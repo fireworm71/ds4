@@ -178,6 +178,26 @@ struct cuda_stream_expert_slot {
 };
 static std::vector<cuda_stream_expert_slot> g_stream_expert_slots;
 /*
+ * DS4_CUDA_ROUTE_DUMP=<path> -- append one line per decode (token, layer):
+ *   <token> <layer> <e0> <e1> ... <e{n-1}>
+ * Diagnostic only; unset means not even a file handle is opened. Decode only
+ * (prefill's batch would dwarf it and answers a different question).
+ */
+static FILE *cuda_route_dump_file(void) {
+    static FILE *f = NULL;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        const char *path = getenv("DS4_CUDA_ROUTE_DUMP");
+        if (path && *path) {
+            f = fopen(path, "w");
+            if (!f) fprintf(stderr, "ds4: DS4_CUDA_ROUTE_DUMP: cannot open %s\n", path);
+        }
+    }
+    return f;
+}
+static uint32_t g_route_dump_token;
+/*
  * DS4_CUDA_EXPERT_EVICT -- routed-expert eviction policy.
  *   unset / 0  exact LRU by monotonic stamp (stock; identical victim choice)
  *   1          CLOCK with second chance, bounded at DS4_CUDA_EXPERT_EVICT_LIVES
@@ -28434,6 +28454,18 @@ static int cuda_stream_selected_cache_begin_load(
      * after the sync, so the reader still gets the stream-wait gap. Inert
      * unless DS4_CUDA_EXPERT_PREFETCH is set. */
     const cuda_pf_fg_scope pf_scope(cuda_pf_enabled());
+    if (slot_count <= DS4_N_EXPERT_USED_MAX_DECODE) {
+        FILE *rd = cuda_route_dump_file();
+        if (rd) {
+            /* Layer 0 opens a token, matching the boundary the other
+             * per-token instruments here use. */
+            if (table->layer == 0u) g_route_dump_token++;
+            fprintf(rd, "%u %u", g_route_dump_token, table->layer);
+            for (uint32_t i = 0; i < slot_count; i++)
+                fprintf(rd, " %d", (int)selected_ids[i]);
+            fputc('\n', rd);
+        }
+    }
     const double xc_t0 = cuda_expert_cache_stats_enabled() ? cuda_wall_sec() : 0.0;
     try {
         std::vector<int32_t> expert_to_slot(table->n_total_expert, -1);
