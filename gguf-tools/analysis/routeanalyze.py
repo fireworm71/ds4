@@ -23,7 +23,7 @@ def load(path):
     trace = []   # (token, layer, [experts])
     for line in open(path):
         f = line.split()
-        if len(f) < 3:
+        if len(f) < 3 or f[0] == 'p':
             continue
         trace.append((int(f[0]), int(f[1]), [int(x) for x in f[2:]]))
     return trace

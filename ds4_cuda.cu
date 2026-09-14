@@ -197,6 +197,7 @@ static FILE *cuda_route_dump_file(void) {
     return f;
 }
 static uint32_t g_route_dump_token;
+static uint32_t g_route_dump_ppcall;
 /*
  * DS4_CUDA_EXPERT_EVICT -- routed-expert eviction policy.
  *   unset / 0  exact LRU by monotonic stamp (stock; identical victim choice)
@@ -28482,6 +28483,15 @@ static int cuda_stream_selected_cache_begin_load(
                 unique.push_back(expert);
             }
             remap[i] = expert_to_slot[expert];
+        }
+        if (slot_count > DS4_N_EXPERT_USED_MAX_DECODE) {
+            FILE *rd = cuda_route_dump_file();
+            if (rd) {
+                fprintf(rd, "p %u %u", g_route_dump_ppcall++, table->layer);
+                for (size_t i = 0; i < unique.size(); i++)
+                    fprintf(rd, " %d", (int)unique[i]);
+                fputc('\n', rd);
+            }
         }
         auto &cache = g_stream_selected_cache;
         if (cache.model_map != table->model_map ||

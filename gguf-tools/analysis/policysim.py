@@ -28,7 +28,7 @@ def load(path):
     out = []
     for line in open(path):
         f = line.split()
-        if len(f) >= 3:
+        if len(f) >= 3 and f[0] != 'p':
             out.append((int(f[0]), int(f[1]), [int(x) for x in f[2:]]))
     return out
 
