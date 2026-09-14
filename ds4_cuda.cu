@@ -28505,7 +28505,9 @@ static uint64_t g_ppf_ordered, g_ppf_consumed, g_ppf_late, g_ppf_pool_full,
 static int cuda_ppf_enabled(void) {
     if (g_ppf_flag < 0) {
         const char *e = getenv("DS4_CUDA_PP_PREFETCH");
-        g_ppf_flag = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (!e || !*e || strcmp(e, "0") == 0) g_ppf_flag = 0;
+        else if (strcmp(e, "2") == 0) g_ppf_flag = 2;   /* kernel hints */
+        else g_ppf_flag = 1;                            /* staging pool */
     }
     return g_ppf_flag;
 }
@@ -28687,6 +28689,46 @@ static int cuda_ppf_flush(void) {
 static void cuda_ppf_place_orders(const ds4_gpu_stream_expert_table *table) {
     if (!cuda_ppf_enabled() || g_ppf_max_layer == 0 ||
         table->layer >= DS4_PPF_MAX_LAYER) {
+        return;
+    }
+    if (cuda_ppf_enabled() == 2) {
+        /* Kernel-readahead mode: same predictor, no machinery. One WILLNEED
+         * per predicted non-resident span; the kernel prefetches during the
+         * compute window and the demand pread hits page cache. Requires
+         * buffered reads -- under O_DIRECT the hints warm memory nothing
+         * will ever read, so refuse rather than waste bandwidth. */
+        static int warned = 0;
+        if (g_model_direct_fd >= 0) {
+            if (!warned) {
+                fprintf(stderr, "ds4: pp-prefetch mode 2 needs buffered IO; "
+                        "set DS4_CUDA_NO_DIRECT_IO=1. Hints disabled.\n");
+                warned = 1;
+            }
+            return;
+        }
+        if (g_model_fd < 0) return;
+        for (uint32_t step = 1; step <= 2u; step++) {
+            const uint32_t T = table->layer + step;
+            if (T >= DS4_PPF_MAX_LAYER) continue;
+            const cuda_ppf_layer_info &li = g_ppf_layers[T];
+            const std::vector<uint32_t> &pred = g_ppf_seen[T];
+            if (!li.valid || pred.empty()) continue;
+            for (uint32_t x : pred) {
+                const uint64_t gate = li.gate_off + (uint64_t)x * li.gate_bytes;
+                if (g_stream_expert_by_gate.find(gate) !=
+                    g_stream_expert_by_gate.end())
+                    continue;
+                (void)posix_fadvise(g_model_fd, (off_t)gate,
+                                    (off_t)li.gate_bytes, POSIX_FADV_WILLNEED);
+                (void)posix_fadvise(g_model_fd,
+                                    (off_t)(li.up_off + (uint64_t)x * li.gate_bytes),
+                                    (off_t)li.gate_bytes, POSIX_FADV_WILLNEED);
+                (void)posix_fadvise(g_model_fd,
+                                    (off_t)(li.down_off + (uint64_t)x * li.down_bytes),
+                                    (off_t)li.down_bytes, POSIX_FADV_WILLNEED);
+                g_ppf_ordered += 3;
+            }
+        }
         return;
     }
     const uint64_t epoch = g_ppf_epoch.load(std::memory_order_acquire);
