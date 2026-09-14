@@ -39754,11 +39754,17 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
+    /* Diagnostic (inert without DS4_METAL_GRAPH_DUMP_PREFIX): the router's
+     * input and logits per decode (layer, pos), for the offline cross-layer
+     * routing-predictability analysis. The decode-graph path already falls
+     * back to eager whenever a dump prefix is configured. */
+    metal_graph_debug_dump_tensor("v41_ffn_norm", g->norm, DS4_N_EMBD, il, (uint32_t)g->pos);
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
         !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+    metal_graph_debug_dump_tensor("v41_route_logits", g->route_logits, DS4_N_EXPERT, il, (uint32_t)g->pos);
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
