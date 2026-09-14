@@ -20,6 +20,8 @@
 #include "ds4_linux_memory.h"
 #include <unordered_map>
 #include <vector>
+#include <atomic>
+#include <deque>
 #include <algorithm>
 
 #include "cuda/mmq/ds4_mmq.h"
@@ -238,6 +240,10 @@ static int cuda_stream_compact_prefill(const char **gate, const char **up,
  * DS4_CUDA_EXPERT_PREFETCH is set. */
 static void cuda_pf_cache_reset(void);
 static void cuda_pf_shutdown(void);
+/* Cross-chunk prefill prefetch (defined before begin_load); both are no-ops
+ * unless DS4_CUDA_PP_PREFETCH is set. */
+static void cuda_ppf_invalidate(void);
+static void cuda_ppf_shutdown(void);
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
@@ -247,6 +253,7 @@ static void cuda_stream_selected_cache_release(void) {
     /* Drop anything the prefetcher planned against the cache being torn down.
      * The reader holds no device pointer, so nothing else is required. */
     cuda_pf_cache_reset();
+    cuda_ppf_invalidate();
     const int tier = g_stream_selected_cache.logical_tier;
     if (tier >= 0 && tier < g_n_gpus) {
         (void)ds4_gpu_set_current_device(tier);
@@ -2914,6 +2921,7 @@ extern "C" void ds4_gpu_cleanup(void) {
      * model file descriptors and staging buffers it reads through. No-op
      * unless the prefetcher was enabled. */
     cuda_pf_shutdown();
+    cuda_ppf_shutdown();
     ds4_gpu_tp_shutdown();
     (void)cudaDeviceSynchronize();
     ds4_gpu_decode_graphs_invalidate();
@@ -28435,6 +28443,359 @@ struct cuda_pf_fg_scope {
     cuda_pf_fg_scope &operator=(const cuda_pf_fg_scope &) = delete;
 };
 
+/* ----------------------------------------------------------------------
+ * Cross-chunk prefill prefetch (DS4_CUDA_PP_PREFETCH, default off).
+ *
+ * Prefill fetch is serial with prefill compute, the disk idles during each
+ * layer's compute window, and a layer's expert set overlaps the same layer
+ * of the previous chunk by a measured 87.4%. So at the end of each prefill
+ * begin_load, the spans of the layer that FOLLOWED this one in the previous
+ * chunk (minus residents) are handed to a reader thread, which preads them
+ * into a pinned pool while the MoE kernels run. The next begin_load consumes
+ * ready entries with a host-to-device copy instead of stalling on pread.
+ *
+ * The reader calls no CUDA API and never touches slots or residency. All
+ * device writes stay on the begin_load thread. The foreground never waits:
+ * an entry not ready is fetched by the demand path unchanged. Entries are
+ * keyed by absolute file offset so age cannot make them wrong; only a model
+ * change can, and that bumps the epoch. Miss accounting is untouched, so
+ * the deterministic stats remain byte-exact regression gates.
+ * -------------------------------------------------------------------- */
+#define DS4_PPF_MAX_LAYER 64u
+struct cuda_ppf_entry {
+    std::atomic<int> state;   /* 0 free, 1 filling, 2 ready, 3 pending-free */
+    uint64_t epoch;
+    uint32_t delta;
+    uint64_t offset;
+    uint64_t bytes;
+    uint64_t call;
+};
+struct cuda_ppf_order {
+    uint64_t offset, bytes, epoch;
+    uint32_t entry;
+};
+struct cuda_ppf_layer_info {
+    uint64_t gate_off, up_off, down_off, gate_bytes, down_bytes;
+    int valid;
+};
+static int          g_ppf_flag = -1;
+static char        *g_ppf_pool;
+static uint64_t     g_ppf_entry_bytes;
+static uint32_t     g_ppf_n_entries;
+static cuda_ppf_entry *g_ppf_entries;
+static std::vector<uint32_t> g_ppf_freelist;                    /* foreground */
+static std::unordered_map<uint64_t, uint32_t> g_ppf_by_offset;  /* foreground */
+static std::deque<cuda_ppf_order> g_ppf_queue;                  /* under lock */
+static pthread_mutex_t g_ppf_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_ppf_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t    g_ppf_thread;
+static int          g_ppf_thread_up, g_ppf_stop;
+static std::atomic<uint64_t> g_ppf_epoch{0};
+static cudaStream_t g_ppf_stream;
+static std::vector<uint32_t> g_ppf_pending_free;                /* foreground */
+static const void  *g_ppf_model_map;
+static uint64_t     g_ppf_model_size;
+static uint64_t     g_ppf_call;                 /* prefill calls seen */
+static uint32_t     g_ppf_max_layer;            /* highest layer seen + 1 */
+static std::vector<uint32_t> g_ppf_seen[DS4_PPF_MAX_LAYER]; /* last demand */
+static cuda_ppf_layer_info g_ppf_layers[DS4_PPF_MAX_LAYER];
+static uint64_t g_ppf_ordered, g_ppf_consumed, g_ppf_late, g_ppf_pool_full,
+                g_ppf_gc_freed;
+
+static int cuda_ppf_enabled(void) {
+    if (g_ppf_flag < 0) {
+        const char *e = getenv("DS4_CUDA_PP_PREFETCH");
+        g_ppf_flag = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return g_ppf_flag;
+}
+
+static void *cuda_ppf_reader_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_ppf_lock);
+        while (!g_ppf_stop && g_ppf_queue.empty())
+            pthread_cond_wait(&g_ppf_cond, &g_ppf_lock);
+        if (g_ppf_stop) {
+            pthread_mutex_unlock(&g_ppf_lock);
+            return NULL;
+        }
+        cuda_ppf_order o = g_ppf_queue.front();
+        g_ppf_queue.pop_front();
+        pthread_mutex_unlock(&g_ppf_lock);
+        cuda_ppf_entry &e = g_ppf_entries[o.entry];
+        if (o.epoch != g_ppf_epoch.load(std::memory_order_acquire)) {
+            e.state.store(2, std::memory_order_release);  /* settled; gc frees */
+            continue;
+        }
+        char *buf = g_ppf_pool + (uint64_t)o.entry * g_ppf_entry_bytes;
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(buf, g_ppf_entry_bytes, o.offset, o.bytes,
+                                   &payload)) {
+            e.bytes = 0;                     /* poison: consume will refuse */
+            e.state.store(2, std::memory_order_release);
+            continue;
+        }
+        e.delta = (uint32_t)(payload - buf);
+        /* Same page hygiene as the demand workers: these bytes are consumed
+         * from the pool, never re-read. */
+        cuda_model_drop_file_pages(o.offset, o.bytes);
+        cuda_model_discard_source_pages(g_ppf_model_map, g_ppf_model_size,
+                                        o.offset, o.bytes);
+        e.state.store(2, std::memory_order_release);
+    }
+}
+
+static int cuda_ppf_pool_init(uint64_t span_bytes) {
+    if (g_ppf_pool) return 1;
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 4096;
+    g_ppf_entry_bytes = span_bytes + 2u * align;
+    uint64_t pool_mb = 4096;
+    const char *e = getenv("DS4_CUDA_PP_PREFETCH_POOL_MB");
+    if (e && *e) {
+        long v = strtol(e, NULL, 10);
+        if (v >= 64 && v <= 32768) pool_mb = (uint64_t)v;
+    }
+    uint64_t n = (pool_mb << 20) / g_ppf_entry_bytes;
+    if (n < 8) { g_ppf_flag = 0; return 0; }
+    if (n > 4096) n = 4096;
+    if (cudaHostAlloc((void **)&g_ppf_pool, (size_t)(n * g_ppf_entry_bytes),
+                      cudaHostAllocDefault) != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_ppf_pool = NULL;
+        fprintf(stderr, "ds4: pp-prefetch pool alloc failed; feature disabled\n");
+        g_ppf_flag = 0;
+        return 0;
+    }
+    if (cudaStreamCreateWithFlags(&g_ppf_stream, cudaStreamNonBlocking) !=
+        cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFreeHost(g_ppf_pool);
+        g_ppf_pool = NULL;
+        g_ppf_flag = 0;
+        return 0;
+    }
+    g_ppf_entries = new cuda_ppf_entry[n]();
+    g_ppf_n_entries = (uint32_t)n;
+    g_ppf_freelist.reserve(n);
+    for (uint32_t i = 0; i < n; i++) g_ppf_freelist.push_back((uint32_t)(n - 1u - i));
+    fprintf(stderr, "ds4: CUDA pp-prefetch: %u pinned entries x %.1f MiB\n",
+            g_ppf_n_entries, (double)g_ppf_entry_bytes / 1048576.0);
+    return 1;
+}
+
+/* Foreground. Recycle settled entries that are stale by epoch or two chunks
+ * old. Entries the reader still holds (state 1) are left tracked. */
+static void cuda_ppf_gc(void) {
+    const uint64_t epoch = g_ppf_epoch.load(std::memory_order_acquire);
+    for (auto it = g_ppf_by_offset.begin(); it != g_ppf_by_offset.end();) {
+        cuda_ppf_entry &e = g_ppf_entries[it->second];
+        const int st = e.state.load(std::memory_order_acquire);
+        if (st == 2 && (e.epoch != epoch || g_ppf_call >= e.call + 12u)) {
+            g_ppf_gc_freed++;
+            e.state.store(0, std::memory_order_release);
+            g_ppf_freelist.push_back(it->second);
+            it = g_ppf_by_offset.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+/* Foreground, from begin_load's prefill branch before any eviction: record
+ * layer geometry and this layer's demanded set (it becomes the predictor for
+ * the layer's next visit). */
+static void cuda_ppf_note_call(const ds4_gpu_stream_expert_table *table,
+                               const std::vector<int32_t> &unique) {
+    if (!cuda_ppf_enabled() || table->layer >= DS4_PPF_MAX_LAYER) return;
+    g_ppf_model_map = table->model_map;
+    g_ppf_model_size = table->model_size;
+    cuda_ppf_layer_info &li = g_ppf_layers[table->layer];
+    li.gate_off = table->gate_offset;
+    li.up_off = table->up_offset;
+    li.down_off = table->down_offset;
+    li.gate_bytes = table->gate_expert_bytes;
+    li.down_bytes = table->down_expert_bytes;
+    li.valid = 1;
+    if (table->layer + 1u > g_ppf_max_layer) g_ppf_max_layer = table->layer + 1u;
+    g_ppf_call++;
+    if ((g_ppf_call % 32u) == 0u) {
+        cuda_ppf_gc();
+        if (cuda_expert_cache_stats_enabled() && g_ppf_ordered) {
+            fprintf(stderr,
+                    "ds4:   pp-prefetch call %llu: ordered=%llu consumed=%llu "
+                    "late=%llu pool_full=%llu gc=%llu\n",
+                    (unsigned long long)g_ppf_call,
+                    (unsigned long long)g_ppf_ordered,
+                    (unsigned long long)g_ppf_consumed,
+                    (unsigned long long)g_ppf_late,
+                    (unsigned long long)g_ppf_pool_full,
+                    (unsigned long long)g_ppf_gc_freed);
+        }
+    }
+    std::vector<uint32_t> &cur = g_ppf_seen[table->layer];
+    cur.clear();
+    cur.reserve(unique.size());
+    for (int32_t x : unique) cur.push_back((uint32_t)x);
+}
+
+/* Foreground, from the prefill miss loop. Returns 1 if the span was staged
+ * and its device copy has been enqueued on the private stream. Never waits. */
+static int cuda_ppf_consume(char *dst, uint64_t offset, uint64_t bytes) {
+    auto it = g_ppf_by_offset.find(offset);
+    if (it == g_ppf_by_offset.end()) return 0;
+    cuda_ppf_entry &e = g_ppf_entries[it->second];
+    if (e.state.load(std::memory_order_acquire) != 2 ||
+        e.bytes != bytes ||
+        e.epoch != g_ppf_epoch.load(std::memory_order_acquire)) {
+        g_ppf_late++;
+        return 0;
+    }
+    char *src = g_ppf_pool + (uint64_t)it->second * g_ppf_entry_bytes + e.delta;
+    if (cudaMemcpyAsync(dst, src, (size_t)bytes, cudaMemcpyHostToDevice,
+                        g_ppf_stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    e.state.store(3, std::memory_order_release);
+    g_ppf_pending_free.push_back(it->second);
+    g_ppf_by_offset.erase(it);
+    g_ppf_consumed++;
+    return 1;
+}
+
+/* Foreground, after uploads.finish(): consumed bytes must be resident before
+ * the mapping is published. */
+static int cuda_ppf_flush(void) {
+    if (g_ppf_pending_free.empty()) return 1;
+    const int ok = cuda_ok(cudaStreamSynchronize(g_ppf_stream),
+                           "pp-prefetch upload");
+    for (uint32_t idx : g_ppf_pending_free) {
+        g_ppf_entries[idx].state.store(0, std::memory_order_release);
+        g_ppf_freelist.push_back(idx);
+    }
+    g_ppf_pending_free.clear();
+    return ok;
+}
+
+/* Foreground, end of a prefill begin_load: order the last-seen sets of the
+ * next layers in schedule order, minus residents and minus what is already
+ * staged. Layer-major order means the next call is either this layer again
+ * (drift only -- its set is resident, so nothing is ordered) or the next
+ * layer, whose previous visit's set is the 92.8%-accurate predictor. The
+ * wrap covers the final 0..39 pass. */
+static void cuda_ppf_place_orders(const ds4_gpu_stream_expert_table *table) {
+    if (!cuda_ppf_enabled() || g_ppf_max_layer == 0 ||
+        table->layer >= DS4_PPF_MAX_LAYER) {
+        return;
+    }
+    const uint64_t epoch = g_ppf_epoch.load(std::memory_order_acquire);
+    std::vector<cuda_ppf_order> batch;
+    bool full = false;
+    for (uint32_t step = 1; step <= 2u && !full; step++) {
+        /* No wrap. A modulo against the RUNNING max layer made the first
+         * ascent target layers 0-1 over and over, staging sets for revisits
+         * that never come -- 1,292 parasitic spans on the shallow control,
+         * all reads taken while the disk was demand-busy. Plain lookahead
+         * costs only the final pass's layers 0-1, and seen[] being empty
+         * makes unvisited targets skip themselves. */
+        const uint32_t T = table->layer + step;
+        if (T >= DS4_PPF_MAX_LAYER) continue;
+        const cuda_ppf_layer_info &li = g_ppf_layers[T];
+        const std::vector<uint32_t> &pred = g_ppf_seen[T];
+        if (!li.valid || pred.empty()) continue;
+        const uint64_t span = li.gate_bytes > li.down_bytes ? li.gate_bytes
+                                                            : li.down_bytes;
+        if (!g_ppf_pool && !cuda_ppf_pool_init(span)) return;
+        if (!g_ppf_thread_up) {
+            if (pthread_create(&g_ppf_thread, NULL, cuda_ppf_reader_main,
+                               NULL) != 0)
+                return;
+            g_ppf_thread_up = 1;
+        }
+        for (uint32_t x : pred) {
+            const uint64_t gate = li.gate_off + (uint64_t)x * li.gate_bytes;
+            if (g_stream_expert_by_gate.find(gate) !=
+                g_stream_expert_by_gate.end())
+                continue;
+            const uint64_t spans[3][2] = {
+                {gate, li.gate_bytes},
+                {li.up_off + (uint64_t)x * li.gate_bytes, li.gate_bytes},
+                {li.down_off + (uint64_t)x * li.down_bytes, li.down_bytes},
+            };
+            for (int i = 0; i < 3; i++) {
+                if (g_ppf_by_offset.count(spans[i][0])) continue;
+                if (g_ppf_freelist.empty()) {
+                    g_ppf_pool_full++;
+                    full = true;
+                    break;
+                }
+                const uint32_t idx = g_ppf_freelist.back();
+                g_ppf_freelist.pop_back();
+                cuda_ppf_entry &en = g_ppf_entries[idx];
+                en.state.store(1, std::memory_order_release);
+                en.epoch = epoch;
+                en.offset = spans[i][0];
+                en.bytes = spans[i][1];
+                en.call = g_ppf_call;
+                g_ppf_by_offset[spans[i][0]] = idx;
+                batch.push_back({spans[i][0], spans[i][1], epoch, idx});
+                g_ppf_ordered++;
+            }
+            if (full) break;
+        }
+    }
+    if (!batch.empty()) {
+        pthread_mutex_lock(&g_ppf_lock);
+        for (auto &o : batch) g_ppf_queue.push_back(o);
+        pthread_cond_broadcast(&g_ppf_cond);
+        pthread_mutex_unlock(&g_ppf_lock);
+    }
+}
+
+static void cuda_ppf_invalidate(void) {
+    if (!g_ppf_pool) return;
+    g_ppf_epoch.fetch_add(1, std::memory_order_acq_rel);
+    pthread_mutex_lock(&g_ppf_lock);
+    g_ppf_queue.clear();
+    pthread_mutex_unlock(&g_ppf_lock);
+    (void)cudaStreamSynchronize(g_ppf_stream);
+    for (uint32_t idx : g_ppf_pending_free) {
+        g_ppf_entries[idx].state.store(0, std::memory_order_release);
+        g_ppf_freelist.push_back(idx);
+    }
+    g_ppf_pending_free.clear();
+    /* Settled entries free now; reader-held ones (state 1) stay tracked and
+     * are reclaimed by gc after they settle -- nothing leaks either way. */
+    cuda_ppf_gc();
+    for (uint32_t l = 0; l < DS4_PPF_MAX_LAYER; l++) {
+        g_ppf_seen[l].clear();
+        g_ppf_layers[l].valid = 0;
+    }
+    g_ppf_max_layer = 0;
+}
+
+static void cuda_ppf_shutdown(void) {
+    if (g_ppf_thread_up) {
+        pthread_mutex_lock(&g_ppf_lock);
+        g_ppf_stop = 1;
+        pthread_cond_broadcast(&g_ppf_cond);
+        pthread_mutex_unlock(&g_ppf_lock);
+        (void)pthread_join(g_ppf_thread, NULL);
+        g_ppf_thread_up = 0;
+    }
+    if (g_ppf_ordered) {
+        fprintf(stderr,
+                "ds4: pp-prefetch total: ordered=%llu consumed=%llu late=%llu "
+                "pool_full=%llu gc=%llu\n",
+                (unsigned long long)g_ppf_ordered,
+                (unsigned long long)g_ppf_consumed,
+                (unsigned long long)g_ppf_late,
+                (unsigned long long)g_ppf_pool_full,
+                (unsigned long long)g_ppf_gc_freed);
+    }
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -28492,6 +28853,7 @@ static int cuda_stream_selected_cache_begin_load(
                     fprintf(rd, " %d", (int)unique[i]);
                 fputc('\n', rd);
             }
+            cuda_ppf_note_call(table, unique);
         }
         auto &cache = g_stream_selected_cache;
         if (cache.model_map != table->model_map ||
@@ -28723,12 +29085,26 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
             if (fetch_threads > 1u) {
-                fetch_jobs.push_back({cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                                      gate, table->gate_expert_bytes});
-                fetch_jobs.push_back({cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                                      up, table->gate_expert_bytes});
-                fetch_jobs.push_back({cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
-                                      down, table->down_expert_bytes});
+                /* pp-prefetch: spans staged during the previous layer's
+                 * compute upload from the pool instead of re-reading disk.
+                 * The miss accounting above is untouched on purpose. */
+                const int ppf = g_ppf_pool != NULL &&
+                    slot_count > DS4_N_EXPERT_USED_MAX_DECODE;
+                if (!(ppf && cuda_ppf_consume(
+                        cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                        gate, table->gate_expert_bytes)))
+                    fetch_jobs.push_back({cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                                          gate, table->gate_expert_bytes});
+                if (!(ppf && cuda_ppf_consume(
+                        cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                        up, table->gate_expert_bytes)))
+                    fetch_jobs.push_back({cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                                          up, table->gate_expert_bytes});
+                if (!(ppf && cuda_ppf_consume(
+                        cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
+                        down, table->down_expert_bytes)))
+                    fetch_jobs.push_back({cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
+                                          down, table->down_expert_bytes});
             } else {
                 uploads.active = true;
                 if (!cuda_model_copy_to_device_streamed(
@@ -28770,6 +29146,15 @@ static int cuda_stream_selected_cache_begin_load(
             }
         }
         if (!uploads.finish()) return 0;
+        if (!cuda_ppf_flush()) {
+            /* Same contract as a failed batch upload: nothing may be treated
+             * as resident afterwards. */
+            g_stream_expert_by_gate.clear();
+            for (auto &sl : g_stream_expert_slots) sl.used = 0;
+            return 0;
+        }
+        if (slot_count > DS4_N_EXPERT_USED_MAX_DECODE)
+            cuda_ppf_place_orders(table);
         if (cuda_expert_cache_stats_enabled()) {
             g_xc_secs_r[slot_count > DS4_N_EXPERT_USED_MAX_DECODE] +=
                 cuda_wall_sec() - xc_t0;
