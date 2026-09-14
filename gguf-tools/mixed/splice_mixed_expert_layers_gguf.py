@@ -60,6 +60,11 @@ GGML_QUANT_SIZES = {
     10: (256, 84, "Q2_K"),
     12: (256, 144, "Q4_K"),
     16: (256, 66, "IQ2_XXS"),
+    # V4.1 Flash carries I8 tensors, which the V4 Flash files this tool
+    # was written against did not, so it refused V4.1 GGUFs outright.
+    # Geometry taken from the engine's own type table in ds4.c
+    # ([24] = {"i8", 1, 1}) rather than inferred from the name.
+    24: (1, 1, "I8"),
     26: (1, 4, "I32"),
 }
 
