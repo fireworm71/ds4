@@ -174,8 +174,37 @@ static uint64_t g_stream_expert_bytes;
 struct cuda_stream_expert_slot {
     uint64_t gate, up, down, used;
     uint32_t hits;   /* reuses since this expert was loaded into the slot */
+    uint8_t  lives;  /* unspent second chances, DS4_CUDA_EXPERT_EVICT only */
 };
 static std::vector<cuda_stream_expert_slot> g_stream_expert_slots;
+/*
+ * DS4_CUDA_EXPERT_EVICT -- routed-expert eviction policy.
+ *   unset / 0  exact LRU by monotonic stamp (stock; identical victim choice)
+ *   1          CLOCK with second chance, bounded at DS4_CUDA_EXPERT_EVICT_LIVES
+ * DS4_CUDA_EXPERT_EVICT_LIVES -- cap on unspent second chances, default 3.
+ * Neither changes what the MoE kernel reads, so output must stay identical
+ * across both arms; a difference means the cache is handing out wrong bytes.
+ */
+static int cuda_expert_evict_clock(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_CUDA_EXPERT_EVICT");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+static uint32_t cuda_expert_evict_lives(void) {
+    static uint32_t v = UINT32_MAX;
+    if (v == UINT32_MAX) {
+        const char *e = getenv("DS4_CUDA_EXPERT_EVICT_LIVES");
+        long n = e && *e ? strtol(e, NULL, 10) : 3;
+        if (n < 0) n = 0;
+        if (n > 255) n = 255;
+        v = (uint32_t)n;
+    }
+    return v;
+}
+static uint32_t g_stream_expert_hand;
 static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
 static uint64_t g_stream_expert_clock;
 static std::vector<int32_t> g_stream_prefill_ids, g_stream_prefill_slots;
@@ -221,6 +250,7 @@ static void cuda_stream_selected_cache_release(void) {
     g_stream_expert_slots.clear();
     g_stream_expert_by_gate.clear();
     g_stream_expert_clock = 0;
+    g_stream_expert_hand = 0;
     g_stream_prefill_ids.clear();
     g_stream_prefill_slots.clear();
 }
@@ -28240,6 +28270,7 @@ static void cuda_pf_claim_landed(const ds4_gpu_stream_expert_table *table,
         slots[i] = (int32_t)found->second;
         slot.used = stamp;
         slot.hits++;
+        if (slot.lives < cuda_expert_evict_lives()) slot.lives++;
     }
 }
 
@@ -28495,6 +28526,7 @@ static int cuda_stream_selected_cache_begin_load(
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
             slot.hits++;
+            if (slot.lives < cuda_expert_evict_lives()) slot.lives++;
         }
         /* Speculative expert prefetch. Inert unless DS4_CUDA_EXPERT_PREFETCH
          * is set. The three steps are in this order on purpose:
@@ -28584,12 +28616,50 @@ static int cuda_stream_selected_cache_begin_load(
         for (size_t i = 0; i < unique.size(); i++) {
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
-            uint64_t oldest = stamp;
-            for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
-                if (g_stream_expert_slots[j].used < oldest) {
-                    oldest = g_stream_expert_slots[j].used;
+            if (cuda_expert_evict_clock()) {
+                /*
+                 * CLOCK second chance. `used == stamp` marks entries this very
+                 * call already resolved as hits, or slots filled earlier in
+                 * this loop: they are never candidates, exactly as the LRU
+                 * scan's `oldest = stamp` seed guarantees.
+                 */
+                const uint32_t n = (uint32_t)g_stream_expert_slots.size();
+                const uint32_t sweeps = cuda_expert_evict_lives() + 1u;
+                for (uint64_t scan = 0; n != 0 && scan < (uint64_t)sweeps * n; scan++) {
+                    const uint32_t j = (uint32_t)((g_stream_expert_hand + scan) % n);
+                    cuda_stream_expert_slot &c = g_stream_expert_slots[j];
+                    if (c.used == stamp) continue;
+                    if (!c.used) { victim = j; break; }
+                    if (c.lives) { c.lives--; continue; }
                     victim = j;
-                    if (!oldest) break;
+                    break;
+                }
+                /*
+                 * Guaranteed progress. `sweeps` passes spend every life, so
+                 * this can only be reached when the hand saw nothing but
+                 * this-call entries -- but a policy must never be the reason
+                 * a layer fails where LRU would have succeeded, so fall back
+                 * to the oldest evictable slot rather than returning 0.
+                 */
+                if (victim == UINT32_MAX) {
+                    uint64_t oldest = stamp;
+                    for (uint32_t j = 0; j < n; j++) {
+                        if (g_stream_expert_slots[j].used < oldest) {
+                            oldest = g_stream_expert_slots[j].used;
+                            victim = j;
+                            if (!oldest) break;
+                        }
+                    }
+                }
+                if (victim != UINT32_MAX) g_stream_expert_hand = (victim + 1u) % n;
+            } else {
+                uint64_t oldest = stamp;
+                for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+                    if (g_stream_expert_slots[j].used < oldest) {
+                        oldest = g_stream_expert_slots[j].used;
+                        victim = j;
+                        if (!oldest) break;
+                    }
                 }
             }
             if (victim == UINT32_MAX) return 0;
@@ -28605,6 +28675,7 @@ static int cuda_stream_selected_cache_begin_load(
             }
             slot.used = 0;
             slot.hits = 0;
+            slot.lives = 0;
             const uint64_t expert = (uint32_t)unique[i];
             const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
