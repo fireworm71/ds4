@@ -28443,6 +28443,39 @@ struct cuda_pf_fg_scope {
     cuda_pf_fg_scope &operator=(const cuda_pf_fg_scope &) = delete;
 };
 
+__global__ static void dsv41_norm_swap_kernel(
+        float *out, const float *in, const float *wa, const float *wb,
+        uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = wa[i];
+    out[i] = a == 0.0f ? 0.0f : in[i] / a * wb[i];
+}
+
+/* Rescale a post-norm vector from layer A's rms-norm weights to layer B's:
+ * the scalar rms cancels, so out = in / wA * wB reconstructs exactly what
+ * layer B's norm would have produced from the same hidden state. */
+extern "C" int ds4_gpu_dsv41_norm_swap(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+        const void *model_map, uint64_t model_size,
+        uint64_t off_a, uint64_t off_b, uint32_t n) {
+    if (!out || !in || !out->ptr || !in->ptr ||
+        out->bytes < (uint64_t)n * sizeof(float) ||
+        in->bytes < (uint64_t)n * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t bytes = (uint64_t)n * sizeof(float);
+    const char *wa = cuda_resolve_weight_ptr(model_map, off_a, bytes, 0,
+                                             "predict norm A");
+    const char *wb = cuda_resolve_weight_ptr(model_map, off_b, bytes, 0,
+                                             "predict norm B");
+    if (!wa || !wb) return 0;
+    dsv41_norm_swap_kernel<<<(n + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)in->ptr,
+        (const float *)wa, (const float *)wb, n);
+    return cuda_ok(cudaGetLastError(), "predict norm swap");
+}
+
 /* ----------------------------------------------------------------------
  * Cross-chunk prefill prefetch (DS4_CUDA_PP_PREFETCH, default off).
  *
@@ -28488,8 +28521,21 @@ static std::unordered_map<uint64_t, uint32_t> g_ppf_by_offset;  /* foreground */
 static std::deque<cuda_ppf_order> g_ppf_queue;                  /* under lock */
 static pthread_mutex_t g_ppf_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_ppf_cond = PTHREAD_COND_INITIALIZER;
-static pthread_t    g_ppf_thread;
+#define DS4_PPF_READERS 4
+static pthread_t    g_ppf_threads[DS4_PPF_READERS];
 static int          g_ppf_thread_up, g_ppf_stop;
+static std::atomic<int> g_ppf_demand_busy{0};
+
+static void *cuda_ppf_reader_main(void *arg);
+static int cuda_ppf_start_readers(void) {
+    if (g_ppf_thread_up) return 1;
+    for (int i = 0; i < DS4_PPF_READERS; i++)
+        if (pthread_create(&g_ppf_threads[i], NULL, cuda_ppf_reader_main,
+                           NULL) != 0)
+            return 0;
+    g_ppf_thread_up = 1;
+    return 1;
+}
 static std::atomic<uint64_t> g_ppf_epoch{0};
 static cudaStream_t g_ppf_stream;
 static std::vector<uint32_t> g_ppf_pending_free;                /* foreground */
@@ -28501,6 +28547,37 @@ static std::vector<uint32_t> g_ppf_seen[DS4_PPF_MAX_LAYER]; /* last demand */
 static cuda_ppf_layer_info g_ppf_layers[DS4_PPF_MAX_LAYER];
 static uint64_t g_ppf_ordered, g_ppf_consumed, g_ppf_late, g_ppf_pool_full,
                 g_ppf_gc_freed;
+
+static int cuda_decode_predict_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_CUDA_DECODE_PREDICT");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+/* One in-flight prediction: written by the foreground in ds41_moe_partial,
+ * consumed by the foreground in the next begin_load. Same thread, so a plain
+ * struct suffices; `pending` is int for clarity, not synchronisation. */
+static struct {
+    int pending;
+    const void *sel_ptr;
+    const void *wts_ptr;
+    uint64_t gate_off, up_off, down_off, gate_bytes, down_bytes;
+    uint32_t n_used;
+} g_pred_h;
+
+static uint32_t cuda_decode_predict_budget(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_CUDA_DECODE_PREDICT_BUDGET");
+        long n = e && *e ? strtol(e, NULL, 10) : 4;
+        if (n < 1) n = 1;
+        if (n > 16) n = 16;
+        v = (int)n;
+    }
+    return (uint32_t)v;
+}
 
 static int cuda_ppf_enabled(void) {
     if (g_ppf_flag < 0) {
@@ -28525,6 +28602,13 @@ static void *cuda_ppf_reader_main(void *arg) {
         cuda_ppf_order o = g_ppf_queue.front();
         g_ppf_queue.pop_front();
         pthread_mutex_unlock(&g_ppf_lock);
+        /* Demand priority: speculation must never slow the fetch it exists
+         * to hide. Park until the in-flight demand load finishes. */
+        while (g_ppf_demand_busy.load(std::memory_order_acquire) &&
+               !g_ppf_stop) {
+            struct timespec ts = {0, 2000000};
+            nanosleep(&ts, NULL);
+        }
         cuda_ppf_entry &e = g_ppf_entries[o.entry];
         if (o.epoch != g_ppf_epoch.load(std::memory_order_acquire)) {
             e.state.store(2, std::memory_order_release);  /* settled; gc frees */
@@ -28680,6 +28764,97 @@ static int cuda_ppf_flush(void) {
     return ok;
 }
 
+/* Foreground: stage one span through the reader, sharing the pool, the
+ * offset index and the epoch discipline with the prefill prefetcher. */
+static void cuda_ppf_order_span(uint64_t offset, uint64_t bytes) {
+    if (g_ppf_by_offset.count(offset)) return;
+    if (g_ppf_freelist.empty()) {
+        g_ppf_pool_full++;
+        return;
+    }
+    const uint64_t epoch = g_ppf_epoch.load(std::memory_order_acquire);
+    const uint32_t idx = g_ppf_freelist.back();
+    g_ppf_freelist.pop_back();
+    cuda_ppf_entry &en = g_ppf_entries[idx];
+    en.state.store(1, std::memory_order_release);
+    en.epoch = epoch;
+    en.offset = offset;
+    en.bytes = bytes;
+    en.call = g_ppf_call;
+    g_ppf_by_offset[offset] = idx;
+    g_ppf_ordered++;
+    pthread_mutex_lock(&g_ppf_lock);
+    g_ppf_queue.push_back({offset, bytes, epoch, idx});
+    pthread_cond_broadcast(&g_ppf_cond);
+    pthread_mutex_unlock(&g_ppf_lock);
+}
+
+/* Foreground, from a decode begin_load after its entry sync: the predicted
+ * next-layer expert ids are complete on device; read them (24 bytes) and
+ * stage the non-resident ones. */
+static void cuda_predict_place_orders(const ds4_gpu_stream_expert_table *tbl) {
+    (void)tbl;
+    /* Drain speculation that never started: its layer has passed, and a late
+     * span is a double read. Entries the reader already picked up (state 1,
+     * absent from the queue) finish on their own and are consumed or gc'd. */
+    {
+        pthread_mutex_lock(&g_ppf_lock);
+        std::deque<cuda_ppf_order> stale;
+        stale.swap(g_ppf_queue);
+        pthread_mutex_unlock(&g_ppf_lock);
+        for (const cuda_ppf_order &o : stale) {
+            cuda_ppf_entry &e = g_ppf_entries[o.entry];
+            if (e.state.load(std::memory_order_acquire) == 1) {
+                e.state.store(0, std::memory_order_release);
+                g_ppf_by_offset.erase(o.offset);
+                g_ppf_freelist.push_back(o.entry);
+            }
+        }
+    }
+    if (!g_pred_h.pending) return;
+    g_pred_h.pending = 0;
+    int32_t ids[16];
+    float wts[16];
+    if (g_pred_h.n_used > 16u) return;
+    if (cudaMemcpy(ids, g_pred_h.sel_ptr,
+                   (size_t)g_pred_h.n_used * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(wts, g_pred_h.wts_ptr,
+                   (size_t)g_pred_h.n_used * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    /* Top-K by predicted router weight: bandwidth is the scarce resource,
+     * so spend it on the experts the prediction is most confident in. */
+    const uint32_t budget = cuda_decode_predict_budget();
+    for (uint32_t a = 0; a < g_pred_h.n_used; a++)
+        for (uint32_t b = a + 1u; b < g_pred_h.n_used; b++)
+            if (wts[b] > wts[a]) {
+                float tw = wts[a]; wts[a] = wts[b]; wts[b] = tw;
+                int32_t ti = ids[a]; ids[a] = ids[b]; ids[b] = ti;
+            }
+    if (g_pred_h.n_used > budget) g_pred_h.n_used = budget;
+    const uint64_t span = g_pred_h.gate_bytes > g_pred_h.down_bytes ?
+                          g_pred_h.gate_bytes : g_pred_h.down_bytes;
+    if (!g_ppf_pool && !cuda_ppf_pool_init(span)) return;
+    if (!cuda_ppf_start_readers()) return;
+    g_ppf_call++;
+    if ((g_ppf_call & 63u) == 0u) cuda_ppf_gc();
+    for (uint32_t i = 0; i < g_pred_h.n_used; i++) {
+        const int32_t e = ids[i];
+        if (e < 0) continue;
+        const uint64_t gate = g_pred_h.gate_off + (uint64_t)e * g_pred_h.gate_bytes;
+        if (g_stream_expert_by_gate.find(gate) != g_stream_expert_by_gate.end())
+            continue;
+        cuda_ppf_order_span(gate, g_pred_h.gate_bytes);
+        cuda_ppf_order_span(g_pred_h.up_off + (uint64_t)e * g_pred_h.gate_bytes,
+                            g_pred_h.gate_bytes);
+        cuda_ppf_order_span(g_pred_h.down_off + (uint64_t)e * g_pred_h.down_bytes,
+                            g_pred_h.down_bytes);
+    }
+}
+
 /* Foreground, end of a prefill begin_load: order the last-seen sets of the
  * next layers in schedule order, minus residents and minus what is already
  * staged. Layer-major order means the next call is either this layer again
@@ -28749,12 +28924,7 @@ static void cuda_ppf_place_orders(const ds4_gpu_stream_expert_table *table) {
         const uint64_t span = li.gate_bytes > li.down_bytes ? li.gate_bytes
                                                             : li.down_bytes;
         if (!g_ppf_pool && !cuda_ppf_pool_init(span)) return;
-        if (!g_ppf_thread_up) {
-            if (pthread_create(&g_ppf_thread, NULL, cuda_ppf_reader_main,
-                               NULL) != 0)
-                return;
-            g_ppf_thread_up = 1;
-        }
+        if (!cuda_ppf_start_readers()) return;
         for (uint32_t x : pred) {
             const uint64_t gate = li.gate_off + (uint64_t)x * li.gate_bytes;
             if (g_stream_expert_by_gate.find(gate) !=
@@ -28817,13 +28987,31 @@ static void cuda_ppf_invalidate(void) {
     g_ppf_max_layer = 0;
 }
 
+extern "C" void ds4_gpu_dsv41_predict_handoff(
+        const ds4_gpu_tensor *sel, const ds4_gpu_tensor *wts,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t gate_bytes, uint64_t down_bytes, uint32_t n_used) {
+    if (!sel || !sel->ptr || !wts || !wts->ptr || !gate_bytes || !down_bytes)
+        return;
+    g_pred_h.sel_ptr = sel->ptr;
+    g_pred_h.wts_ptr = wts->ptr;
+    g_pred_h.gate_off = gate_off;
+    g_pred_h.up_off = up_off;
+    g_pred_h.down_off = down_off;
+    g_pred_h.gate_bytes = gate_bytes;
+    g_pred_h.down_bytes = down_bytes;
+    g_pred_h.n_used = n_used;
+    g_pred_h.pending = 1;
+}
+
 static void cuda_ppf_shutdown(void) {
     if (g_ppf_thread_up) {
         pthread_mutex_lock(&g_ppf_lock);
         g_ppf_stop = 1;
         pthread_cond_broadcast(&g_ppf_cond);
         pthread_mutex_unlock(&g_ppf_lock);
-        (void)pthread_join(g_ppf_thread, NULL);
+        for (int i = 0; i < DS4_PPF_READERS; i++)
+            (void)pthread_join(g_ppf_threads[i], NULL);
         g_ppf_thread_up = 0;
     }
     if (g_ppf_ordered) {
@@ -29131,7 +29319,8 @@ static int cuda_stream_selected_cache_begin_load(
                  * compute upload from the pool instead of re-reading disk.
                  * The miss accounting above is untouched on purpose. */
                 const int ppf = g_ppf_pool != NULL &&
-                    slot_count > DS4_N_EXPERT_USED_MAX_DECODE;
+                    (slot_count > DS4_N_EXPERT_USED_MAX_DECODE ||
+                     cuda_decode_predict_enabled());
                 if (!(ppf && cuda_ppf_consume(
                         cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
                         gate, table->gate_expert_bytes)))
@@ -29177,9 +29366,13 @@ static int cuda_stream_selected_cache_begin_load(
         if (fetch_threads > 1u && !fetch_jobs.empty()) {
             const uint64_t max_span = table->gate_expert_bytes > table->down_expert_bytes ?
                                       table->gate_expert_bytes : table->down_expert_bytes;
-            if (!cuda_expert_fetch_parallel(fetch_jobs.data(), fetch_jobs.size(),
-                                            fetch_threads, max_span,
-                                            table->model_map, table->model_size)) {
+            g_ppf_demand_busy.store(1, std::memory_order_release);
+            const int fetch_ok = cuda_expert_fetch_parallel(
+                    fetch_jobs.data(), fetch_jobs.size(),
+                    fetch_threads, max_span,
+                    table->model_map, table->model_size);
+            g_ppf_demand_busy.store(0, std::memory_order_release);
+            if (!fetch_ok) {
                 /* Same failure contract as a bad async upload: nothing may be
                  * treated as resident afterwards. */
                 g_stream_expert_by_gate.clear();
@@ -29197,6 +29390,8 @@ static int cuda_stream_selected_cache_begin_load(
         }
         if (slot_count > DS4_N_EXPERT_USED_MAX_DECODE)
             cuda_ppf_place_orders(table);
+        else if (cuda_decode_predict_enabled())
+            cuda_predict_place_orders(table);
         if (cuda_expert_cache_stats_enabled()) {
             g_xc_secs_r[slot_count > DS4_N_EXPERT_USED_MAX_DECODE] +=
                 cuda_wall_sec() - xc_t0;

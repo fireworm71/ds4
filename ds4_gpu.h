@@ -2379,6 +2379,14 @@ int ds4_gpu_directional_steering_project_tensor(
         uint32_t                rows,
         float                   scale);
 
+int ds4_gpu_dsv41_norm_swap(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+        const void *model_map, uint64_t model_size,
+        uint64_t off_a, uint64_t off_b, uint32_t n);
+void ds4_gpu_dsv41_predict_handoff(
+        const ds4_gpu_tensor *sel, const ds4_gpu_tensor *wts,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t gate_bytes, uint64_t down_bytes, uint32_t n_used);
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,

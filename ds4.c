@@ -39744,6 +39744,36 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
+/* Mode 3: computed next-layer routing prediction (DS4_CUDA_DECODE_PREDICT).
+ * See the prediction block inside ds41_moe_partial. */
+static const ds4_weights *g_ds41_predict_w;
+static ds4_gpu_tensor *g_pred_norm, *g_pred_logits, *g_pred_probs,
+                      *g_pred_sel, *g_pred_wts;
+
+static bool ds41_decode_predict_on(void) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_CUDA_DECODE_PREDICT");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v == 1;
+#else
+    return false;
+#endif
+}
+
+static bool ds41_predict_scratch(void) {
+    if (g_pred_sel) return true;
+    g_pred_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g_pred_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g_pred_probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g_pred_wts = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+    g_pred_sel = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+    return g_pred_norm && g_pred_logits && g_pred_probs && g_pred_wts &&
+           g_pred_sel;
+}
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -39765,6 +39795,42 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
     metal_graph_debug_dump_tensor("v41_route_logits", g->route_logits, DS4_N_EXPERT, il, (uint32_t)g->pos);
+    /* Mode 3: predict layer il+1's experts from the state we hold RIGHT NOW.
+     * Measured: this names 55.7% of the experts that will actually miss, one
+     * layer before they are needed. Everything here is enqueued on the same
+     * stream L's work uses; begin_load's entry sync completes it before the
+     * staging orders are read off. A failure anywhere silently skips the
+     * prediction -- it must never fail the layer. */
+    /* prefill_tokens is a tensor handle, not a count -- using it as a
+     * decode test left this block permanently dead in the first build.
+     * ds41_moe_partial is the single-token path (batch prefill routes
+     * through ds41_moe_batch), so no prefill test is needed here. */
+    if (ds41_decode_predict_on() && g->tp_world < 2 && g->streaming &&
+        il + 1u < DS4_N_LAYER && g_ds41_predict_w) {
+        const ds4_layer_weights *ln = &g_ds41_predict_w->layer[il + 1u];
+        const ds4_tensor *nbias = ds41_image_at(g, g->pos) ? ln->ffn_exp_probs_vl
+                                                           : ln->ffn_exp_probs_b;
+        uint64_t ngate_row = 0, ndown_row = 0;
+        if (ln->ffn_gate_inp && ln->ffn_norm && l->ffn_norm && nbias &&
+            ln->ffn_gate_exps && ln->ffn_up_exps && ln->ffn_down_exps &&
+            tensor_nbytes(ln->ffn_gate_exps->type, DS4_N_EMBD, &ngate_row) &&
+            tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &ndown_row) &&
+            ds41_predict_scratch() &&
+            ds4_gpu_dsv41_norm_swap(g_pred_norm, g->norm, m->map, m->size,
+                                    l->ffn_norm->abs_offset,
+                                    ln->ffn_norm->abs_offset, DS4_N_EMBD) &&
+            ds41_matmul(g_pred_logits, m, ln->ffn_gate_inp, g_pred_norm, false) &&
+            ds4_gpu_router_select_tensor(g_pred_sel, g_pred_wts, g_pred_probs,
+                m->map, m->size, nbias->abs_offset, 0, 0, token,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0,
+                true, false, g_pred_logits)) {
+            ds4_gpu_dsv41_predict_handoff(g_pred_sel, g_pred_wts,
+                ln->ffn_gate_exps->abs_offset, ln->ffn_up_exps->abs_offset,
+                ln->ffn_down_exps->abs_offset,
+                ngate_row * DS4_N_FF_EXP, ndown_row * DS4_N_EMBD,
+                DS4_N_EXPERT_USED);
+        }
+    }
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -40274,6 +40340,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    if (ds41_decode_predict_on()) g_ds41_predict_w = w;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
