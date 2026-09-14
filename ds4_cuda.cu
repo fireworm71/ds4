@@ -183,11 +183,20 @@ static int cuda_stream_compact_prefill(const char **gate, const char **up,
                                       const char **down, const int32_t **ids,
                                       uint32_t *experts, uint32_t in_dim = 0,
                                       uint32_t mid_dim = 0, uint32_t out_dim = 0);
+/* Speculative expert prefetch (opt-in, see the big comment block above
+ * cuda_stream_selected_cache_begin_load). Both are no-ops unless
+ * DS4_CUDA_EXPERT_PREFETCH is set. */
+static void cuda_pf_cache_reset(void);
+static void cuda_pf_shutdown(void);
+
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
 }
 
 static void cuda_stream_selected_cache_release(void) {
+    /* Drop anything the prefetcher planned against the cache being torn down.
+     * The reader holds no device pointer, so nothing else is required. */
+    cuda_pf_cache_reset();
     const int tier = g_stream_selected_cache.logical_tier;
     if (tier >= 0 && tier < g_n_gpus) {
         (void)ds4_gpu_set_current_device(tier);
@@ -2850,6 +2859,10 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
+    /* Join the speculative prefetch reader first: it must not outlive the
+     * model file descriptors and staging buffers it reads through. No-op
+     * unless the prefetcher was enabled. */
+    cuda_pf_shutdown();
     ds4_gpu_tp_shutdown();
     (void)cudaDeviceSynchronize();
     ds4_gpu_decode_graphs_invalidate();
@@ -27433,6 +27446,943 @@ static void cuda_expert_cache_stats_report(void) {
 }
 
 
+/* =========================================================================
+ * Speculative long-horizon expert prefetch                (opt-in, off by default)
+ * =========================================================================
+ *
+ * WHAT IT IS
+ *   The SSD expert cache is a plain global-LRU slot cache. Instrumented decode
+ *   runs on GB10 show its remaining misses are NOT a recency problem:
+ *     - zero misses for any expert used within the last 16 tokens, so LRU is
+ *       already perfect inside its horizon;
+ *     - 47.5% of Q4 misses are experts last used 65..256 tokens ago, i.e. just
+ *       past the eviction horizon (~3977 slots / ~40 admissions per token);
+ *     - 36.8% were never used before and are unpredictable from history;
+ *     - 61.3% of evicted experts were never reused, so the LRU tail is mostly
+ *       one-offs.
+ *   This adds a second, speculative admission path that targets exactly the
+ *   65..256-token band: a decayed per-(layer,expert) recurrence counter with a
+ *   half-life of ~128 tokens picks experts that keep coming back but are not
+ *   currently resident, a background reader pulls them off disk during the
+ *   ~56% of the decode step that is compute rather than I/O, and the foreground
+ *   installs them into the slot cache at the one point where that is provably
+ *   safe (see SLOT LIFETIME SAFETY below).
+ *
+ *   Deliberately NOT implemented: any predictor over the last 1..8 tokens of
+ *   routing. Measured window sizes 1, 2, 4 and 8 all reproduced the baseline
+ *   87.4% hit rate exactly, because every expert such a window names is already
+ *   resident. Only long-horizon recurrence carries signal here.
+ *
+ * ------------------------------------------------------------------------
+ * ENVIRONMENT VARIABLES -- every behavioural change added by this feature is
+ * individually gated, and with none of these set the streaming path is the
+ * stock path. Read this block to know exactly how to turn any piece off.
+ *
+ *   DS4_CUDA_EXPERT_PREFETCH_OFF=1
+ *       MASTER KILL SWITCH. Default unset. When set (to anything other than
+ *       "0"/"off"/"no"/"false") nothing in this file's prefetch section ever
+ *       runs, whatever any other variable below says. Use it to return the
+ *       binary to stock behaviour without a rebuild.
+ *
+ *   DS4_CUDA_EXPERT_PREFETCH=1
+ *       Enables the prefetcher. Default 0 (OFF). This is the only variable
+ *       that turns new behaviour on. With it unset, the two call sites in
+ *       cuda_stream_selected_cache_begin_load() are one already-cached int
+ *       test each and nothing else differs: no field added to
+ *       cuda_stream_expert_slot, no change to the demand path's victim scan,
+ *       no change to eviction order, no extra CUDA call, no extra thread.
+ *
+ *   DS4_CUDA_EXPERT_PREFETCH_BUDGET=N
+ *       Experts that may be speculatively ordered per decode token.
+ *       Default 8. Clamped to 0..64. N=0 keeps the predictor scoring but
+ *       orders, fetches and inserts nothing -- use it to measure the
+ *       predictor's own cost with none of its effect.
+ *       Sizing note: the cache is zero-sum. A speculative insert that is
+ *       never used still consumes a slot lifetime and therefore shortens the
+ *       LRU horizon for everything else. With ~40 admissions per token at Q4,
+ *       a budget of N and precision p moves the horizon by 40/(40+N*(1-p)).
+ *       The default is deliberately well under the ~38 experts/token of idle
+ *       disk bandwidth for that reason.
+ *
+ *   DS4_CUDA_EXPERT_PREFETCH_MIN_AGE=T
+ *       Victim floor in decode tokens, applied to the SPECULATIVE insert path
+ *       ONLY. A speculative load may only take a slot that is empty or has
+ *       been untouched for at least T tokens. Default 32. T=0 makes the
+ *       speculative insert use plain global LRU, the same rule the demand
+ *       path uses. This gets its own variable because it is an
+ *       eviction-policy decision; the demand path's victim loop in
+ *       cuda_stream_selected_cache_begin_load() is not modified by this
+ *       feature under any setting.
+ *
+ *   DS4_CUDA_EXPERT_PREFETCH_HALFLIFE=H
+ *       Half-life in decode tokens of the recurrence counter. Default 128,
+ *       chosen to sit inside the measured 65..256-token recurrence band.
+ *       Clamped to 8..4096. Predictor tuning only.
+ *
+ *   DS4_CUDA_EXPERT_PREFETCH_MINSCORE=S
+ *       Minimum decayed recurrence score for an expert to be a candidate.
+ *       Default 1.0. A candidate must also have been selected at least twice
+ *       ever (DS4_PF_MIN_SEEN), which is the "demonstrated recurrence" test.
+ *       Predictor tuning only.
+ *
+ *   DS4_CUDA_EXPERT_PREFETCH_STATS=1
+ *       Periodic accounting to stderr every DS4_PF_REPORT_TOKENS tokens.
+ *       Reporting only; changes no behaviour.
+ *
+ * ------------------------------------------------------------------------
+ * SLOT LIFETIME SAFETY -- the property that must hold
+ *
+ *   cuda_stream_selected_cache_begin_load() builds a slot mapping, copies it
+ *   to cache.slot_selected_ptr, returns, and routed_moe_launch() then launches
+ *   MoE kernels that read those slots ASYNCHRONOUSLY. A slot must therefore
+ *   never be overwritten while a kernel that was handed that slot index may
+ *   still be reading it. A mutex around the bookkeeping does not give this:
+ *   the kernel does not take the mutex.
+ *
+ *   The design here removes the hazard by construction rather than by
+ *   synchronising against it. The background reader thread NEVER touches the
+ *   slot cache. Concretely, cuda_pf_reader_main() touches only:
+ *     - the mutex-protected work rings below,
+ *     - its own pinned host staging slabs,
+ *     - pread() on the model file via cuda_model_stage_read().
+ *   It never calls a CUDA API, never reads or writes g_stream_expert_slots,
+ *   g_stream_expert_by_gate, or any byte of cache.gate_ptr / up_ptr /
+ *   down_ptr. It hands the foreground completed HOST buffers, nothing more.
+ *
+ *   All slot mutation happens in cuda_pf_apply_ready(), which is called from
+ *   exactly one place: inside cuda_stream_selected_cache_begin_load(), after
+ *   the cudaStreamSynchronize(cuda_decode_stream()) at the top of that
+ *   function has returned, and before this call's mapping is written to
+ *   cache.slot_selected_ptr. At that instant:
+ *
+ *     (1) Every kernel from the previous mapping has completed. begin_load
+ *         synchronises the decode stream before it does anything else, and
+ *         that is the same fact the existing demand-path eviction already
+ *         relies on to overwrite victim slots.
+ *     (2) No kernel from this call's mapping can have been launched, because
+ *         begin_load has not returned yet and the mapping it will publish has
+ *         not been written.
+ *
+ *   (1) and (2) together mean no kernel is reading ANY slot at that moment, so
+ *   overwriting any slot is safe -- there is no such thing as an in-flight
+ *   slot index to exclude. This is strictly the same window in which the
+ *   existing demand path already evicts, so the speculative path inherits an
+ *   invariant that is already load-bearing rather than adding a new one.
+ *
+ *   Corollaries worth stating, because they are what the earlier broken
+ *   attempt got wrong:
+ *     - No slot index is ever chosen as a victim on a thread other than the
+ *       one running begin_load.
+ *     - No device write is ever issued from the reader thread, so there is no
+ *       window between "chose a victim" and "wrote the victim" that a kernel
+ *       can fall into.
+ *     - The H2D copies issued by cuda_pf_apply_ready() run on their own
+ *       non-blocking stream and are synchronised before the function returns,
+ *       so they are complete before begin_load publishes anything.
+ *     - g_stream_expert_by_gate is updated only after that synchronise
+ *       succeeds, so a failed copy can never be observed as a cache hit.
+ *
+ *   Cache teardown is handled the same way: cuda_pf_cache_reset() (called from
+ *   cuda_stream_selected_cache_release()) bumps g_pf_epoch, and every queued
+ *   order and staged buffer carries the epoch it was created under; a stale
+ *   one is dropped at apply time instead of being written into a reallocated
+ *   cache. The reader cannot hold a dangling device pointer because it never
+ *   holds a device pointer at all.
+ *
+ * ------------------------------------------------------------------------
+ * COST WHEN ENABLED
+ *   Foreground work added per decode token: one bounded ring drain per
+ *   begin_load call (early-out when empty), at most g_pf_budget victim scans
+ *   and 3*budget H2D copies spread over the token, ~4*budget hash lookups at
+ *   the token boundary, and ~320 12-byte pushes onto an observation ring. The
+ *   scoring scan, the top-K selection and every disk read run on the reader
+ *   thread. The reader also parks itself whenever the foreground is inside
+ *   begin_load (g_pf_fg_busy), so it reads during the compute phase and stays
+ *   out of the demand path's way during the fetch phase.
+ * ========================================================================= */
+
+#define DS4_PF_MAX_LAYER       64u
+#define DS4_PF_MAX_EXPERT      512u
+#define DS4_PF_MAX_BUDGET      64u
+#define DS4_PF_RING            128u   /* power of two; order/ready/applied rings */
+#define DS4_PF_OBS_RING        8192u  /* power of two; ~25 tokens of backlog */
+#define DS4_PF_PLAN_CAP        256u
+#define DS4_PF_MAX_SLABS       16u
+#define DS4_PF_FREE_RING       32u    /* power of two, > DS4_PF_MAX_SLABS */
+#define DS4_PF_APPLY_PER_CALL  4u     /* applies per begin_load; spreads the H2D */
+#define DS4_PF_MIN_SEEN        2u     /* "demonstrated recurrence": seen twice */
+#define DS4_PF_ORDER_TTL       8u     /* tokens an unfilled order stays claimed */
+#define DS4_PF_OUTCOME_TTL     512u   /* tokens to wait for a speculative hit */
+#define DS4_PF_REPORT_TOKENS   256u
+
+/* Per (layer, expert) recurrence state. Owned by the reader thread; the
+ * foreground never touches it. */
+struct cuda_pf_stat {
+    float    score;      /* decayed selection counter, valid as of last_tok */
+    uint32_t last_tok;   /* decode token of the last selection, 0 = never */
+    uint32_t mark_tok;   /* decode token the current `state` was entered */
+    uint16_t seen;       /* saturating count of distinct tokens seen on */
+    uint8_t  state;      /* 0 idle, 1 ordered, 2 speculatively resident */
+    uint8_t  pad;
+};
+
+/* One speculative expert to pull off disk. Built by the foreground (which owns
+ * the layer geometry and the residency map), filled by the reader. */
+struct cuda_pf_order {
+    const void *model_map;
+    uint64_t    model_size;
+    uint64_t    gate, up, down;      /* absolute file offsets */
+    uint64_t    gate_bytes, down_bytes;
+    uint64_t    epoch;               /* g_pf_epoch when this order was made */
+    uint32_t    layer, expert;
+    uint32_t    slab;                /* staging slab the reader filled */
+};
+
+/* A completed host-side read waiting for the foreground to install it. */
+struct cuda_pf_ready {
+    cuda_pf_order order;
+    const char   *gate_src, *up_src, *down_src;   /* into slab `order.slab` */
+};
+
+struct cuda_pf_cand { float score; uint16_t layer, expert; };
+struct cuda_pf_le   { uint16_t layer, expert; };
+
+/* Geometry of one layer's expert table, snapshotted by the foreground the
+ * first time it loads that layer. Only the foreground reads it. */
+struct cuda_pf_layer {
+    const void *model_map;
+    uint64_t    model_size;
+    uint64_t    gate_offset, up_offset, down_offset;
+    uint64_t    gate_bytes, down_bytes;
+    uint32_t    n_expert;
+    uint8_t     valid;
+};
+
+/* ---- configuration (resolved once, then read-only) ---------------------- */
+static int      g_pf_on = -1;          /* -1 not yet resolved, 0 off, 1 on */
+static uint32_t g_pf_budget;
+static uint32_t g_pf_min_age_tokens;
+static float    g_pf_halflife = 128.0f;
+static float    g_pf_min_score = 1.0f;
+static int      g_pf_stats;
+
+/* ---- shared work rings, all under g_pf_mu ------------------------------- */
+static pthread_mutex_t g_pf_mu   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_pf_wake = PTHREAD_COND_INITIALIZER;
+
+struct cuda_pf_obs { uint32_t token; uint16_t layer, expert; uint8_t hit, pad; };
+static cuda_pf_obs   g_pf_obs_ring[DS4_PF_OBS_RING];
+static uint32_t      g_pf_obs_head, g_pf_obs_tail;
+static cuda_pf_order g_pf_order_ring[DS4_PF_RING];
+static uint32_t      g_pf_order_head, g_pf_order_tail;
+static cuda_pf_ready g_pf_ready_ring[DS4_PF_RING];
+static uint32_t      g_pf_ready_head, g_pf_ready_tail;
+static cuda_pf_le    g_pf_applied_ring[DS4_PF_RING];
+static uint32_t      g_pf_applied_head, g_pf_applied_tail;
+static uint32_t      g_pf_free_ring[DS4_PF_FREE_RING];
+static uint32_t      g_pf_free_head, g_pf_free_tail;
+static cuda_pf_cand  g_pf_plan[DS4_PF_PLAN_CAP];
+static uint32_t      g_pf_plan_n;
+static uint32_t      g_pf_cur_token;   /* decode tokens observed so far */
+static int           g_pf_fg_busy;     /* foreground is inside begin_load */
+static bool          g_pf_stop;
+static bool          g_pf_thread_started;
+static pthread_t     g_pf_thread;
+
+/* ---- foreground-only state ---------------------------------------------- */
+static cuda_pf_layer g_pf_layer[DS4_PF_MAX_LAYER];
+static uint64_t      g_pf_epoch = 1;
+static uint64_t      g_pf_ticks_per_token;   /* begin_load calls per token */
+static uint64_t      g_pf_last_token_stamp;
+static cudaStream_t  g_pf_upload_stream;
+static char         *g_pf_slab_gate[DS4_PF_MAX_SLABS];
+static char         *g_pf_slab_up[DS4_PF_MAX_SLABS];
+static char         *g_pf_slab_down[DS4_PF_MAX_SLABS];
+static uint64_t      g_pf_slab_gate_stage, g_pf_slab_down_stage;
+static uint64_t      g_pf_slab_gate_bytes, g_pf_slab_down_bytes;
+static uint32_t      g_pf_slab_n;
+
+/* ---- accounting (stats only) -------------------------------------------- */
+static uint64_t g_pf_n_ordered, g_pf_n_applied, g_pf_n_rejected, g_pf_n_stale;
+static uint64_t g_pf_n_obs_dropped, g_pf_n_order_dropped;
+static uint64_t g_pf_n_read_fail, g_pf_n_used, g_pf_n_expired, g_pf_n_late;
+
+static uint32_t cuda_pf_env_u32(const char *name, uint32_t dflt,
+                                uint32_t lo, uint32_t hi) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return dflt;
+    char *end = NULL;
+    const unsigned long v = strtoul(s, &end, 10);
+    if (end == s) return dflt;
+    if (v < (unsigned long)lo) return lo;
+    if (v > (unsigned long)hi) return hi;
+    return (uint32_t)v;
+}
+
+static float cuda_pf_env_f32(const char *name, float dflt, float lo, float hi) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return dflt;
+    char *end = NULL;
+    const double v = strtod(s, &end);
+    if (end == s) return dflt;
+    if (v < (double)lo) return lo;
+    if (v > (double)hi) return hi;
+    return (float)v;
+}
+
+static int cuda_pf_env_flag_set(const char *name) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return 0;
+    return !(s[0] == '0' || strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+             strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+             strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0);
+}
+
+/* Resolve the environment exactly once. Returns 1 when the prefetcher is
+ * enabled. The master kill switch is checked first and wins outright. */
+static int cuda_pf_config(void) {
+    if (g_pf_on >= 0) return g_pf_on;
+    if (cuda_pf_env_flag_set("DS4_CUDA_EXPERT_PREFETCH_OFF")) {
+        fprintf(stderr, "ds4: DS4_CUDA_EXPERT_PREFETCH_OFF set - "
+                        "speculative expert prefetch disabled\n");
+        g_pf_on = 0;
+        return 0;
+    }
+    if (!cuda_pf_env_flag_set("DS4_CUDA_EXPERT_PREFETCH")) { g_pf_on = 0; return 0; }
+    g_pf_budget         = cuda_pf_env_u32("DS4_CUDA_EXPERT_PREFETCH_BUDGET", 8u, 0u,
+                                          DS4_PF_MAX_BUDGET);
+    g_pf_min_age_tokens = cuda_pf_env_u32("DS4_CUDA_EXPERT_PREFETCH_MIN_AGE", 32u, 0u, 65535u);
+    g_pf_halflife       = cuda_pf_env_f32("DS4_CUDA_EXPERT_PREFETCH_HALFLIFE", 128.0f,
+                                          8.0f, 4096.0f);
+    g_pf_min_score      = cuda_pf_env_f32("DS4_CUDA_EXPERT_PREFETCH_MINSCORE", 1.0f,
+                                          0.0f, 1.0e6f);
+    g_pf_stats          = cuda_pf_env_flag_set("DS4_CUDA_EXPERT_PREFETCH_STATS");
+    g_pf_on = 1;
+    fprintf(stderr,
+            "ds4: CUDA speculative expert prefetch on: budget=%u/token, "
+            "min_age=%u tokens, halflife=%.0f tokens, min_score=%.2f\n",
+            g_pf_budget, g_pf_min_age_tokens, (double)g_pf_halflife,
+            (double)g_pf_min_score);
+    return 1;
+}
+
+static inline int cuda_pf_enabled(void) {
+    return g_pf_on >= 0 ? g_pf_on : cuda_pf_config();
+}
+
+/* ------------------------------------------------------------------------ *
+ * Reader thread. Touches no CUDA API and no slot-cache state; see the
+ * SLOT LIFETIME SAFETY note above.
+ * ------------------------------------------------------------------------ */
+
+static cuda_pf_stat *g_pf_tab;   /* [DS4_PF_MAX_LAYER][DS4_PF_MAX_EXPERT] */
+static uint8_t       g_pf_tab_layer_seen[DS4_PF_MAX_LAYER];
+static uint32_t      g_pf_plan_tok;   /* last token the reader planned for */
+
+static inline cuda_pf_stat *cuda_pf_stat_at(uint32_t layer, uint32_t expert) {
+    return &g_pf_tab[(size_t)layer * DS4_PF_MAX_EXPERT + expert];
+}
+
+/* Decayed recurrence value of `st` as of token `tok`. Exponential decay with
+ * the configured half-life; this is the long-horizon signal, and it is the
+ * only thing the predictor uses. An expert selected every ~128 tokens settles
+ * near 2.0, a single one-off 128 tokens back sits at 0.5, so the default
+ * min_score of 1.0 keeps one-offs out. */
+static inline float cuda_pf_decayed(const cuda_pf_stat *st, uint32_t tok,
+                                    float inv_halflife) {
+    const uint32_t age = tok - st->last_tok;
+    if (!age) return st->score;
+    return st->score * exp2f(-(float)age * inv_halflife);
+}
+
+static void cuda_pf_reader_apply_obs(const cuda_pf_obs *obs, uint32_t n,
+                                     float inv_halflife) {
+    for (uint32_t i = 0; i < n; i++) {
+        cuda_pf_stat *st = cuda_pf_stat_at(obs[i].layer, obs[i].expert);
+        g_pf_tab_layer_seen[obs[i].layer] = 1u;
+        if (st->state) {
+            /* This expert was speculatively loaded and has now been asked
+             * for: that is the outcome we were waiting on. */
+            if (st->state == 2u) {
+                if (obs[i].hit) g_pf_n_used++; else g_pf_n_late++;
+            }
+            st->state = 0u;
+        }
+        if (st->last_tok == obs[i].token && st->seen) continue;  /* once per token */
+        st->score = cuda_pf_decayed(st, obs[i].token, inv_halflife) + 1.0f;
+        st->last_tok = obs[i].token;
+        if (st->seen < 0xffffu) st->seen++;
+    }
+}
+
+/* Rank the non-resident-by-history candidates for token `tok` and publish the
+ * top `want` of them. Residency is deliberately NOT consulted here -- the
+ * reader must not touch g_stream_expert_by_gate -- so the foreground filters
+ * the published plan against the live residency map before ordering. */
+static bool cuda_pf_cand_stronger(const cuda_pf_cand &a, const cuda_pf_cand &b) {
+    return a.score > b.score;
+}
+
+static void cuda_pf_reader_plan(uint32_t tok, uint32_t want) {
+    if (want > DS4_PF_PLAN_CAP) want = DS4_PF_PLAN_CAP;
+    cuda_pf_cand best[DS4_PF_PLAN_CAP];
+    uint32_t n = 0, worst_i = 0;
+    float    worst = 0.0f;
+    const float inv_hl = 1.0f / g_pf_halflife;
+    const float floor_score = g_pf_min_score;
+    for (uint32_t L = 0; L < DS4_PF_MAX_LAYER; L++) {
+        if (!g_pf_tab_layer_seen[L]) continue;
+        cuda_pf_stat *row = cuda_pf_stat_at(L, 0);
+        for (uint32_t e = 0; e < DS4_PF_MAX_EXPERT; e++) {
+            cuda_pf_stat *st = &row[e];
+            if (st->state) {
+                /* Expire claims so a prediction that never landed, or one that
+                 * landed and was never asked for, can be made again. */
+                const uint32_t age = tok - st->mark_tok;
+                if (st->state == 1u && age > DS4_PF_ORDER_TTL) st->state = 0u;
+                else if (st->state == 2u && age > DS4_PF_OUTCOME_TTL) {
+                    g_pf_n_expired++;
+                    st->state = 0u;
+                } else continue;
+            }
+            if (st->seen < DS4_PF_MIN_SEEN) continue;
+            if (st->score < floor_score) continue;   /* decay only shrinks it */
+            if (st->last_tok == tok) continue;       /* selected this very token */
+            const float eff = cuda_pf_decayed(st, tok, inv_hl);
+            if (eff < floor_score) continue;
+            if (n == want) {
+                if (want == 0u || eff <= worst) continue;
+                best[worst_i].score  = eff;
+                best[worst_i].layer  = (uint16_t)L;
+                best[worst_i].expert = (uint16_t)e;
+            } else {
+                best[n].score  = eff;
+                best[n].layer  = (uint16_t)L;
+                best[n].expert = (uint16_t)e;
+                n++;
+                if (n < want) continue;
+            }
+            worst = best[0].score;
+            worst_i = 0;
+            for (uint32_t k = 1; k < n; k++)
+                if (best[k].score < worst) { worst = best[k].score; worst_i = k; }
+        }
+    }
+    if (n > 1u) std::sort(best, best + n, cuda_pf_cand_stronger);
+    /* Claim them so the next plan does not re-propose the same experts while
+     * these are still in flight. DS4_PF_ORDER_TTL releases the claim if the
+     * foreground drops the candidate (because it turned out to be resident). */
+    for (uint32_t i = 0; i < n; i++) {
+        cuda_pf_stat *st = cuda_pf_stat_at(best[i].layer, best[i].expert);
+        st->state = 1u;
+        st->mark_tok = tok;
+    }
+    pthread_mutex_lock(&g_pf_mu);
+    memcpy(g_pf_plan, best, (size_t)n * sizeof(best[0]));
+    g_pf_plan_n = n;
+    pthread_mutex_unlock(&g_pf_mu);
+}
+
+static void *cuda_pf_reader_main(void *arg) {
+    (void)arg;
+    cuda_pf_obs obs[256];
+    cuda_pf_le  applied[64];
+    for (;;) {
+        cuda_pf_order ord;
+        uint32_t n_obs = 0, n_applied = 0, tok = 0;
+        int have_order = 0, plan_due = 0, obs_empty = 0;
+        memset(&ord, 0, sizeof(ord));
+
+        pthread_mutex_lock(&g_pf_mu);
+        for (;;) {
+            if (g_pf_stop) { pthread_mutex_unlock(&g_pf_mu); return NULL; }
+            const int has_obs     = g_pf_obs_head != g_pf_obs_tail;
+            const int has_applied = g_pf_applied_head != g_pf_applied_tail;
+            const int can_read    = !g_pf_fg_busy &&
+                                    g_pf_order_head != g_pf_order_tail &&
+                                    g_pf_free_head != g_pf_free_tail;
+            plan_due = g_pf_cur_token != g_pf_plan_tok;
+            if (has_obs || has_applied || can_read || plan_due) break;
+            pthread_cond_wait(&g_pf_wake, &g_pf_mu);
+        }
+        tok = g_pf_cur_token;
+        while (n_obs < (uint32_t)(sizeof(obs) / sizeof(obs[0])) &&
+               g_pf_obs_head != g_pf_obs_tail)
+            obs[n_obs++] = g_pf_obs_ring[g_pf_obs_head++ & (DS4_PF_OBS_RING - 1u)];
+        while (n_applied < (uint32_t)(sizeof(applied) / sizeof(applied[0])) &&
+               g_pf_applied_head != g_pf_applied_tail)
+            applied[n_applied++] = g_pf_applied_ring[g_pf_applied_head++ & (DS4_PF_RING - 1u)];
+        obs_empty = g_pf_obs_head == g_pf_obs_tail;
+        /* Only start a read when the foreground is not itself on the disk, and
+         * only once scoring has caught up, so predictions never go stale. */
+        if (!g_pf_fg_busy && obs_empty &&
+            g_pf_order_head != g_pf_order_tail && g_pf_free_head != g_pf_free_tail) {
+            ord = g_pf_order_ring[g_pf_order_head++ & (DS4_PF_RING - 1u)];
+            ord.slab = g_pf_free_ring[g_pf_free_head++ & (DS4_PF_FREE_RING - 1u)];
+            have_order = 1;
+        }
+        pthread_mutex_unlock(&g_pf_mu);
+
+        const float inv_hl = 1.0f / g_pf_halflife;
+        if (n_obs) cuda_pf_reader_apply_obs(obs, n_obs, inv_hl);
+        for (uint32_t i = 0; i < n_applied; i++) {
+            cuda_pf_stat *st = cuda_pf_stat_at(applied[i].layer, applied[i].expert);
+            st->state = 2u;
+            st->mark_tok = tok;
+        }
+        if (plan_due && obs_empty) {
+            g_pf_plan_tok = tok;
+            cuda_pf_reader_plan(tok, g_pf_budget * 4u);
+        }
+        if (!have_order) continue;
+
+        /* The three spans of one expert. Between spans, park while the
+         * foreground is fetching so the demand path keeps the disk to itself. */
+        const uint32_t sl = ord.slab;
+        const char *src[3] = {NULL, NULL, NULL};
+        char *const dst[3] = {g_pf_slab_gate[sl], g_pf_slab_up[sl], g_pf_slab_down[sl]};
+        const uint64_t cap[3] = {g_pf_slab_gate_stage, g_pf_slab_gate_stage,
+                                 g_pf_slab_down_stage};
+        const uint64_t off[3] = {ord.gate, ord.up, ord.down};
+        const uint64_t len[3] = {ord.gate_bytes, ord.gate_bytes, ord.down_bytes};
+        int ok = 1;
+        for (uint32_t s = 0; s < 3u && ok; s++) {
+            pthread_mutex_lock(&g_pf_mu);
+            while (g_pf_fg_busy && !g_pf_stop) pthread_cond_wait(&g_pf_wake, &g_pf_mu);
+            const int stop = g_pf_stop;
+            pthread_mutex_unlock(&g_pf_mu);
+            if (stop) { ok = 0; break; }
+            if (!cuda_model_stage_read(dst[s], cap[s], off[s], len[s], &src[s])) {
+                ok = 0;
+                break;
+            }
+            cuda_model_drop_file_pages(off[s], len[s]);
+            cuda_model_discard_source_pages(ord.model_map, ord.model_size,
+                                            off[s], len[s]);
+        }
+
+        pthread_mutex_lock(&g_pf_mu);
+        if (!ok) {
+            g_pf_n_read_fail++;
+            g_pf_free_ring[g_pf_free_tail++ & (DS4_PF_FREE_RING - 1u)] = sl;
+        } else if (g_pf_ready_tail - g_pf_ready_head >= DS4_PF_RING) {
+            g_pf_free_ring[g_pf_free_tail++ & (DS4_PF_FREE_RING - 1u)] = sl;
+        } else {
+            cuda_pf_ready &r = g_pf_ready_ring[g_pf_ready_tail++ & (DS4_PF_RING - 1u)];
+            r.order    = ord;
+            r.gate_src = src[0];
+            r.up_src   = src[1];
+            r.down_src = src[2];
+        }
+        pthread_mutex_unlock(&g_pf_mu);
+    }
+}
+
+/* Pinned host staging, one slab per concurrently readable expert. Allocated
+ * once from the foreground when the expert geometry is first known, and never
+ * freed (the feature is opt-in and the buffers are reused for the process
+ * lifetime). Returns 0 and disables the feature if it cannot be sized. */
+static int cuda_pf_slabs_ensure(uint64_t gate_bytes, uint64_t down_bytes) {
+    if (g_pf_slab_n && g_pf_slab_gate_bytes == gate_bytes &&
+        g_pf_slab_down_bytes == down_bytes) return 1;
+    if (g_pf_slab_n) return 0;   /* geometry changed under us; stay out of the way */
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1u;
+    const uint64_t gate_stage = cuda_round_up(gate_bytes + 2u * align, align);
+    const uint64_t down_stage = cuda_round_up(down_bytes + 2u * align, align);
+    uint32_t want = g_pf_budget < DS4_PF_MAX_SLABS ? g_pf_budget : DS4_PF_MAX_SLABS;
+    if (!want) want = 1u;
+    const uint64_t slab_bytes = align + 2u * gate_stage + down_stage;
+    for (uint32_t i = 0; i < want; i++) {
+        void *p = NULL;
+        if (cudaHostAlloc(&p, (size_t)slab_bytes, cudaHostAllocDefault) != cudaSuccess) {
+            (void)cudaGetLastError();
+            break;
+        }
+        /* Never freed: the feature is opt-in and the slabs are reused for the
+         * process lifetime, so the raw allocation is not retained. */
+        char *b = (char *)cuda_align_ptr(p, align);
+        g_pf_slab_gate[i] = b;
+        g_pf_slab_up[i]   = b + gate_stage;
+        g_pf_slab_down[i] = b + 2u * gate_stage;
+        g_pf_slab_n = i + 1u;
+    }
+    if (!g_pf_slab_n) {
+        fprintf(stderr, "ds4: CUDA expert prefetch staging alloc failed - disabled\n");
+        g_pf_on = 0;
+        return 0;
+    }
+    g_pf_slab_gate_stage = gate_stage;
+    g_pf_slab_down_stage = down_stage;
+    g_pf_slab_gate_bytes = gate_bytes;
+    g_pf_slab_down_bytes = down_bytes;
+    g_pf_free_head = g_pf_free_tail = 0;
+    for (uint32_t i = 0; i < g_pf_slab_n; i++)
+        g_pf_free_ring[g_pf_free_tail++ & (DS4_PF_FREE_RING - 1u)] = i;
+    fprintf(stderr, "ds4: CUDA expert prefetch staging: %u slabs, %.1f MiB pinned\n",
+            g_pf_slab_n, (double)(slab_bytes * g_pf_slab_n) / 1048576.0);
+    return 1;
+}
+
+static int cuda_pf_start(uint64_t gate_bytes, uint64_t down_bytes) {
+    if (!g_pf_tab) {
+        g_pf_tab = (cuda_pf_stat *)calloc((size_t)DS4_PF_MAX_LAYER * DS4_PF_MAX_EXPERT,
+                                          sizeof(cuda_pf_stat));
+        if (!g_pf_tab) { g_pf_on = 0; return 0; }
+    }
+    if (!cuda_pf_slabs_ensure(gate_bytes, down_bytes)) return 0;
+    if (!g_pf_upload_stream &&
+        cudaStreamCreateWithFlags(&g_pf_upload_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: CUDA expert prefetch stream create failed - disabled\n");
+        g_pf_on = 0;
+        return 0;
+    }
+    if (!g_pf_thread_started) {
+        if (pthread_create(&g_pf_thread, NULL, cuda_pf_reader_main, NULL) != 0) {
+            fprintf(stderr, "ds4: CUDA expert prefetch reader thread failed - disabled\n");
+            g_pf_on = 0;
+            return 0;
+        }
+        g_pf_thread_started = true;
+    }
+    return 1;
+}
+
+/* Called from cuda_stream_selected_cache_release(). The reader holds no device
+ * pointer, so all this has to do is invalidate work that was planned against
+ * the old cache geometry. */
+static void cuda_pf_cache_reset(void) {
+    if (g_pf_on <= 0) return;
+    pthread_mutex_lock(&g_pf_mu);
+    g_pf_epoch++;
+    while (g_pf_ready_head != g_pf_ready_tail) {
+        const uint32_t sl = g_pf_ready_ring[g_pf_ready_head++ & (DS4_PF_RING - 1u)].order.slab;
+        g_pf_free_ring[g_pf_free_tail++ & (DS4_PF_FREE_RING - 1u)] = sl;
+    }
+    g_pf_order_head = g_pf_order_tail;
+    g_pf_plan_n = 0;
+    pthread_mutex_unlock(&g_pf_mu);
+    memset(g_pf_layer, 0, sizeof(g_pf_layer));
+    g_pf_ticks_per_token = 0;
+    g_pf_last_token_stamp = 0;
+}
+
+/* Called from ds4_gpu_cleanup() before any CUDA teardown, so the reader cannot
+ * outlive the state it reads. */
+static void cuda_pf_shutdown(void) {
+    if (!g_pf_thread_started) return;
+    pthread_mutex_lock(&g_pf_mu);
+    g_pf_stop = true;
+    pthread_cond_broadcast(&g_pf_wake);
+    pthread_mutex_unlock(&g_pf_mu);
+    (void)pthread_join(g_pf_thread, NULL);
+    g_pf_thread_started = false;
+    pthread_mutex_lock(&g_pf_mu);
+    g_pf_stop = false;
+    g_pf_fg_busy = 0;
+    pthread_mutex_unlock(&g_pf_mu);
+}
+
+static void cuda_pf_report(void) {
+    /* used/late/expired/read_fail are the reader's counters; snapshot them
+     * under the lock instead of racing on them for a printf. */
+    uint64_t used, late, expired, read_fail, tok;
+    pthread_mutex_lock(&g_pf_mu);
+    used = g_pf_n_used; late = g_pf_n_late; expired = g_pf_n_expired;
+    read_fail = g_pf_n_read_fail; tok = g_pf_cur_token;
+    pthread_mutex_unlock(&g_pf_mu);
+    fprintf(stderr,
+            "ds4: expert prefetch: tokens=%llu ordered=%llu applied=%llu used=%llu "
+            "(%.1f%% of applied) late=%llu expired=%llu\n",
+            (unsigned long long)tok, (unsigned long long)g_pf_n_ordered,
+            (unsigned long long)g_pf_n_applied, (unsigned long long)used,
+            g_pf_n_applied ? 100.0 * (double)used / (double)g_pf_n_applied : 0.0,
+            (unsigned long long)late, (unsigned long long)expired);
+    fprintf(stderr,
+            "ds4:   rejected(no cold victim)=%llu stale=%llu read_fail=%llu "
+            "obs_dropped=%llu order_dropped=%llu\n",
+            (unsigned long long)g_pf_n_rejected, (unsigned long long)g_pf_n_stale,
+            (unsigned long long)read_fail,
+            (unsigned long long)g_pf_n_obs_dropped,
+            (unsigned long long)g_pf_n_order_dropped);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Foreground hook 1: install completed speculative reads.
+ *
+ * SAFETY: see the SLOT LIFETIME SAFETY note at the top of this section. The
+ * single caller is cuda_stream_selected_cache_begin_load(), after its
+ * cudaStreamSynchronize(cuda_decode_stream()) has returned and before it
+ * writes this call's mapping to cache.slot_selected_ptr, so no kernel can be
+ * reading any slot. This is the same window the demand path already evicts in.
+ * ------------------------------------------------------------------------ */
+static void cuda_pf_apply_ready(uint64_t stamp) {
+    cuda_stream_selected_cache &cache = g_stream_selected_cache;
+    if (!cache.gate_ptr || !cache.up_ptr || !cache.down_ptr ||
+        g_stream_expert_slots.empty() || !g_pf_upload_stream) return;
+
+    cuda_pf_ready batch[DS4_PF_APPLY_PER_CALL];
+    uint32_t n = 0;
+    pthread_mutex_lock(&g_pf_mu);
+    while (n < DS4_PF_APPLY_PER_CALL && g_pf_ready_head != g_pf_ready_tail)
+        batch[n++] = g_pf_ready_ring[g_pf_ready_head++ & (DS4_PF_RING - 1u)];
+    pthread_mutex_unlock(&g_pf_mu);
+    if (!n) return;
+
+    struct { uint32_t slot; uint64_t gate, up, down; uint16_t layer, expert; }
+        claimed[DS4_PF_APPLY_PER_CALL];
+    uint32_t n_claimed = 0;
+    const uint64_t ticks = g_pf_ticks_per_token ? g_pf_ticks_per_token : 1u;
+    const uint64_t min_ticks = (uint64_t)g_pf_min_age_tokens * ticks;
+    const size_t   n_slots = g_stream_expert_slots.size();
+
+    for (uint32_t i = 0; i < n; i++) {
+        const cuda_pf_order &o = batch[i].order;
+        if (o.epoch != g_pf_epoch || o.model_map != cache.model_map ||
+            o.gate_bytes != cache.gate_expert_bytes ||
+            o.down_bytes != cache.down_expert_bytes) { g_pf_n_stale++; continue; }
+        /* Someone demanded it while it was in flight: nothing left to do. */
+        if (g_stream_expert_by_gate.find(o.gate) != g_stream_expert_by_gate.end())
+            continue;
+        uint32_t victim = UINT32_MAX;
+        uint64_t oldest = stamp;
+        for (uint32_t j = 0; j < (uint32_t)n_slots; j++) {
+            if (g_stream_expert_slots[j].used < oldest) {
+                oldest = g_stream_expert_slots[j].used;
+                victim = j;
+                if (!oldest) break;
+            }
+        }
+        /* DS4_CUDA_EXPERT_PREFETCH_MIN_AGE: speculation may only take a slot
+         * that is empty or genuinely cold. Measured decode never misses on an
+         * expert used within the last 16 tokens, so taking a warm slot would
+         * trade a certain hit for a guess. This rule is local to this
+         * function; the demand path's victim loop is untouched. */
+        if (victim != UINT32_MAX && oldest != 0u && min_ticks &&
+            stamp - oldest < min_ticks) victim = UINT32_MAX;
+        if (victim == UINT32_MAX) { g_pf_n_rejected++; continue; }
+
+        cuda_stream_expert_slot &slot = g_stream_expert_slots[victim];
+        if (slot.used) g_stream_expert_by_gate.erase(slot.gate);
+        /* Mark taken immediately so the next iteration cannot pick it again;
+         * with no gate entry the slot is unreachable until we publish it. */
+        slot.used = stamp;
+        slot.hits = 0;
+        if (cudaMemcpyAsync(cache.gate_ptr + (uint64_t)victim * cache.gate_expert_bytes,
+                            batch[i].gate_src, (size_t)o.gate_bytes,
+                            cudaMemcpyHostToDevice, g_pf_upload_stream) != cudaSuccess ||
+            cudaMemcpyAsync(cache.up_ptr + (uint64_t)victim * cache.gate_expert_bytes,
+                            batch[i].up_src, (size_t)o.gate_bytes,
+                            cudaMemcpyHostToDevice, g_pf_upload_stream) != cudaSuccess ||
+            cudaMemcpyAsync(cache.down_ptr + (uint64_t)victim * cache.down_expert_bytes,
+                            batch[i].down_src, (size_t)o.down_bytes,
+                            cudaMemcpyHostToDevice, g_pf_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            slot.used = 0;
+            continue;
+        }
+        claimed[n_claimed].slot   = victim;
+        claimed[n_claimed].gate   = o.gate;
+        claimed[n_claimed].up     = o.up;
+        claimed[n_claimed].down   = o.down;
+        claimed[n_claimed].layer  = (uint16_t)o.layer;
+        claimed[n_claimed].expert = (uint16_t)o.expert;
+        n_claimed++;
+    }
+
+    /* Publish only after the copies have landed: a failed copy must never be
+     * observable as a cache hit. On failure the claimed slots go back to empty,
+     * which is consistent because their old gate entries are already gone. */
+    int ok = n_claimed == 0u ||
+             cudaStreamSynchronize(g_pf_upload_stream) == cudaSuccess;
+    if (!ok) (void)cudaGetLastError();
+    for (uint32_t i = 0; i < n_claimed; i++) {
+        cuda_stream_expert_slot &slot = g_stream_expert_slots[claimed[i].slot];
+        if (!ok) { slot.used = 0; continue; }
+        slot = {claimed[i].gate, claimed[i].up, claimed[i].down, stamp};
+        g_stream_expert_by_gate[claimed[i].gate] = claimed[i].slot;
+    }
+    if (ok) g_pf_n_applied += n_claimed;
+
+    pthread_mutex_lock(&g_pf_mu);
+    for (uint32_t i = 0; i < n; i++)
+        g_pf_free_ring[g_pf_free_tail++ & (DS4_PF_FREE_RING - 1u)] = batch[i].order.slab;
+    if (ok) {
+        for (uint32_t i = 0; i < n_claimed; i++) {
+            if (g_pf_applied_tail - g_pf_applied_head >= DS4_PF_RING) break;
+            cuda_pf_le &le = g_pf_applied_ring[g_pf_applied_tail++ & (DS4_PF_RING - 1u)];
+            le.layer  = claimed[i].layer;
+            le.expert = claimed[i].expert;
+        }
+    }
+    pthread_cond_broadcast(&g_pf_wake);
+    pthread_mutex_unlock(&g_pf_mu);
+}
+
+/* A speculative load installed by cuda_pf_apply_ready() a few lines ago can
+ * satisfy the request currently being built. Upgrade those misses to hits so
+ * the demand path does not fetch the same expert a second time and orphan the
+ * slot the speculative copy went into. Mirrors the validation the
+ * hit-protection loop in begin_load does. */
+static void cuda_pf_claim_landed(const ds4_gpu_stream_expert_table *table,
+                                 const int32_t *unique, int32_t *slots,
+                                 uint32_t n_unique, uint64_t stamp) {
+    for (uint32_t i = 0; i < n_unique; i++) {
+        if (slots[i] >= 0) continue;
+        const uint64_t expert = (uint32_t)unique[i];
+        const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
+        const auto found = g_stream_expert_by_gate.find(gate);
+        if (found == g_stream_expert_by_gate.end()) continue;
+        cuda_stream_expert_slot &slot = g_stream_expert_slots[found->second];
+        if (slot.up != table->up_offset + expert * table->gate_expert_bytes ||
+            slot.down != table->down_offset + expert * table->down_expert_bytes)
+            continue;
+        slots[i] = (int32_t)found->second;
+        slot.used = stamp;
+        slot.hits++;
+    }
+}
+
+/* ------------------------------------------------------------------------ *
+ * Foreground hook 2: feed the predictor, and at each token boundary turn the
+ * reader's ranked plan into fetch orders.
+ *
+ * Only decode is learned from. A prefill call asks for a whole batch's experts
+ * at once; folding that into a per-token recurrence counter would swamp it
+ * with a distribution the predictor is not trying to model.
+ * ------------------------------------------------------------------------ */
+/* `slots[i] < 0` must still mean "missed" here, so the single caller runs this
+ * after begin_load's hit-protection loop and before its victim/fetch loop. */
+static void cuda_pf_observe(const ds4_gpu_stream_expert_table *table,
+                            const int32_t *unique, const int32_t *slots,
+                            uint32_t n_unique, uint32_t slot_count,
+                            uint64_t stamp) {
+    if (slot_count > DS4_N_EXPERT_USED_MAX_DECODE) return;   /* prefill */
+    if (table->layer >= DS4_PF_MAX_LAYER ||
+        table->n_total_expert > DS4_PF_MAX_EXPERT) return;
+    if (!cuda_pf_start(table->gate_expert_bytes, table->down_expert_bytes)) return;
+
+    cuda_pf_layer &L = g_pf_layer[table->layer];
+    if (!L.valid || L.model_map != table->model_map ||
+        L.gate_offset != table->gate_offset) {
+        L.model_map   = table->model_map;
+        L.model_size  = table->model_size;
+        L.gate_offset = table->gate_offset;
+        L.up_offset   = table->up_offset;
+        L.down_offset = table->down_offset;
+        L.gate_bytes  = table->gate_expert_bytes;
+        L.down_bytes  = table->down_expert_bytes;
+        L.n_expert    = table->n_total_expert;
+        L.valid       = 1u;
+    }
+
+    const int boundary = table->layer == 0u;
+    cuda_pf_order orders[DS4_PF_MAX_BUDGET];
+    uint32_t n_orders = 0;
+    uint32_t token;
+
+    if (boundary) {
+        if (g_pf_last_token_stamp && stamp > g_pf_last_token_stamp)
+            g_pf_ticks_per_token = stamp - g_pf_last_token_stamp;
+        g_pf_last_token_stamp = stamp;
+    }
+
+    pthread_mutex_lock(&g_pf_mu);
+    if (boundary) g_pf_cur_token++;
+    token = g_pf_cur_token;
+    for (uint32_t i = 0; i < n_unique; i++) {
+        const int32_t e = unique[i];
+        if (e < 0 || (uint32_t)e >= DS4_PF_MAX_EXPERT) continue;
+        if (g_pf_obs_tail - g_pf_obs_head >= DS4_PF_OBS_RING) {
+            g_pf_n_obs_dropped++;
+            break;
+        }
+        cuda_pf_obs &o = g_pf_obs_ring[g_pf_obs_tail++ & (DS4_PF_OBS_RING - 1u)];
+        o.token  = token;
+        o.layer  = (uint16_t)table->layer;
+        o.expert = (uint16_t)e;
+        o.hit    = slots[i] >= 0 ? 1u : 0u;
+        o.pad    = 0u;
+    }
+    /* Take the plan while we hold the lock; filter it outside. */
+    cuda_pf_cand plan[DS4_PF_PLAN_CAP];
+    uint32_t plan_n = 0;
+    if (boundary && g_pf_budget && g_pf_plan_n) {
+        plan_n = g_pf_plan_n;
+        memcpy(plan, g_pf_plan, (size_t)plan_n * sizeof(plan[0]));
+        g_pf_plan_n = 0;
+    }
+    pthread_mutex_unlock(&g_pf_mu);
+
+    /* Residency is the foreground's to know. Only experts that are NOT
+     * currently resident are worth a read. */
+    for (uint32_t i = 0; i < plan_n && n_orders < g_pf_budget; i++) {
+        if (plan[i].layer >= DS4_PF_MAX_LAYER) continue;
+        const cuda_pf_layer &PL = g_pf_layer[plan[i].layer];
+        if (!PL.valid || plan[i].expert >= PL.n_expert) continue;
+        const uint64_t gate = PL.gate_offset + (uint64_t)plan[i].expert * PL.gate_bytes;
+        if (g_stream_expert_by_gate.find(gate) != g_stream_expert_by_gate.end()) continue;
+        cuda_pf_order &o = orders[n_orders++];
+        o.model_map  = PL.model_map;
+        o.model_size = PL.model_size;
+        o.gate       = gate;
+        o.up         = PL.up_offset + (uint64_t)plan[i].expert * PL.gate_bytes;
+        o.down       = PL.down_offset + (uint64_t)plan[i].expert * PL.down_bytes;
+        o.gate_bytes = PL.gate_bytes;
+        o.down_bytes = PL.down_bytes;
+        o.epoch      = g_pf_epoch;
+        o.layer      = plan[i].layer;
+        o.expert     = plan[i].expert;
+        o.slab       = 0u;
+    }
+
+    if (n_orders) {
+        pthread_mutex_lock(&g_pf_mu);
+        for (uint32_t i = 0; i < n_orders; i++) {
+            /* Newer predictions are worth more than stale ones: drop the
+             * oldest order rather than the one just made. */
+            if (g_pf_order_tail - g_pf_order_head >= DS4_PF_RING) {
+                g_pf_order_head++;
+                g_pf_n_order_dropped++;
+            }
+            g_pf_order_ring[g_pf_order_tail++ & (DS4_PF_RING - 1u)] = orders[i];
+        }
+        g_pf_n_ordered += n_orders;
+        pthread_mutex_unlock(&g_pf_mu);
+    }
+    if (g_pf_stats && boundary && (token % DS4_PF_REPORT_TOKENS) == 0u) cuda_pf_report();
+}
+
+/* "The foreground owns the disk." Raised for the whole body of
+ * cuda_stream_selected_cache_begin_load() so the reader does its I/O in the
+ * compute gaps between layers instead of competing with the demand fetch.
+ * Deliberately raised AFTER begin_load's cudaStreamSynchronize, so the reader
+ * also gets the stream-wait window. */
+static void cuda_pf_foreground_begin(void) {
+    pthread_mutex_lock(&g_pf_mu);
+    g_pf_fg_busy = 1;
+    pthread_mutex_unlock(&g_pf_mu);
+}
+
+static void cuda_pf_foreground_done(void) {
+    pthread_mutex_lock(&g_pf_mu);
+    g_pf_fg_busy = 0;
+    pthread_cond_broadcast(&g_pf_wake);
+    pthread_mutex_unlock(&g_pf_mu);
+}
+
+/* Scope guard so every return path of begin_load -- including the catch(...)
+ * -- lowers the flag. Inert when the prefetcher is off. */
+struct cuda_pf_fg_scope {
+    int on;
+    explicit cuda_pf_fg_scope(int enabled) : on(enabled) {
+        if (on) cuda_pf_foreground_begin();
+    }
+    ~cuda_pf_fg_scope() { if (on) cuda_pf_foreground_done(); }
+    cuda_pf_fg_scope(const cuda_pf_fg_scope &) = delete;
+    cuda_pf_fg_scope &operator=(const cuda_pf_fg_scope &) = delete;
+};
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -27447,6 +28397,12 @@ static int cuda_stream_selected_cache_begin_load(
     }
     if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "stream expert reuse wait"))
         return 0;
+    /* Everything below this point until the mapping is published is the
+     * foreground's window; the speculative reader parks for its duration so it
+     * never competes with the demand fetch for disk bandwidth. Raised here,
+     * after the sync, so the reader still gets the stream-wait gap. Inert
+     * unless DS4_CUDA_EXPERT_PREFETCH is set. */
+    const cuda_pf_fg_scope pf_scope(cuda_pf_enabled());
     const double xc_t0 = cuda_expert_cache_stats_enabled() ? cuda_wall_sec() : 0.0;
     try {
         std::vector<int32_t> expert_to_slot(table->n_total_expert, -1);
@@ -27539,6 +28495,26 @@ static int cuda_stream_selected_cache_begin_load(
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
             slot.hits++;
+        }
+        /* Speculative expert prefetch. Inert unless DS4_CUDA_EXPERT_PREFETCH
+         * is set. The three steps are in this order on purpose:
+         *   - install after the hit-protection loop above, so the speculative
+         *     victim search cannot take a slot this very request is about to
+         *     read (every hit already carries `stamp`, and the search only
+         *     accepts slots strictly older than that);
+         *   - then re-check the misses, because a speculative load that just
+         *     landed can serve this request and must not be fetched twice;
+         *   - then observe, so both the recorded hit/miss and the residency
+         *     filter reflect the cache the kernels will actually see.
+         * SAFETY: begin_load synchronised the decode stream above and has not
+         * published this call's mapping, so no kernel is reading any slot.
+         * See the SLOT LIFETIME SAFETY block above for the full argument. */
+        if (pf_scope.on && slot_count <= DS4_N_EXPERT_USED_MAX_DECODE) {
+            cuda_pf_apply_ready(stamp);
+            cuda_pf_claim_landed(table, unique.data(), slots.data(),
+                                 (uint32_t)unique.size(), stamp);
+            cuda_pf_observe(table, unique.data(), slots.data(),
+                            (uint32_t)unique.size(), slot_count, stamp);
         }
         if (cuda_expert_cache_stats_enabled()) {
             const int pp = slot_count > DS4_N_EXPERT_USED_MAX_DECODE;
