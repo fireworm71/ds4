@@ -173,6 +173,7 @@ static uint32_t g_stream_expert_budget;
 static uint64_t g_stream_expert_bytes;
 struct cuda_stream_expert_slot {
     uint64_t gate, up, down, used;
+    uint32_t hits;   /* reuses since this expert was loaded into the slot */
 };
 static std::vector<cuda_stream_expert_slot> g_stream_expert_slots;
 static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
@@ -182,7 +183,6 @@ static int cuda_stream_compact_prefill(const char **gate, const char **up,
                                       const char **down, const int32_t **ids,
                                       uint32_t *experts, uint32_t in_dim = 0,
                                       uint32_t mid_dim = 0, uint32_t out_dim = 0);
-
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
 }
@@ -27252,7 +27252,61 @@ static uint64_t g_xc_bytes, g_xc_reads;
 #define DS4_N_EXPERT_USED_MAX_DECODE 16u
 static uint64_t g_xc_calls_r[2], g_xc_unique_r[2], g_xc_hits_r[2];
 static uint64_t g_xc_miss_r[2], g_xc_bytes_r[2];
+#define DS4_XC_MAX_LAYER 64u
+static uint32_t g_xlayer_seen_max;
+#define DS4_N_LAYER_RUNTIME (g_xlayer_seen_max + 1u)
+#define DS4_XC_MAX_EXPERT 512u
 static double g_xc_secs_r[2];
+/* Token index of the last selection of each (layer, expert), 0 = never seen.
+ * Token counter advances when layer 0 is loaded, so it counts decode steps. */
+static uint32_t g_xrec_lastuse[DS4_XC_MAX_LAYER][DS4_XC_MAX_EXPERT];
+static uint32_t g_xrec_token;
+/* Gap buckets for MISSED experts: never, 1-4, 5-16, 17-64, 65-256, >256. */
+static uint64_t g_xrec_gap[6];
+/* Reuse before eviction: 0 hits, 1, 2-4, 5-16, 17+. */
+static uint64_t g_xjunk[5];
+static uint64_t g_xjunk_evicted;
+/* Misses per decode token: 0, 1-2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-128, 129+ */
+static uint64_t g_xburst[9];
+static uint64_t g_xburst_cur, g_xburst_tokens;
+/* Layers carrying at least one miss, per token: 0,1-2,3-4,5-8,9-16,17-24,25+ */
+static uint64_t g_xlayers[7];
+static uint64_t g_xlayers_cur;
+static bool     g_xlayer_missed[DS4_XC_MAX_LAYER];
+
+static uint32_t cuda_xlayers_bucket(uint64_t n) {
+    if (n == 0) return 0;
+    if (n <= 2) return 1;
+    if (n <= 4) return 2;
+    if (n <= 8) return 3;
+    if (n <= 16) return 4;
+    if (n <= 24) return 5;
+    return 6;
+}
+
+static uint32_t cuda_xburst_bucket(uint64_t n) {
+    if (n == 0) return 0;
+    if (n <= 2) return 1;
+    if (n <= 4) return 2;
+    if (n <= 8) return 3;
+    if (n <= 16) return 4;
+    if (n <= 32) return 5;
+    if (n <= 64) return 6;
+    if (n <= 128) return 7;
+    return 8;
+}
+static uint64_t g_xrec_hit_gap[6];   /* same buckets for hits, as the control */
+
+static uint32_t cuda_xrec_bucket(uint32_t gap, int never) {
+    if (never) return 0;
+    if (gap <= 4u) return 1;
+    if (gap <= 16u) return 2;
+    if (gap <= 64u) return 3;
+    if (gap <= 256u) return 4;
+    return 5;
+}
+static uint32_t *g_xc_freq;          /* [layer][expert], decode selections */
+static uint32_t g_xc_freq_layers, g_xc_freq_experts;
 
 static int cuda_expert_cache_stats_enabled(void) {
     static int on = -1;
@@ -27273,6 +27327,87 @@ static void cuda_expert_cache_stats_report(void) {
             (unsigned long long)g_xc_reads,
             g_xc_miss ? (double)g_xc_reads / (double)g_xc_miss : 0.0,
             (double)g_xc_bytes / 1073741824.0);
+    {
+        uint64_t m = 0, h = 0;
+        for (int i = 0; i < 6; i++) { m += g_xrec_gap[i]; h += g_xrec_hit_gap[i]; }
+        if (m || h) {
+            static const char *names[6] = {"never", "1-4", "5-16", "17-64",
+                                           "65-256", ">256"};
+            fprintf(stderr, "ds4:   recurrence (tokens since same expert last used)\n");
+            for (int i = 0; i < 6; i++) {
+                fprintf(stderr,
+                        "ds4:     %-7s miss %8llu (%5.1f%% of misses)   hit %10llu\n",
+                        names[i], (unsigned long long)g_xrec_gap[i],
+                        m ? 100.0 * (double)g_xrec_gap[i] / (double)m : 0.0,
+                        (unsigned long long)g_xrec_hit_gap[i]);
+            }
+        }
+    }
+    if (g_xburst_tokens) {
+        static const char *names[9] = {"0", "1-2", "3-4", "5-8", "9-16",
+                                       "17-32", "33-64", "65-128", "129+"};
+        fprintf(stderr, "ds4:   misses per decode token (%llu tokens)\n",
+                (unsigned long long)g_xburst_tokens);
+        for (int i = 0; i < 9; i++)
+            fprintf(stderr, "ds4:     %-7s %8llu tokens (%5.1f%%)\n", names[i],
+                    (unsigned long long)g_xburst[i],
+                    100.0 * (double)g_xburst[i] / (double)g_xburst_tokens);
+    }
+    if (g_xburst_tokens) {
+        static const char *names[7] = {"0", "1-2", "3-4", "5-8", "9-16",
+                                       "17-24", "25+"};
+        fprintf(stderr, "ds4:   layers stalling per token (of %u)\n",
+                (unsigned)DS4_N_LAYER_RUNTIME);
+        for (int i = 0; i < 7; i++)
+            fprintf(stderr, "ds4:     %-6s %8llu tokens (%5.1f%%)\n", names[i],
+                    (unsigned long long)g_xlayers[i],
+                    100.0 * (double)g_xlayers[i] / (double)g_xburst_tokens);
+    }
+    if (g_xjunk_evicted) {
+        static const char *names[5] = {"0 (never reused)", "1", "2-4", "5-16", "17+"};
+        fprintf(stderr, "ds4:   reuse before eviction (%llu evictions)\n",
+                (unsigned long long)g_xjunk_evicted);
+        for (int i = 0; i < 5; i++)
+            fprintf(stderr, "ds4:     %-16s %10llu (%5.1f%%)\n", names[i],
+                    (unsigned long long)g_xjunk[i],
+                    100.0 * (double)g_xjunk[i] / (double)g_xjunk_evicted);
+    }
+    if (g_xc_freq) {
+        const uint32_t budget = g_stream_expert_budget;
+        const uint32_t per_layer = budget / (g_xc_freq_layers ? g_xc_freq_layers : 1u);
+        uint64_t total = 0, covered = 0;
+        uint32_t used_layers = 0;
+        for (uint32_t L = 0; L < g_xc_freq_layers; L++) {
+            uint32_t *row = g_xc_freq + (size_t)L * g_xc_freq_experts;
+            uint64_t row_total = 0;
+            for (uint32_t e = 0; e < g_xc_freq_experts; e++) row_total += row[e];
+            if (!row_total) continue;
+            used_layers++;
+            total += row_total;
+            /* Partial selection of the top per_layer counts: repeatedly take
+             * the largest. per_layer is around 100 and experts 384, so an
+             * O(k*n) pass is cheaper than sorting and runs once. */
+            uint32_t *tmp = (uint32_t *)malloc((size_t)g_xc_freq_experts * sizeof(uint32_t));
+            if (!tmp) break;
+            memcpy(tmp, row, (size_t)g_xc_freq_experts * sizeof(uint32_t));
+            for (uint32_t k = 0; k < per_layer && k < g_xc_freq_experts; k++) {
+                uint32_t best = 0, bi = 0;
+                for (uint32_t e = 0; e < g_xc_freq_experts; e++)
+                    if (tmp[e] > best) { best = tmp[e]; bi = e; }
+                if (!best) break;
+                covered += best;
+                tmp[bi] = 0;
+            }
+            free(tmp);
+        }
+        if (total) {
+            fprintf(stderr,
+                    "ds4:   hot-set: decode selections=%llu over %u layers; "
+                    "top-%u per layer would cover %.1f%% (LRU achieved see hit_rate)\n",
+                    (unsigned long long)total, used_layers, per_layer,
+                    100.0 * (double)covered / (double)total);
+        }
+    }
     for (int r = 0; r < 2; r++) {
         if (!g_xc_calls_r[r]) continue;
         fprintf(stderr,
@@ -27296,6 +27431,7 @@ static void cuda_expert_cache_stats_report(void) {
                                        g_xc_secs_r[r] : 0.0);
     }
 }
+
 
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
@@ -27402,9 +27538,61 @@ static int cuda_stream_selected_cache_begin_load(
             }
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
+            slot.hits++;
         }
         if (cuda_expert_cache_stats_enabled()) {
             const int pp = slot_count > DS4_N_EXPERT_USED_MAX_DECODE;
+            if (!pp && table->layer < DS4_XC_MAX_LAYER &&
+                table->n_total_expert <= DS4_XC_MAX_EXPERT) {
+                if (!g_xc_freq) {
+                    g_xc_freq_layers = DS4_XC_MAX_LAYER;
+                    g_xc_freq_experts = table->n_total_expert;
+                    g_xc_freq = (uint32_t *)calloc((size_t)g_xc_freq_layers *
+                                                   g_xc_freq_experts,
+                                                   sizeof(uint32_t));
+                }
+                if (g_xc_freq && table->n_total_expert == g_xc_freq_experts) {
+                    for (uint32_t k = 0; k < slot_count; k++) {
+                        const int32_t e = selected_ids[k];
+                        if (e >= 0 && (uint32_t)e < g_xc_freq_experts)
+                            g_xc_freq[(size_t)table->layer * g_xc_freq_experts + e]++;
+                    }
+                    if (table->layer > g_xlayer_seen_max)
+                        g_xlayer_seen_max = table->layer;
+                    if (table->layer == 0u) {
+                        if (g_xrec_token) {
+                            g_xburst[cuda_xburst_bucket(g_xburst_cur)]++;
+                            g_xlayers[cuda_xlayers_bucket(g_xlayers_cur)]++;
+                            g_xburst_tokens++;
+                        }
+                        g_xburst_cur = 0;
+                        g_xlayers_cur = 0;
+                        memset(g_xlayer_missed, 0, sizeof(g_xlayer_missed));
+                        g_xrec_token++;
+                    }
+                    for (uint32_t k = 0; k < slot_count; k++) {
+                        const int32_t e = selected_ids[k];
+                        if (e < 0 || (uint32_t)e >= DS4_XC_MAX_EXPERT) continue;
+                        const uint32_t last = g_xrec_lastuse[table->layer][e];
+                        const uint64_t gate = table->gate_offset +
+                            (uint64_t)e * table->gate_expert_bytes;
+                        const int resident = g_stream_expert_by_gate.count(gate) != 0;
+                        const uint32_t b = cuda_xrec_bucket(
+                            last ? g_xrec_token - last : 0u, last == 0u);
+                        if (resident) g_xrec_hit_gap[b]++;
+                        else {
+                            g_xrec_gap[b]++;
+                            g_xburst_cur++;
+                            if (table->layer < DS4_XC_MAX_LAYER &&
+                                !g_xlayer_missed[table->layer]) {
+                                g_xlayer_missed[table->layer] = true;
+                                g_xlayers_cur++;
+                            }
+                        }
+                        g_xrec_lastuse[table->layer][e] = g_xrec_token;
+                    }
+                }
+            }
             g_xc_calls++;
             g_xc_slots += slot_count;
             g_xc_unique += unique.size();
@@ -27430,8 +27618,17 @@ static int cuda_stream_selected_cache_begin_load(
             }
             if (victim == UINT32_MAX) return 0;
             auto &slot = g_stream_expert_slots[victim];
-            if (slot.used) g_stream_expert_by_gate.erase(slot.gate);
+            if (slot.used) {
+                g_stream_expert_by_gate.erase(slot.gate);
+                if (cuda_expert_cache_stats_enabled()) {
+                    const uint32_t h = slot.hits;
+                    g_xjunk_evicted++;
+                    g_xjunk[h == 0u ? 0 : h == 1u ? 1 :
+                            h <= 4u ? 2 : h <= 16u ? 3 : 4]++;
+                }
+            }
             slot.used = 0;
+            slot.hits = 0;
             const uint64_t expert = (uint32_t)unique[i];
             const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
