@@ -27103,6 +27103,128 @@ static int cuda_stream_selected_ranges_valid(
 
 /* The staging ring spans all misses in a request. Drain it before publishing
  * the request, or before any error return can release/reuse its destinations. */
+
+/* One expert span to fetch: a device destination and a file extent. */
+struct cuda_expert_fetch_job {
+    char    *dst;
+    uint64_t offset;
+    uint64_t bytes;
+};
+
+#define CUDA_EXPERT_FETCH_MAX_THREADS 8u
+
+static uint32_t cuda_expert_fetch_threads(void) {
+    static int n = -1;
+    if (n < 0) {
+        n = 1;
+        const char *env = getenv("DS4_CUDA_EXPERT_FETCH_THREADS");
+        if (env && env[0]) {
+            char *end = NULL;
+            const unsigned long v = strtoul(env, &end, 10);
+            if (end != env && v >= 1ul) n = (int)(v > CUDA_EXPERT_FETCH_MAX_THREADS ?
+                                                 CUDA_EXPERT_FETCH_MAX_THREADS : v);
+        }
+    }
+    return (uint32_t)n;
+}
+
+struct cuda_expert_fetch_worker {
+    const cuda_expert_fetch_job *jobs;
+    size_t        n_jobs;
+    uint32_t      index;
+    uint32_t      stride;
+    void         *stage;
+    uint64_t      stage_bytes;
+    cudaStream_t  stream;
+    const void   *model_map;
+    uint64_t      model_size;
+    int           ok;
+};
+
+static void *cuda_expert_fetch_main(void *arg) {
+    cuda_expert_fetch_worker *w = (cuda_expert_fetch_worker *)arg;
+    w->ok = 1;
+    for (size_t i = w->index; i < w->n_jobs; i += w->stride) {
+        const cuda_expert_fetch_job &j = w->jobs[i];
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(w->stage, w->stage_bytes, j.offset, j.bytes, &payload)) {
+            fprintf(stderr, "ds4: CUDA parallel expert read failed at offset %llu: %s\n",
+                    (unsigned long long)j.offset, strerror(errno));
+            w->ok = 0;
+            return NULL;
+        }
+        if (cudaMemcpyAsync(j.dst, payload, (size_t)j.bytes,
+                            cudaMemcpyHostToDevice, w->stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            w->ok = 0;
+            return NULL;
+        }
+        /* Each read must land before the buffer is reused for the next one. */
+        if (cudaStreamSynchronize(w->stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            w->ok = 0;
+            return NULL;
+        }
+        cuda_model_drop_file_pages(j.offset, j.bytes);
+        cuda_model_discard_source_pages(w->model_map, w->model_size, j.offset, j.bytes);
+    }
+    return NULL;
+}
+
+/* Run the collected span fetches across `threads` readers. Returns 0 on any
+ * failure, having already reported it. */
+static int cuda_expert_fetch_parallel(const cuda_expert_fetch_job *jobs, size_t n_jobs,
+                                      uint32_t threads, uint64_t max_span,
+                                      const void *model_map, uint64_t model_size) {
+    if (!n_jobs) return 1;
+    if (threads > CUDA_EXPERT_FETCH_MAX_THREADS) threads = CUDA_EXPERT_FETCH_MAX_THREADS;
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    const uint64_t stage_bytes = max_span + 2u * align;
+
+    static void        *stage[CUDA_EXPERT_FETCH_MAX_THREADS];
+    static cudaStream_t streams[CUDA_EXPERT_FETCH_MAX_THREADS];
+    static uint64_t     stage_cap[CUDA_EXPERT_FETCH_MAX_THREADS];
+    for (uint32_t t = 0; t < threads; t++) {
+        if (stage_cap[t] < stage_bytes) {
+            if (stage[t]) (void)cudaFreeHost(stage[t]);
+            stage[t] = NULL;
+            if (cudaHostAlloc(&stage[t], (size_t)stage_bytes, cudaHostAllocDefault) != cudaSuccess) {
+                (void)cudaGetLastError();
+                fprintf(stderr, "ds4: CUDA parallel expert staging alloc failed\n");
+                return 0;
+            }
+            stage_cap[t] = stage_bytes;
+        }
+        if (!streams[t] &&
+            cudaStreamCreateWithFlags(&streams[t], cudaStreamNonBlocking) != cudaSuccess) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "ds4: CUDA parallel expert stream create failed\n");
+            return 0;
+        }
+    }
+
+    cuda_expert_fetch_worker w[CUDA_EXPERT_FETCH_MAX_THREADS];
+    pthread_t tid[CUDA_EXPERT_FETCH_MAX_THREADS];
+    uint32_t started = 0;
+    for (uint32_t t = 0; t < threads; t++) {
+        w[t] = (cuda_expert_fetch_worker){jobs, n_jobs, t, threads, stage[t],
+                                          stage_bytes, streams[t], model_map,
+                                          model_size, 1};
+    }
+    /* Worker 0 runs inline, so a pthread_create failure degrades to fewer
+     * readers rather than dropping the spans that thread would have owned. */
+    for (uint32_t t = 1; t < threads; t++) {
+        if (pthread_create(&tid[t], NULL, cuda_expert_fetch_main, &w[t]) != 0) break;
+        started = t;
+    }
+    cuda_expert_fetch_main(&w[0]);
+    for (uint32_t t = started + 1; t < threads; t++) cuda_expert_fetch_main(&w[t]);
+    for (uint32_t t = 1; t <= started; t++) (void)pthread_join(tid[t], NULL);
+
+    for (uint32_t t = 0; t < threads; t++) if (!w[t].ok) return 0;
+    return 1;
+}
+
 struct cuda_stream_upload_batch {
     uint64_t chunks = 0;
     bool active = false;
@@ -27120,6 +27242,61 @@ struct cuda_stream_upload_batch {
     ~cuda_stream_upload_batch() { (void)finish(); }
 };
 
+/* Cumulative expert-cache accounting, enabled by DS4_CUDA_EXPERT_CACHE_STATS.
+ * Off by default and free when off: one predictable branch per load. */
+static uint64_t g_xc_calls, g_xc_slots, g_xc_unique, g_xc_hits, g_xc_miss;
+static uint64_t g_xc_bytes, g_xc_reads;
+/* Index 0 is decode, 1 is prefill. A decode load asks for one token's experts;
+ * anything wider is a batch. The bound is generous so a decode step is never
+ * misfiled as prefill. */
+#define DS4_N_EXPERT_USED_MAX_DECODE 16u
+static uint64_t g_xc_calls_r[2], g_xc_unique_r[2], g_xc_hits_r[2];
+static uint64_t g_xc_miss_r[2], g_xc_bytes_r[2];
+static double g_xc_secs_r[2];
+
+static int cuda_expert_cache_stats_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_CUDA_EXPERT_CACHE_STATS") != NULL;
+    return on;
+}
+
+static void cuda_expert_cache_stats_report(void) {
+    if (!cuda_expert_cache_stats_enabled() || !g_xc_calls) return;
+    fprintf(stderr,
+            "ds4: expert cache stats calls=%llu slots=%llu unique=%llu "
+            "hits=%llu miss=%llu hit_rate=%.1f%% reads=%llu reads_per_miss=%.2f "
+            "fetched=%.2f GiB\n",
+            (unsigned long long)g_xc_calls, (unsigned long long)g_xc_slots,
+            (unsigned long long)g_xc_unique, (unsigned long long)g_xc_hits,
+            (unsigned long long)g_xc_miss,
+            g_xc_unique ? 100.0 * (double)g_xc_hits / (double)g_xc_unique : 0.0,
+            (unsigned long long)g_xc_reads,
+            g_xc_miss ? (double)g_xc_reads / (double)g_xc_miss : 0.0,
+            (double)g_xc_bytes / 1073741824.0);
+    for (int r = 0; r < 2; r++) {
+        if (!g_xc_calls_r[r]) continue;
+        fprintf(stderr,
+                "ds4:   %s calls=%llu unique=%llu hits=%llu miss=%llu "
+                "hit_rate=%.1f%% fetched=%.2f GiB\n",
+                r ? "prefill" : "decode ",
+                (unsigned long long)g_xc_calls_r[r],
+                (unsigned long long)g_xc_unique_r[r],
+                (unsigned long long)g_xc_hits_r[r],
+                (unsigned long long)g_xc_miss_r[r],
+                g_xc_unique_r[r] ? 100.0 * (double)g_xc_hits_r[r] /
+                                   (double)g_xc_unique_r[r] : 0.0,
+                (double)g_xc_bytes_r[r] / 1073741824.0);
+        fprintf(stderr,
+                "ds4:   %s load_time=%.3f s  per_call=%.3f ms  "
+                "effective=%.0f MiB/s\n",
+                r ? "prefill" : "decode ", g_xc_secs_r[r],
+                g_xc_calls_r[r] ? 1000.0 * g_xc_secs_r[r] /
+                                  (double)g_xc_calls_r[r] : 0.0,
+                g_xc_secs_r[r] > 0.0 ? ((double)g_xc_bytes_r[r] / 1048576.0) /
+                                       g_xc_secs_r[r] : 0.0);
+    }
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -27134,6 +27311,7 @@ static int cuda_stream_selected_cache_begin_load(
     }
     if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "stream expert reuse wait"))
         return 0;
+    const double xc_t0 = cuda_expert_cache_stats_enabled() ? cuda_wall_sec() : 0.0;
     try {
         std::vector<int32_t> expert_to_slot(table->n_total_expert, -1);
         std::vector<int32_t> unique, remap(slot_count);
@@ -27225,7 +27403,20 @@ static int cuda_stream_selected_cache_begin_load(
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
         }
+        if (cuda_expert_cache_stats_enabled()) {
+            const int pp = slot_count > DS4_N_EXPERT_USED_MAX_DECODE;
+            g_xc_calls++;
+            g_xc_slots += slot_count;
+            g_xc_unique += unique.size();
+            g_xc_calls_r[pp]++;
+            g_xc_unique_r[pp] += unique.size();
+            for (size_t i = 0; i < unique.size(); i++)
+                if (slots[i] >= 0) { g_xc_hits++; g_xc_hits_r[pp]++; }
+        }
         cuda_stream_upload_batch uploads;
+        const uint32_t fetch_threads = cuda_expert_fetch_threads();
+        std::vector<cuda_expert_fetch_job> fetch_jobs;
+        if (fetch_threads > 1u) fetch_jobs.reserve(3u * unique.size());
         for (size_t i = 0; i < unique.size(); i++) {
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
@@ -27245,22 +27436,59 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
-            uploads.active = true;
-            if (!cuda_model_copy_to_device_streamed(
-                    cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
-                !cuda_model_copy_to_device_streamed(
-                    cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    table->model_map, table->model_size, up, table->gate_expert_bytes, "stream up", uploads.chunks) ||
-                !cuda_model_copy_to_device_streamed(
-                    cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
-                    table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
-                return 0;
+            if (fetch_threads > 1u) {
+                fetch_jobs.push_back({cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                                      gate, table->gate_expert_bytes});
+                fetch_jobs.push_back({cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                                      up, table->gate_expert_bytes});
+                fetch_jobs.push_back({cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
+                                      down, table->down_expert_bytes});
+            } else {
+                uploads.active = true;
+                if (!cuda_model_copy_to_device_streamed(
+                        cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                        table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
+                    !cuda_model_copy_to_device_streamed(
+                        cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                        table->model_map, table->model_size, up, table->gate_expert_bytes, "stream up", uploads.chunks) ||
+                    !cuda_model_copy_to_device_streamed(
+                        cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
+                        table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
+                    return 0;
+            }
+            if (cuda_expert_cache_stats_enabled()) {
+                const int pp = slot_count > DS4_N_EXPERT_USED_MAX_DECODE;
+                g_xc_miss++;
+                g_xc_reads += 3u;   /* gate, up and down are separate spans */
+                g_xc_bytes += 2u * table->gate_expert_bytes +
+                              table->down_expert_bytes;
+                g_xc_miss_r[pp]++;
+                g_xc_bytes_r[pp] += 2u * table->gate_expert_bytes +
+                                    table->down_expert_bytes;
+            }
             slot = {gate, up, down, stamp};
             g_stream_expert_by_gate[gate] = victim;
             slots[i] = (int32_t)victim;
         }
+        if (fetch_threads > 1u && !fetch_jobs.empty()) {
+            const uint64_t max_span = table->gate_expert_bytes > table->down_expert_bytes ?
+                                      table->gate_expert_bytes : table->down_expert_bytes;
+            if (!cuda_expert_fetch_parallel(fetch_jobs.data(), fetch_jobs.size(),
+                                            fetch_threads, max_span,
+                                            table->model_map, table->model_size)) {
+                /* Same failure contract as a bad async upload: nothing may be
+                 * treated as resident afterwards. */
+                g_stream_expert_by_gate.clear();
+                for (auto &sl : g_stream_expert_slots) sl.used = 0;
+                return 0;
+            }
+        }
         if (!uploads.finish()) return 0;
+        if (cuda_expert_cache_stats_enabled()) {
+            g_xc_secs_r[slot_count > DS4_N_EXPERT_USED_MAX_DECODE] +=
+                cuda_wall_sec() - xc_t0;
+            if ((g_xc_calls % 400u) == 0u) cuda_expert_cache_stats_report();
+        }
         g_stream_prefill_ids = remap;
         g_stream_prefill_slots = slots;
         for (auto &id : remap) id = slots[id];
