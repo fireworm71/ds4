@@ -1147,6 +1147,18 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     }
     ds4_tokens_free(&prefix);
 
+    /* DS4_PPL_DUMP=<path>: one "-logprob" per scored token, flushed per
+     * line so a killed run still yields a usable paired prefix. Diagnostic
+     * only; unset means nothing is opened. */
+    FILE *ppl_dump = NULL;
+    {
+        const char *dump_path = getenv("DS4_PPL_DUMP");
+        if (dump_path && *dump_path) {
+            ppl_dump = fopen(dump_path, "w");
+            if (!ppl_dump)
+                fprintf(stderr, "ds4: DS4_PPL_DUMP: cannot open %s\n", dump_path);
+        }
+    }
     double nll = 0.0;
     for (int j = 0; j < scored; j++) {
         const int i = prefix_len + j;
@@ -1158,6 +1170,10 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
             return 1;
         }
         nll -= (double)score.logprob;
+        if (ppl_dump) {
+            fprintf(ppl_dump, "%.9f\n", -(double)score.logprob);
+            fflush(ppl_dump);
+        }
 
         if (((j + 1) % 256) == 0 || j + 1 == scored) {
             fprintf(stderr, "ds4: perplexity scored %d/%d\r", j + 1, scored);
@@ -1177,6 +1193,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     printf("tokens=%d scored=%d nll=%.9f avg_nll=%.9f ppl=%.9f\n",
            tokens.len, scored, nll, avg_nll, exp(avg_nll));
 
+    if (ppl_dump) fclose(ppl_dump);
     ds4_session_free(session);
     ds4_tokens_free(&tokens);
     return 0;
