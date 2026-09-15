@@ -40213,6 +40213,8 @@ static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
 typedef struct ds41_verify_ctx ds41_verify_ctx;
 static DS4_MAYBE_UNUSED bool ds41_verify_save_prev(ds41_verify_ctx *vc, ds41_gpu_graph *g,
                                                    uint32_t owner, uint32_t row);
+static DS4_MAYBE_UNUSED bool ds41_verify_save_window(ds41_verify_ctx *vc, ds41_gpu_graph *g,
+                                                     uint32_t il);
 
 static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
@@ -40223,8 +40225,35 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     const uint32_t first = start / ratio, rows = (start + count) / ratio - first;
     if (ratio == 2u) {
         if (!ds41_project_rows(b->pool_kv, m, l->attn_compressor_kv, b->norm, count, false) ||
-            !ds41_project_rows(b->pool_score, m, l->attn_compressor_gate, b->norm, count, false) ||
-            !ds4_gpu_dsv41_pool2(b->latent, b->pool_kv, b->pool_score,
+            !ds41_project_rows(b->pool_score, m, l->attn_compressor_gate, b->norm, count, false))
+            return false;
+        if (vc) {
+            /* Verify pass: pool row by row instead of in one batched call. The
+             * ratio-2 carry is threaded position to position, and a partial
+             * commit has to restore previous_kv/previous_score to the value
+             * that stood after the last ACCEPTED row; the batched pool only
+             * leaves the value after the last row of all. */
+            for (uint32_t r = 0; r < count; r++) {
+                ds4_gpu_tensor *lat = ds4_gpu_tensor_view(b->latent,
+                    (uint64_t)r * DS4_N_HEAD_DIM * sizeof(float),
+                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                ds4_gpu_tensor *pk = ds4_gpu_tensor_view(b->pool_kv,
+                    (uint64_t)r * DS4_N_HEAD_DIM * sizeof(float),
+                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                ds4_gpu_tensor *ps = ds4_gpu_tensor_view(b->pool_score,
+                    (uint64_t)r * DS4_N_HEAD_DIM * sizeof(float),
+                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                bool rok = lat && pk && ps &&
+                    ds4_gpu_dsv41_pool2(lat, pk, ps, g->previous_kv[owner],
+                                        g->previous_score[owner], DS4_N_HEAD_DIM,
+                                        1u, start + r) &&
+                    ds41_verify_save_prev(vc, g, owner, r);
+                ds4_gpu_tensor_free(ps);
+                ds4_gpu_tensor_free(pk);
+                ds4_gpu_tensor_free(lat);
+                if (!rok) return false;
+            }
+        } else if (!ds4_gpu_dsv41_pool2(b->latent, b->pool_kv, b->pool_score,
                 g->previous_kv[owner], g->previous_score[owner], DS4_N_HEAD_DIM, count, start))
             return false;
     } else if (!ds41_project_rows(b->latent, m, l->attn_compressor_kv, b->norm, count, true))
@@ -41150,6 +41179,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             const uint32_t count = total_count - off < chunk ? total_count - off : chunk;
             const uint32_t start = initial_start + off;
             g->pos = start;
+            /* Verify pass: snapshot this layer's slice of the window ring
+             * before the layer writes it. pos % 128 is not self-healing under
+             * lookahead -- a write at P+i evicts the key for P+i-128, which is
+             * still inside the live window after a partial commit. */
+            if (ok && vc) ok = ds41_verify_save_window(vc, g, il);
             ds41_prefill_row active = {0};
             if (batch_hc) {
                 /* HC helpers infer row count from buffer size, including short tails. */
