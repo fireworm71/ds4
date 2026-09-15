@@ -66018,18 +66018,32 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     config_validate_model(&e->model);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
-        const bool supported = (e->backend == DS4_BACKEND_METAL ||
+        bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
                 (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
                  (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
 #endif
                  false) &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
-            !load_slice && !opt->dspark && !opt->glm_mtp &&
+            !load_slice && !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
-            (!opt->mtp_path || !opt->mtp_path[0]) &&
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
+        /* V4.1 DSpark drafter: the speculative pipeline is family-generic
+         * (metal_graph_eval_dspark_*), so permit a sidecar on single-GPU CUDA
+         * or Metal. Every other refusal above stands. Experimental: gate on
+         * DS4_V41_DSPARK_ENABLE so stock behaviour is unchanged. */
+        const bool v41_dspark_single =
+            (e->backend == DS4_BACKEND_METAL ||
+             (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
+              (!gpu_cfg || gpu_cfg->n_gpus <= 1))) &&
+            opt->distributed.role == DS4_DISTRIBUTED_NONE;
+        const bool v41_dspark_try =
+            getenv("DS4_V41_DSPARK_ENABLE") != NULL &&
+            opt->mtp_path && opt->mtp_path[0] && !opt->dspark && v41_dspark_single;
+        if (!v41_dspark_try)
+            supported = supported && !opt->dspark &&
+                        (!opt->mtp_path || !opt->mtp_path[0]);
         if (!supported) {
             fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network tensor parallelism); "
                             "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
