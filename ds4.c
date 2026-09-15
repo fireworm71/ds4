@@ -2721,7 +2721,13 @@ static bool ds4_dspark_rocm_gfx1151_reference_alignment(void) {
 #if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     return ds4_gpu_dspark_gfx1151_fast_path() != 0;
 #else
-    return false;
+    /* V4.1's DSpark drafter is trained on the reference pairing -- seed
+     * token t[L+1] with target hidden h[L] (model.py forward_spec) -- the
+     * same alignment the ROCm gfx1151 bring-up used. The experimental V4.1
+     * CUDA path needs it too; without it the drafter conditions one step
+     * behind and acceptance collapses. */
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+           getenv("DS4_V41_DSPARK_ENABLE") != NULL;
 #endif
 }
 
@@ -34998,6 +35004,20 @@ static bool metal_graph_eval_dspark_final_hidden(
     bool ok = stage_output_hc && output_pre && output_weights &&
               output_embd && output_norm;
     if (ok && !commands_open) ok = ds4_gpu_begin_commands() != 0;
+    if (ok && getenv("DS4_DSPARK_HEAD_DERIVED") == NULL) {
+        /* Reference head combine (model.py forward_head): x = hc_pre(x,
+         * pre_mix) where pre_mix is the LAST STAGE's ffn_pre -- the Sinkhorn
+         * split its ffn just wrote into batch_hc_split (row layout
+         * [pre(4)|post(4)|comb(16)]). V4.1's checkpoint carries no learned
+         * hc_head; the derived tensors recompute a pre from the final x,
+         * which is the wrong input state and blurs the hidden. Only valid on
+         * the fused path, where this runs right after the last stage's ffn. */
+        ok = ds4_gpu_hc_weighted_sum_split_tensor(output_embd,
+                                                  stage_output_hc,
+                                                  metal_graph_batch_hc_split(g),
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+    } else {
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(metal_graph_batch_flat_hc(g),
                                                      stage_output_hc,
                                                      (uint32_t)hc_dim,
@@ -35023,6 +35043,7 @@ static bool metal_graph_eval_dspark_final_hidden(
                                                  output_weights,
                                                  DS4_N_EMBD,
                                                  DS4_N_HC) != 0;
+    }
     if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(output_norm,
                                                       output_embd,
                                                       dspark_model->map,
@@ -72095,6 +72116,18 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                 DS4_DSPARK_PROP_ADD(propose_confidence_ms, confidence_t0);
             }
         }
+        if (getenv("DS4_DSPARK_DEBUG") && s->graph.spec_logits && s->logits) {
+            float *dbg_row = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+            if (ds4_gpu_tensor_read(s->graph.spec_logits, 0, dbg_row,
+                                    (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0) {
+                const int base_top = sample_argmax(dbg_row, DS4_N_VOCAB);
+                const int true_top = sample_argmax(s->logits, DS4_N_VOCAB);
+                fprintf(stderr, "ds4: dbg headcmp base_top=%d (%.2f) true_top=%d (%.2f) base_at_true=%.2f\n",
+                        base_top, dbg_row[base_top], true_top,
+                        s->logits[true_top], dbg_row[true_top]);
+            }
+            free(dbg_row);
+        }
         if (getenv("DS4_DSPARK_DEBUG"))
             fprintf(stderr, "ds4: dbg propose3 markov_ok=%d mlen=%u conf_ok=%d clen=%u cpre=%u c0=%.3f thr=%.3f\n",
                     markov_ok, markov_proposal_len, confidence_ok,
@@ -72374,6 +72407,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                     s->shadow_len = 0;
                 }
             } else {
+                if (getenv("DS4_DSPARK_DEBUG") && s->shadow_blocks < 24)
+                    fprintf(stderr, "ds4: dbg shadow miss idx=%u draft=%d real=%d (draft0=%d len=%u)\n",
+                            s->shadow_idx, s->shadow_draft[s->shadow_idx],
+                            token, s->shadow_draft[0], s->shadow_len);
                 s->shadow_prefix_hist[s->shadow_idx]++;
                 s->shadow_blocks++;
                 s->shadow_len = 0;
@@ -72387,6 +72424,23 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                           (uint32_t)(s->checkpoint.len - 1),
                                           probe_mtp,
                                           getenv("DS4_MTP_PROBE") != NULL);
+        if (dspark_shadow && s->shadow_blocks != 0 &&
+            (s->shadow_blocks & 7u) == 0u && s->shadow_len == 0) {
+            fprintf(stderr,
+                    "ds4: DSpark shadow blocks=%llu proposed=%llu hits=%llu "
+                    "hit_rate=%.1f%% prefix_hist=%llu,%llu,%llu,%llu,%llu,%llu\n",
+                    (unsigned long long)s->shadow_blocks,
+                    (unsigned long long)s->shadow_proposed,
+                    (unsigned long long)s->shadow_hits,
+                    s->shadow_proposed ?
+                        100.0 * (double)s->shadow_hits / (double)s->shadow_proposed : 0.0,
+                    (unsigned long long)s->shadow_prefix_hist[0],
+                    (unsigned long long)s->shadow_prefix_hist[1],
+                    (unsigned long long)s->shadow_prefix_hist[2],
+                    (unsigned long long)s->shadow_prefix_hist[3],
+                    (unsigned long long)s->shadow_prefix_hist[4],
+                    (unsigned long long)s->shadow_prefix_hist[5]);
+        }
         if (dspark_shadow && s->dspark_draft_valid && s->shadow_len == 0) {
             const uint32_t n = s->dspark_draft_len <= DS4_DSPARK_MAX_BLOCK_SIZE ?
                                s->dspark_draft_len : DS4_DSPARK_MAX_BLOCK_SIZE;
@@ -72400,22 +72454,6 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             /* Statistics only: the spec loop must not consume the draft. */
             s->dspark_draft_valid = false;
             s->dspark_draft_len = 0;
-            if ((s->shadow_blocks & 31u) == 16u && s->shadow_len == 0) {
-                fprintf(stderr,
-                        "ds4: DSpark shadow blocks=%llu proposed=%llu hits=%llu "
-                        "hit_rate=%.1f%% prefix_hist=%llu,%llu,%llu,%llu,%llu,%llu\n",
-                        (unsigned long long)s->shadow_blocks,
-                        (unsigned long long)s->shadow_proposed,
-                        (unsigned long long)s->shadow_hits,
-                        s->shadow_proposed ?
-                            100.0 * (double)s->shadow_hits / (double)s->shadow_proposed : 0.0,
-                        (unsigned long long)s->shadow_prefix_hist[0],
-                        (unsigned long long)s->shadow_prefix_hist[1],
-                        (unsigned long long)s->shadow_prefix_hist[2],
-                        (unsigned long long)s->shadow_prefix_hist[3],
-                        (unsigned long long)s->shadow_prefix_hist[4],
-                        (unsigned long long)s->shadow_prefix_hist[5]);
-            }
         }
         return 0;
     }
