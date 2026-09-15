@@ -7865,6 +7865,15 @@ static void dspark_weights_bind_optional(
 
     dw->n_stages = summary->stages < DS4_DSPARK_MAX_STAGES ?
                    summary->stages : DS4_DSPARK_MAX_STAGES;
+    /* DS4_DSPARK_STAGES=<n>: run only the first n drafter stages. Diagnostic
+     * knob for isolating a stage against an offline reference run. */
+    {
+        const char *sv = getenv("DS4_DSPARK_STAGES");
+        if (sv && sv[0]) {
+            const uint32_t v = (uint32_t)strtoul(sv, NULL, 10);
+            if (v != 0 && v < dw->n_stages) dw->n_stages = v;
+        }
+    }
     dw->n_experts = summary->n_experts ? summary->n_experts : DS4_N_EXPERT;
     dw->n_experts_used =
         summary->n_experts_used ? summary->n_experts_used : DS4_N_EXPERT_USED;
@@ -34344,7 +34353,16 @@ static bool metal_graph_eval_dspark_stage_block(
                                                  q_dim,
                                                  metal_graph_batch_qr_norm(g),
                                                  draft);
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(metal_graph_batch_q(g),
+    /* The DSpark drafter's q path is wq_b(q_norm(wq_a(x))) then rope -- there
+     * is no per-head RMS norm (model.py DSparkAttention.forward, and the fused
+     * sparse_attn kernel does not normalize either). Applying the main model's
+     * per-head norm here flattens the drafter's attention: measured against an
+     * offline reference run, with the norm the engine matches a reference whose
+     * logits are scaled ~0.2x (cos 0.9992) and its base-logit top-1 accuracy is
+     * 0%, while the reference without it scores ~23%. Keep the main model's
+     * path untouched; DS4_DSPARK_Q_HEAD_NORM=1 restores the old behaviour. */
+    if (ok && getenv("DS4_DSPARK_Q_HEAD_NORM") != NULL)
+        ok = ds4_gpu_head_rms_norm_tensor(metal_graph_batch_q(g),
                                                draft,
                                                DS4_N_HEAD,
                                                DS4_N_HEAD_DIM,
@@ -72114,6 +72132,121 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                 free(markov_state);
                 free(hidden_rows);
                 DS4_DSPARK_PROP_ADD(propose_confidence_ms, confidence_t0);
+            }
+        }
+        /* DS4_DSPARK_DUMP=<dir>: write the drafter's own inputs and its
+         * computed main_x for the first few cycles, so an offline reference
+         * run can be fed byte-identical inputs. Diagnostic only. */
+        {
+            static uint32_t dump_n = 0;
+            const char *dump_dir = getenv("DS4_DSPARK_DUMP");
+            if (dump_dir && dump_dir[0] && dump_n < 170 &&
+                s->graph.dspark_target_hidden && s->graph.dspark_main_x) {
+                const uint32_t nt = s->graph.dspark_target_layer_count;
+                const uint64_t th_bytes = (uint64_t)nt * DS4_N_EMBD * sizeof(float);
+                float *th = xmalloc((size_t)th_bytes);
+                float *mx = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+                if (ds4_gpu_tensor_read(s->graph.dspark_target_hidden, 0, th, th_bytes) != 0 &&
+                    ds4_gpu_tensor_read(s->graph.dspark_main_x, 0, mx,
+                                        (uint64_t)DS4_N_EMBD * sizeof(float)) != 0) {
+                    char path[1024];
+                    snprintf(path, sizeof(path), "%s/cycle%u_target_hidden.bin", dump_dir, dump_n);
+                    (void)write_f32_binary_file(path, th, (uint64_t)nt * DS4_N_EMBD);
+                    snprintf(path, sizeof(path), "%s/cycle%u_main_x.bin", dump_dir, dump_n);
+                    (void)write_f32_binary_file(path, mx, DS4_N_EMBD);
+                    /* Final drafter hidden rows (post head-combine + norm):
+                     * the cleanest engine-vs-reference comparison point, and
+                     * it avoids materializing the 1.3 GiB output head. */
+                    const uint32_t rows = dw->block_size;
+                    const uint64_t fn_bytes =
+                        (uint64_t)rows * DS4_N_EMBD * sizeof(float);
+                    float *fn = xmalloc((size_t)fn_bytes);
+                    if (metal_graph_batch_ffn_norm(&s->graph) &&
+                        ds4_gpu_tensor_read(metal_graph_batch_ffn_norm(&s->graph),
+                                            0, fn, fn_bytes) != 0) {
+                        snprintf(path, sizeof(path), "%s/cycle%u_ffn_norm.bin",
+                                 dump_dir, dump_n);
+                        (void)write_f32_binary_file(path, fn,
+                                                    (uint64_t)rows * DS4_N_EMBD);
+                    }
+                    free(fn);
+                    /* Last-stage output hc rows: with DS4_DSPARK_STAGES=n this
+                     * isolates stage n-1's output for reference comparison. */
+                    {
+                        ds4_gpu_tensor *soh =
+                            metal_graph_dspark_final_output_hc(&s->graph);
+                        const uint64_t soh_bytes = (uint64_t)rows *
+                            (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+                        if (soh && ds4_gpu_tensor_bytes(soh) >= soh_bytes) {
+                            float *sb = xmalloc((size_t)soh_bytes);
+                            if (ds4_gpu_tensor_read(soh, 0, sb, soh_bytes) != 0) {
+                                snprintf(path, sizeof(path), "%s/cycle%u_stage_out.bin",
+                                         dump_dir, dump_n);
+                                (void)write_f32_binary_file(path, sb,
+                                        (uint64_t)rows * DS4_N_HC * DS4_N_EMBD);
+                            }
+                            free(sb);
+                        }
+                    }
+                    /* With DS4_DSPARK_STAGES=1 these still hold stage 0's
+                     * values after the chain: attention input (post attn_norm)
+                     * and attention output (post wo_b). */
+                    {
+                        /* attn_norm carries the target row first (rows+1);
+                         * attn_out holds the draft rows only. */
+                        struct { const char *tag; ds4_gpu_tensor *t; uint32_t n; } bufs[] = {
+                            { "attn_norm", metal_graph_batch_attn_norm(&s->graph), rows + 1u },
+                            { "attn_out",  metal_graph_batch_attn_out(&s->graph),  rows },
+                        };
+                        /* Raw attention heads (post rope-inverse, pre wo):
+                         * splits attention math from the output projection. */
+                        {
+                            const uint64_t hb = (uint64_t)rows *
+                                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+                            ds4_gpu_tensor *ht = metal_graph_batch_heads(&s->graph);
+                            if (ht && ds4_gpu_tensor_bytes(ht) >= hb) {
+                                float *hbuf = xmalloc((size_t)hb);
+                                if (ds4_gpu_tensor_read(ht, 0, hbuf, hb) != 0) {
+                                    snprintf(path, sizeof(path), "%s/cycle%u_heads.bin",
+                                             dump_dir, dump_n);
+                                    (void)write_f32_binary_file(path, hbuf,
+                                            (uint64_t)rows * DS4_N_HEAD * DS4_N_HEAD_DIM);
+                                }
+                                free(hbuf);
+                            }
+                        }
+                        for (unsigned bi = 0; bi < 2; bi++) {
+                            const uint64_t rb =
+                                (uint64_t)bufs[bi].n * DS4_N_EMBD * sizeof(float);
+                            float *tmp = xmalloc((size_t)rb);
+                            if (bufs[bi].t &&
+                                ds4_gpu_tensor_bytes(bufs[bi].t) >= rb &&
+                                ds4_gpu_tensor_read(bufs[bi].t, 0, tmp, rb) != 0) {
+                                snprintf(path, sizeof(path), "%s/cycle%u_%s.bin",
+                                         dump_dir, dump_n, bufs[bi].tag);
+                                (void)write_f32_binary_file(path, tmp,
+                                        (uint64_t)bufs[bi].n * DS4_N_EMBD);
+                            }
+                            free(tmp);
+                        }
+                    }
+                    snprintf(path, sizeof(path), "%s/cycle%u_meta.txt", dump_dir, dump_n);
+                    FILE *mf = fopen(path, "w");
+                    if (mf) {
+                        fprintf(mf, "token %d\npos %u\nn_target %u\nn_embd %u\nrows %u\n",
+                                token, pos, nt, (unsigned)DS4_N_EMBD, rows);
+                        fprintf(mf, "draft");
+                        for (uint32_t i = 0; i < s->dspark_draft_len; i++)
+                            fprintf(mf, " %d", s->dspark_draft_tokens[i]);
+                        fprintf(mf, "\n");
+                        fclose(mf);
+                    }
+                    fprintf(stderr, "ds4: DSpark dump cycle %u (token=%d pos=%u)\n",
+                            dump_n, token, pos);
+                    dump_n++;
+                }
+                free(mx);
+                free(th);
             }
         }
         if (getenv("DS4_DSPARK_DEBUG") && s->graph.spec_logits && s->logits) {
