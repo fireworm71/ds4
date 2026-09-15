@@ -40208,9 +40208,16 @@ static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
     return ds41_matmul_batch(out, m, weight, in, count, bf16);
 }
 
+/* Verify-pass plumbing: the transaction context is defined further down with
+ * the rest of the verify core; these batch helpers only need to pass it. */
+typedef struct ds41_verify_ctx ds41_verify_ctx;
+static DS4_MAYBE_UNUSED bool ds41_verify_save_prev(ds41_verify_ctx *vc, ds41_gpu_graph *g,
+                                                   uint32_t owner, uint32_t row);
+
 static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
-                                         uint32_t il, uint32_t start, uint32_t count) {
+                                         uint32_t il, uint32_t start, uint32_t count,
+                                         ds41_verify_ctx *vc) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t first = start / ratio, rows = (start + count) / ratio - first;
@@ -40307,7 +40314,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
-                                  const ds4_layer_weights *l, uint32_t il, uint32_t count) {
+                                  const ds4_layer_weights *l, uint32_t il, uint32_t count, ds41_verify_ctx *vc) {
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (start + count) / ratio : 0;
@@ -40338,7 +40345,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
         ratio == 2u &&
 #endif
         !getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
-    if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count)) return false;
+    if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count, vc)) return false;
     for (uint32_t t = 0; (!batch_index || !batch_publish) && t < count; t++) {
         row.pos = start + t;
 #define DS41_SELECT_ROW(name, width) row.name = g->rows_view[t].name;
@@ -40820,7 +40827,7 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
         if (ok && batch_attention) ok = ds4_gpu_dsv41_quantize(active.x, DS4_N_EMBD, count, DS4_V41_BF16) &&
             ds41_norm_batch(active.norm, active.x, m, l->attn_norm, count);
         if (ok && batch_publish)
-            ok = ds41_attention_publish_batch(g, &active, m, l, il, initial_start + off, count);
+            ok = ds41_attention_publish_batch(g, &active, m, l, il, initial_start + off, count, NULL);
         if (ok && !publish && batch_attention)
             ok = ds41_matmul_batch(active.kv, m, l->attn_kv, active.norm, count, true) &&
                 ds41_norm_batch(active.kv, active.kv, m, l->attn_kv_a_norm, count) &&
@@ -40958,7 +40965,7 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
  */
 #define DS41_VERIFY_KV_ROW (512u * sizeof(float))
 
-typedef struct {
+typedef struct ds41_verify_ctx {
     uint32_t rows, pos0;
     ds4_gpu_tensor *win;    /* DS4_N_LAYER * rows * 512 floats */
     ds4_gpu_tensor *prev;   /* 4 owners * rows * 2 * 512 floats */
@@ -41056,7 +41063,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t total_count,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
-                              bool encoder_only, bool resume_encoder) {
+                              bool encoder_only, bool resume_encoder,
+                              ds41_verify_ctx *vc) {
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
     const bool wide = total_count > encoder_chunk;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
@@ -41242,7 +41250,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 const ds4_layer_weights *l = &w->layer[il];
                 ok = ds41_attention_project_batch(g, m, l, count);
                 DS41_STAGE("attention projections");
-                if (ok && batch_core) ok = ds41_attention_batch(g, m, l, il, count);
+                if (ok && batch_core) ok = ds41_attention_batch(g, m, l, il, count, vc);
                 for (uint32_t t = 0; ok && !batch_core && t < count; t++) {
                     row.pos = start + t;
 #define DS41_USE_ATTN_ROW(name, width) row.name = g->rows_view[t].name;
@@ -41357,7 +41365,7 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud) {
     return ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
-                                   total, cancel, cancel_ud, false, false);
+                                   total, cancel, cancel_ud, false, false, NULL);
 }
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
     if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
@@ -70599,7 +70607,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 (defer_decoder || decoder_pending ?
                  ds41_graph_prefill_sweep(g, &e->model, &e->weights, prompt->v + i, count,
                     s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud,
-                    defer_decoder, decoder_pending) :
+                    defer_decoder, decoder_pending, NULL) :
                  ds41_graph_prefill(g, &e->model, &e->weights, prompt->v + i, count,
                     s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud)) :
                 ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL);
