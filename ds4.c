@@ -40927,6 +40927,131 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
  * frontiers, so the caller must rebuild from its retained token history. */
+/* =========================================================================
+ * V4.1 DSpark verify transaction.
+ * =========================================================================
+ * Ported from IngeniousIdiocy/ds4-v41-m3ultra (fork of antirez/ds4 at bd66c40
+ * by Mark Shank, MIT, same licence as this tree). Their design note is the
+ * authority here and it corrects a mistake this branch nearly shipped: we had
+ * planned to roll a verify pass back by restoring g->pos alone, on the theory
+ * that V4.1's caches are position-derived and therefore self-healing. That
+ * holds for compressed[]/index_cache[] -- indexed linearly by compressed
+ * position, every rejected entry past the committed frontier, no read looking
+ * past n_comp = (pos+1)/ratio -- but NOT for the raw window ring:
+ *
+ *   window[il] is 128 slots indexed by absolute position % 128, so a write at
+ *   P+i evicts the key for P+i-128. After committing rows 0..keep-1 the live
+ *   window starts at P+keep-127, and every evicted position P+i-128 with
+ *   i >= keep+1 is still inside it. pos % 128 is NOT self-healing under
+ *   lookahead.
+ *
+ * So the verified span is snapshotted per layer before it is written and the
+ * rejected tail restored. Same for the ratio-2 compressor carry, which is
+ * threaded position to position and must therefore be saved per row (the
+ * restore picks row keep-1) -- which in turn means a verify pass must publish
+ * that carry per row instead of in one batched pool. block_mask,
+ * selected_comp, index_scores and the rest of the scratch are recomputed by
+ * the next step and need no undo.
+ *
+ * The undo log is small: DS4_N_LAYER * rows * 2 KiB (~480 KiB at rows=6) plus
+ * 4 owners * rows * 4 KiB.
+ */
+#define DS41_VERIFY_KV_ROW (512u * sizeof(float))
+
+typedef struct {
+    uint32_t rows, pos0;
+    ds4_gpu_tensor *win;    /* DS4_N_LAYER * rows * 512 floats */
+    ds4_gpu_tensor *prev;   /* 4 owners * rows * 2 * 512 floats */
+    ds4_gpu_tensor *logits; /* rows * DS4_N_VOCAB, device */
+    ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
+    float *row_logits;      /* rows * DS4_N_VOCAB, host */
+} ds41_verify_ctx;
+
+static DS4_MAYBE_UNUSED void ds41_verify_free(ds41_verify_ctx *vc) {
+    if (!vc) return;
+    ds4_gpu_tensor_free(vc->win);
+    ds4_gpu_tensor_free(vc->prev);
+    ds4_gpu_tensor_free(vc->logits);
+    free(vc->row_logits);
+    memset(vc, 0, sizeof(*vc));
+}
+
+static DS4_MAYBE_UNUSED bool ds41_verify_alloc(ds41_verify_ctx *vc, uint32_t rows) {
+    memset(vc, 0, sizeof(*vc));
+    if (rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return false;
+    vc->rows = rows;
+    vc->win = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * rows * DS41_VERIFY_KV_ROW);
+    vc->prev = ds4_gpu_tensor_alloc((uint64_t)4u * rows * 2u * DS41_VERIFY_KV_ROW);
+    vc->logits = ds4_gpu_tensor_alloc((uint64_t)rows * DS4_N_VOCAB * sizeof(float));
+    vc->row_logits = malloc((size_t)rows * DS4_N_VOCAB * sizeof(float));
+    if (!vc->win || !vc->prev || !vc->logits || !vc->row_logits) {
+        ds41_verify_free(vc);
+        return false;
+    }
+    return true;
+}
+
+/* The verified span occupies `rows` consecutive slots modulo 128, so it is at
+ * most two contiguous runs in the ring and exactly one in the snapshot. */
+static DS4_MAYBE_UNUSED bool ds41_verify_ring(ds41_verify_ctx *vc, ds4_gpu_tensor *ring,
+                             uint32_t il, uint32_t from, bool save) {
+    const uint32_t slot = (vc->pos0 + from) % 128u;
+    const uint32_t n = vc->rows - from;
+    const uint32_t head = 128u - slot < n ? 128u - slot : n;
+    const uint64_t snap = ((uint64_t)il * vc->rows + from) * DS41_VERIFY_KV_ROW;
+    const uint64_t at = (uint64_t)slot * DS41_VERIFY_KV_ROW;
+    const uint64_t tail = snap + (uint64_t)head * DS41_VERIFY_KV_ROW;
+    if (save)
+        return ds4_gpu_tensor_copy(vc->win, snap, ring, at,
+                                   (uint64_t)head * DS41_VERIFY_KV_ROW) &&
+               (head == n || ds4_gpu_tensor_copy(vc->win, tail, ring, 0,
+                                   (uint64_t)(n - head) * DS41_VERIFY_KV_ROW));
+    return ds4_gpu_tensor_copy(ring, at, vc->win, snap,
+                               (uint64_t)head * DS41_VERIFY_KV_ROW) &&
+           (head == n || ds4_gpu_tensor_copy(ring, 0, vc->win, tail,
+                               (uint64_t)(n - head) * DS41_VERIFY_KV_ROW));
+}
+
+static DS4_MAYBE_UNUSED bool ds41_verify_save_window(ds41_verify_ctx *vc, ds41_gpu_graph *g, uint32_t il) {
+    return ds41_verify_ring(vc, g->window[il], il, 0, true);
+}
+
+/* previous_kv/previous_score are only carried by the ratio-2 compressors; the
+ * ratio-1 owner copies pool_kv straight through and reads neither. */
+static DS4_MAYBE_UNUSED bool ds41_verify_save_prev(ds41_verify_ctx *vc, ds41_gpu_graph *g,
+                                  uint32_t owner, uint32_t row) {
+    const uint64_t at = ((uint64_t)owner * vc->rows + row) * 2u * DS41_VERIFY_KV_ROW;
+    return ds4_gpu_tensor_copy(vc->prev, at, g->previous_kv[owner], 0, DS41_VERIFY_KV_ROW) &&
+           ds4_gpu_tensor_copy(vc->prev, at + DS41_VERIFY_KV_ROW,
+                               g->previous_score[owner], 0, DS41_VERIFY_KV_ROW);
+}
+
+/* Commit the first `keep` verified rows and undo everything the rest wrote. */
+static DS4_MAYBE_UNUSED bool ds41_verify_commit(ds41_gpu_graph *g,
+                                                ds41_verify_ctx *vc,
+                                                uint32_t keep) {
+    if (!g || !vc || keep == 0 || keep > vc->rows) return false;
+    bool ok = true;
+    if (keep < vc->rows) {
+        if (!ds4_gpu_begin_commands()) return false;
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++)
+            ok = ds41_verify_ring(vc, g->window[il], il, keep, false);
+        for (uint32_t owner = 0; ok && owner < 4u; owner++) {
+            const uint32_t il = owner == 0 ? 2u : owner == 1 ? 8u : owner == 2 ? 14u : 20u;
+            if (ds4_layer_compress_ratio(il) != 2u) continue;
+            const uint64_t at = ((uint64_t)owner * vc->rows + keep - 1u) * 2u * DS41_VERIFY_KV_ROW;
+            ok = ds4_gpu_tensor_copy(g->previous_kv[owner], 0, vc->prev, at,
+                                     DS41_VERIFY_KV_ROW) &&
+                 ds4_gpu_tensor_copy(g->previous_score[owner], 0, vc->prev,
+                                     at + DS41_VERIFY_KV_ROW, DS41_VERIFY_KV_ROW);
+        }
+        if (!ds4_gpu_end_commands()) ok = false;
+    }
+    g->history = vc->history[keep - 1u];
+    g->pos = vc->pos0 + keep;
+    return ok;
+}
+
 static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t total_count,
                               ds4_session_progress_fn progress, void *progress_ud,
