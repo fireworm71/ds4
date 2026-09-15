@@ -31694,6 +31694,19 @@ static bool metal_graph_encode_mixed_routed_rows(
  * experts, sum, and HC post.  A non-empty decode tail has already been
  * prepared in rows [n_tokens, n_tokens + decode_count); only the routed
  * expert dispatch is shared between the two arithmetic paths. */
+#define DS4_FFN_DBG_MAG(label_, tensor_) do {                             \
+        if (ok && N_ROUTER_EXPERTS != DS4_N_EXPERT &&                       \
+            getenv("DS4_DSPARK_DEBUG_GPU")) {                                   \
+            if (ds4_gpu_end_commands() != 0) {                              \
+                float fv_[8]; double fm_ = 0;                               \
+                if ((tensor_) &&                                            \
+                    ds4_gpu_tensor_read((tensor_), 0, fv_, sizeof(fv_)) != 0) \
+                    for (int fi_ = 0; fi_ < 8; fi_++) fm_ += fabsf(fv_[fi_]); \
+                fprintf(stderr, "ds4: dbg ffnpart %s mag8=%.4f\n", (label_), fm_); \
+                ok = ds4_gpu_begin_commands() != 0;                         \
+            } else ok = false;                                              \
+        }                                                                   \
+    } while (0)
 static bool metal_graph_encode_layer_ffn_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -31821,6 +31834,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("norm");
+    DS4_FFN_DBG_MAG("norm", metal_graph_batch_ffn_norm(g));
     if (ok) ok = metal_graph_matmul_plain_tensor(metal_graph_batch_router_logits(g),
                                                  model,
                                                  layer->ffn_gate_inp,
@@ -31891,6 +31905,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * N_ROUTER_USED, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
+    DS4_FFN_DBG_MAG("router", metal_graph_batch_router_weights(g));
 
     if (ok) {
         ok = metal_graph_cuda_stream_prefill_batch_selected_load(g,
@@ -32248,6 +32263,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
+    DS4_FFN_DBG_MAG("routed_moe", metal_graph_batch_routed_out(g));
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
     }
@@ -34105,6 +34121,18 @@ static bool metal_graph_dspark_stage_profile_boundary(
     return ds4_gpu_begin_commands() != 0;
 }
 
+#define DS4_DSPARK_DBG_MAG(label_, tensor_) do {                          \
+        if (ok && stage == 0 && getenv("DS4_DSPARK_DEBUG_GPU")) {               \
+            if (ds4_gpu_end_commands() != 0) {                              \
+                float dv_[8]; double dm_ = 0;                               \
+                if ((tensor_) &&                                            \
+                    ds4_gpu_tensor_read((tensor_), 0, dv_, sizeof(dv_)) != 0) \
+                    for (int di_ = 0; di_ < 8; di_++) dm_ += fabsf(dv_[di_]); \
+                fprintf(stderr, "ds4: dbg part %s mag8=%.4f\\n", (label_), dm_); \
+                ok = ds4_gpu_begin_commands() != 0;                         \
+            } else ok = false;                                              \
+        }                                                                   \
+    } while (0)
 static bool metal_graph_eval_dspark_stage_block(
         ds4_gpu_graph            *g,
         const ds4_model          *dspark_model,
@@ -34213,11 +34241,18 @@ static bool metal_graph_eval_dspark_stage_block(
         if (ds4_gpu_end_commands() != 0) {
             const uint64_t hcb = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
             float v[8];
-            for (uint32_t r = 0; r < 2; r++) {
+            for (uint32_t r = 0; r < 6; r++) {
                 double mag = 0;
                 if (ds4_gpu_tensor_read(g->dspark_stage_input_hc, r * hcb, v, sizeof(v)) != 0)
                     for (int i = 0; i < 8; i++) mag += fabsf(v[i]);
                 fprintf(stderr, "ds4: dbg stagein row=%u mag8=%.4f\n", r, mag);
+            }
+            {
+                int32_t toks[8] = {0};
+                if (g->dspark_draft_tokens)
+                    (void)ds4_gpu_tensor_read(g->dspark_draft_tokens, 0, toks, sizeof(toks));
+                fprintf(stderr, "ds4: dbg stagein draft_tokens=%d,%d,%d,%d,%d\n",
+                        toks[0], toks[1], toks[2], toks[3], toks[4]);
             }
             double mx = 0, th = 0;
             if (g->dspark_main_x && ds4_gpu_tensor_read(g->dspark_main_x, 0, v, sizeof(v)) != 0)
@@ -34323,6 +34358,7 @@ static bool metal_graph_eval_dspark_stage_block(
                                            DS4_ROPE_YARN_BETA_FAST,
                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
     DS4_DSPARK_PROFILE_STAGE("q_path");
+    DS4_DSPARK_DBG_MAG("q_path", metal_graph_batch_q(g));
 
     if (ok && ds4_dspark_rocm_gfx1151_reference_alignment()) {
         /* Keep every draft row's HC/attn_norm result; only target row zero uses the already-projected main_x shared by all support stages. */
@@ -34415,6 +34451,7 @@ static bool metal_graph_eval_dspark_stage_block(
                                            DS4_ROPE_YARN_BETA_FAST,
                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
     DS4_DSPARK_PROFILE_STAGE("attention");
+    DS4_DSPARK_DBG_MAG("attention", metal_graph_batch_heads(g));
     if (ok) ok = ds4_gpu_attention_output_q8_batch_tensor(
                     metal_graph_batch_attn_out(g),
                     metal_graph_batch_attn_low(g),
@@ -34437,6 +34474,7 @@ static bool metal_graph_eval_dspark_stage_block(
                                                  DS4_N_EMBD,
                                                  DS4_N_HC) != 0;
     DS4_DSPARK_PROFILE_STAGE("attn_output_hc");
+    DS4_DSPARK_DBG_MAG("attn_output_hc", metal_graph_batch_after_attn_hc(g));
 
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g,
                                                      dspark_model,
@@ -34462,7 +34500,7 @@ static bool metal_graph_eval_dspark_stage_block(
                 g, dw, metal_graph_batch_next_hc(g));
     }
     DS4_DSPARK_PROFILE_STAGE("next_input");
-    if (ok && getenv("DS4_DSPARK_DEBUG")) {
+    if (ok && getenv("DS4_DSPARK_DEBUG_GPU")) {
         /* Debug-only sync read: per-draft-row magnitude of this stage's
          * output, to localize NaN production to a stage. */
         if (ds4_gpu_end_commands() != 0) {
@@ -57160,6 +57198,12 @@ struct ds4_session {
     int greedy_splitkv_anchor_len;
 #ifndef DS4_NO_GPU
     float *spec_row_logits;
+    /* DS4_DSPARK_SHADOW=1: score drafts against the actually-decoded tokens
+     * without consuming them (plain decode, statistics only). */
+    int32_t  shadow_draft[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t shadow_len, shadow_idx;
+    uint64_t shadow_blocks, shadow_proposed, shadow_hits,
+             shadow_prefix_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     float *dspark_markov_bias;
     float *dspark_conf_features;
     size_t dspark_conf_features_cap;
@@ -66636,6 +66680,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
             dspark_weights_bind_optional(&e->dspark_weights,
                                          &e->mtp_model,
                                          &dspark);
+            /* Single-tier CUDA never reaches engine_install_dspark_support_cache
+             * (multi-tier only), but the CUDA side still needs to recognize the
+             * support map: the streaming-mode MoE guard keys on it so drafter
+             * experts resolve residently instead of aliasing the main model's
+             * layer 0..2 slots in the streaming expert cache. */
+            if (e->dspark && e->backend == DS4_BACKEND_CUDA && !e->multi_tier) {
+                const uint64_t bias = (e->model.size + 4095ull) & ~4095ull;
+                (void)ds4_gpu_register_support_map(e->mtp_model.map,
+                                                   e->mtp_model.size, bias);
+            }
             fprintf(stderr,
                     "ds4: DSpark support model detected: %s "
                     "(stages=%u block=%u markov_rank=%u tensors=%u missing=%u "
@@ -68298,6 +68352,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     s->dspark_conf_features_cap = (size_t)dspark_feature_count;
                 }
             }
+            /* Spec-verifier row-logits scratch, also allocated after the
+             * early return on the shared path. The markov proposal reads
+             * per-row logits through it. */
+            s->spec_row_logits =
+                xmalloc((size_t)DS4_N_VOCAB * sizeof(s->spec_row_logits[0]));
         }
         *out = s;
         return 0;
@@ -72301,6 +72360,25 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
          * accepts it. GLM does this on its own decode path; V4.1 needs it too.
          * No-op unless capture is enabled and valid. */
         ds4_session_dspark_capture_note_checkpoint(s);
+        /* Shadow scoring: before proposing anew, compare the previous
+         * cycle's stashed draft against the token that was ACTUALLY decoded.
+         * Prefix semantics match the real verifier: stop at first mismatch. */
+        const bool dspark_shadow = getenv("DS4_DSPARK_SHADOW") != NULL;
+        if (dspark_shadow && s->shadow_len != 0) {
+            if (token == s->shadow_draft[s->shadow_idx]) {
+                s->shadow_hits++;
+                s->shadow_idx++;
+                if (s->shadow_idx == s->shadow_len) {
+                    s->shadow_prefix_hist[s->shadow_len]++;
+                    s->shadow_blocks++;
+                    s->shadow_len = 0;
+                }
+            } else {
+                s->shadow_prefix_hist[s->shadow_idx]++;
+                s->shadow_blocks++;
+                s->shadow_len = 0;
+            }
+        }
         /* And run the drafter proposal the shared decode path runs at its
          * tail (72273) -- this early return otherwise skips it, leaving
          * no_draft on every cycle. probe_mtp gates it exactly as there. */
@@ -72309,6 +72387,36 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                           (uint32_t)(s->checkpoint.len - 1),
                                           probe_mtp,
                                           getenv("DS4_MTP_PROBE") != NULL);
+        if (dspark_shadow && s->dspark_draft_valid && s->shadow_len == 0) {
+            const uint32_t n = s->dspark_draft_len <= DS4_DSPARK_MAX_BLOCK_SIZE ?
+                               s->dspark_draft_len : DS4_DSPARK_MAX_BLOCK_SIZE;
+            for (uint32_t i = 0; i < n; i++)
+                s->shadow_draft[i] = s->dspark_draft_tokens[i];
+            s->shadow_len = n;
+            s->shadow_idx = 0;
+            s->shadow_proposed += n;
+        }
+        if (dspark_shadow) {
+            /* Statistics only: the spec loop must not consume the draft. */
+            s->dspark_draft_valid = false;
+            s->dspark_draft_len = 0;
+            if ((s->shadow_blocks & 31u) == 16u && s->shadow_len == 0) {
+                fprintf(stderr,
+                        "ds4: DSpark shadow blocks=%llu proposed=%llu hits=%llu "
+                        "hit_rate=%.1f%% prefix_hist=%llu,%llu,%llu,%llu,%llu,%llu\n",
+                        (unsigned long long)s->shadow_blocks,
+                        (unsigned long long)s->shadow_proposed,
+                        (unsigned long long)s->shadow_hits,
+                        s->shadow_proposed ?
+                            100.0 * (double)s->shadow_hits / (double)s->shadow_proposed : 0.0,
+                        (unsigned long long)s->shadow_prefix_hist[0],
+                        (unsigned long long)s->shadow_prefix_hist[1],
+                        (unsigned long long)s->shadow_prefix_hist[2],
+                        (unsigned long long)s->shadow_prefix_hist[3],
+                        (unsigned long long)s->shadow_prefix_hist[4],
+                        (unsigned long long)s->shadow_prefix_hist[5]);
+            }
+        }
         return 0;
     }
 #endif

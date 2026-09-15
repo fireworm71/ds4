@@ -24571,7 +24571,20 @@ static int routed_moe_launch(
     const int mxfp4_path = (gate_type == 39u && down_type == 39u);
     if (!q4k_path && !iq2_path && !mxfp4_path) return 0;
 
-    if (g_ssd_streaming_mode && !owned_filtered) {
+    /* The streaming expert cache serves the MAIN model's layers; a support
+     * (DSpark sidecar) model's experts are resident and its stage indices
+     * would alias main layers 0..2 in the slot cache. Resolve those through
+     * the ordinary resident path instead. */
+    int support_model_map =
+        g_support_host_base && model_map == g_support_host_base;
+    /* Support-model experts are resident; never route them through the
+     * streaming expert cache (its slots belong to the main model's layers). */
+    if (support_model_map) allow_streaming = 0;
+    if (getenv("DS4_DSPARK_DEBUG") && n_total_expert != 384u)
+        fprintf(stderr, "ds4: dbg moe_launch support_map=%d stream_mode=%d owned=%d base=%p map=%p\n",
+                support_model_map, g_ssd_streaming_mode, owned_filtered,
+                g_support_host_base, model_map);
+    if (g_ssd_streaming_mode && !owned_filtered && !support_model_map) {
         const ds4_gpu_stream_expert_table table = {
             model_map, model_size, layer_index, n_total_expert,
             gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes};
@@ -24912,9 +24925,14 @@ static int routed_moe_launch(
      *                  token-indexed decode-style prefill kernels). */
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
+#define DS4_MOE_DBG(msg_) do {                                              \
+        if (getenv("DS4_DSPARK_DEBUG") && n_total_expert != 384u)           \
+            fprintf(stderr, "ds4: dbg moe q4k: %s\n", (msg_));             \
+    } while (0)
     if (gate_bytes > model_size - gate_offset ||
         gate_bytes > model_size - up_offset ||
         down_bytes > model_size - down_offset) {
+        DS4_MOE_DBG("bytes-vs-size reject");
         return 0;
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
