@@ -41401,6 +41401,62 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
                                    total, cancel, cancel_ud, false, false, NULL);
 }
+/* Verify `count` speculative tokens at consecutive positions starting at the
+ * session's current frontier, leaving every row's logits in vc->row_logits.
+ *
+ * The rows go through the ordinary batch sweep -- the verifier must compute
+ * exactly what prefill computes -- with the verify context armed so the window
+ * ring and the ratio-2 carry are snapshotted as the layers write them. On
+ * return the graph has advanced by `count`; the caller decides how many rows
+ * to keep and calls ds41_verify_commit, which restores the rejected tail.
+ *
+ * The caller owns vc: allocate with ds41_verify_alloc(vc, count) once per
+ * session and reuse it, since the undo log is sized by row count alone.
+ */
+static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
+                                                    const ds4_model *m,
+                                                    const ds4_weights *w,
+                                                    const int *tokens,
+                                                    uint32_t count,
+                                                    ds41_verify_ctx *vc) {
+    if (!g || !g->valid || !tokens || !vc || count == 0 || count != vc->rows ||
+        count > DS4_TP_BATCH_MAX_ROWS || g->tp_world == 2 ||
+        count > g->ctx - g->pos || !vc->logits || !vc->row_logits) {
+        return false;
+    }
+    vc->pos0 = g->pos;
+    /* Per-row Engram history: ds41_verify_commit rewinds to row keep-1, so
+     * capture the history after each token rather than only after the batch.
+     * This is a CPU-side hash advance, cheap at these row counts. */
+    ds4_engram_history hist = g->history;
+    for (uint32_t r = 0; r < count; r++) {
+        uint32_t ids[2][DS4_ENGRAM_COLS] = {{0}};
+        const uint32_t saved_pos = g->pos;
+        g->pos = vc->pos0 + r;
+        const bool hok = ds41_hash_tokens(g, &hist, tokens + r, 1u, &ids[0][0]);
+        g->pos = saved_pos;
+        if (!hok) return false;
+        vc->history[r] = hist;
+    }
+    if (!ds41_graph_prefill_sweep(g, m, w, tokens, count, NULL, NULL, 0,
+                                  NULL, NULL, false, false, vc)) {
+        return false;
+    }
+    /* Per-row logits: the V4.1 head is already row-parameterized, so the only
+     * difference from the single-token path is the row count. */
+    ds41_prefill_row *b = &g->batch;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre,
+                                                DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16);
+    if (ok) ok = ds41_norm_batch(b->norm, b->x, m, w->output_norm, count);
+    if (ok) ok = ds41_output_projection(g, vc->logits, m, w, b->norm, count);
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok) ok = ds4_gpu_tensor_read(vc->logits, 0, vc->row_logits,
+                                     (uint64_t)count * DS4_N_VOCAB * sizeof(float)) != 0;
+    return ok;
+}
+
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
     if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
     ds41_gpu_graph *largest = NULL;
