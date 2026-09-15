@@ -66038,9 +66038,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
              (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
               (!gpu_cfg || gpu_cfg->n_gpus <= 1))) &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE;
+        /* --dspark is the runtime-enable flag, so it must be PERMITTED here
+         * (not excluded); the sidecar path handles it. */
         const bool v41_dspark_try =
             getenv("DS4_V41_DSPARK_ENABLE") != NULL &&
-            opt->mtp_path && opt->mtp_path[0] && !opt->dspark && v41_dspark_single;
+            opt->mtp_path && opt->mtp_path[0] && v41_dspark_single;
         if (!v41_dspark_try)
             supported = supported && !opt->dspark &&
                         (!opt->mtp_path || !opt->mtp_path[0]);
@@ -66480,7 +66482,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
+        /* Streaming main model + resident DSpark sidecar: the sidecar's own
+         * tensors are cached to device below (accelerator_cache_model_tensors),
+         * independent of the main model's streaming expert cache, so the two
+         * coexist. Permitted for V4.1 behind DS4_V41_DSPARK_ENABLE; every other
+         * model/flag keeps the refusal. Budget: resident main + streaming plan
+         * + ~8 GiB sidecar fits 121 GiB with margin, but a run should still be
+         * watched for headroom. */
+        const bool v41_dspark_stream_ok =
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+            getenv("DS4_V41_DSPARK_ENABLE") != NULL;
+        if (e->ssd_streaming && !v41_dspark_stream_ok) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp-model yet\n");
             ds4_engine_close(e);
             *out = NULL;
