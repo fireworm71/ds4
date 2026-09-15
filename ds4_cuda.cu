@@ -19467,8 +19467,85 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     }
     return ok;
 }
+__global__ static void router_select_generic_kernel(
+        int32_t *selected,
+        float *weights,
+        float *probs,
+        const float *bias,
+        const float *logits,
+        uint32_t n_expert,
+        uint32_t n_used,
+        float scale,
+        uint32_t n_tokens) {
+    /* V4.1 DSpark drafter routing (128 experts, top-3): same scoring as the
+     * backbone selector -- prob = sqrt(softplus(logit)), bias steers selection
+     * only, weights are the raw probs of the winners normalized then scaled.
+     * One thread per token; the drafter routes 6 rows of 128, so brute force
+     * is faster than any clever shape-specialized kernel here. */
+    uint32_t t = blockIdx.x;
+    if (t >= n_tokens || threadIdx.x != 0 || n_used > 8u) return;
+    const float *log = logits + (uint64_t)t * n_expert;
+    float *prob = probs + (uint64_t)t * n_expert;
+    int32_t *sel = selected + (uint64_t)t * n_used;
+    float *w = weights + (uint64_t)t * n_used;
+
+    for (uint32_t i = 0; i < n_expert; i++) prob[i] = sqrtf(softplus_dev(log[i]));
+    for (uint32_t i = 0; i < n_used; i++) sel[i] = -1;
+    for (uint32_t i = 0; i < n_expert; i++) {
+        const float score = prob[i] + (bias ? bias[i] : 0.0f);
+        for (uint32_t j = 0; j < n_used; j++) {
+            const int32_t cur = sel[j];
+            const float cur_score =
+                cur >= 0 ? prob[cur] + (bias ? bias[cur] : 0.0f) : -1.0e30f;
+            if (cur < 0 || score > cur_score) {
+                for (uint32_t k = n_used - 1u; k > j; k--) sel[k] = sel[k - 1u];
+                sel[j] = (int32_t)i;
+                break;
+            }
+        }
+    }
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_used; i++) {
+        const int32_t e = sel[i];
+        const float v = (e >= 0 && (uint32_t)e < n_expert) ? prob[e] : 0.0f;
+        w[i] = v;
+        sum += v;
+    }
+    sum = fmaxf(sum, 6.103515625e-5f);
+    for (uint32_t i = 0; i < n_used; i++) w[i] = w[i] / sum * scale;
+}
+
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
-    if ((n_expert != 256u && n_expert != 384u) || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    const bool generic_shape =
+        (n_expert != 256u && n_expert != 384u) || n_expert_used != 6u;
+    if (generic_shape) {
+        /* Non-backbone geometry (the V4.1 DSpark drafter: 128 experts, top-3).
+         * Same scoring, brute-force kernel; hash/group modes unsupported. */
+        if (!selected || !weights || !probs || !logits || !model_map ||
+            n_tokens == 0 || hash_mode || n_expert_groups > 1u ||
+            n_expert < 2u || n_expert_used < 1u || n_expert_used > 8u ||
+            logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+            probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+            selected->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
+            weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
+            return 0;
+        }
+        const float *gbias = NULL;
+        if (has_bias) {
+            if (bias_offset > model_size ||
+                model_size - bias_offset < n_expert * sizeof(float)) return 0;
+            gbias = (const float *)cuda_resolve_weight_ptr(
+                    model_map, bias_offset, n_expert * sizeof(float),
+                    ds4_tensor_device_idx(selected), "router_bias");
+            if (!gbias) return 0;
+        }
+        router_select_generic_kernel<<<n_tokens, 1, 0, cuda_decode_stream()>>>(
+                (int32_t *)selected->ptr, (float *)weights->ptr,
+                (float *)probs->ptr, gbias, (const float *)logits->ptr,
+                n_expert, n_expert_used, expert_weight_scale, n_tokens);
+        return cuda_ok(cudaGetLastError(), "router_select generic launch");
+    }
+    if (fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
         logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
