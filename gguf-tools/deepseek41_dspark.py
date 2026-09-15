@@ -45,6 +45,7 @@ from glm53_quantize import (
     tensor_header,
 )
 from deepseek41_quantize import NativeQuantizer, scale_name
+import struct, shutil
 
 # --- DSpark metadata KV keys the engine's model_dspark_summary reads ---
 def kv_u32(key, value):
@@ -185,6 +186,65 @@ def dspark_records(c, revision):
     return recs
 
 
+
+def write_dspark(args, plan, records, db):
+    """Compact single-pass writer: no imatrix, no resume (8 GiB). hc_head
+    items (transform set) are the pre-slice of the stage's hc_ffn."""
+    q = NativeQuantizer(args.quants_library)
+    np = q.np
+    data_start, data_bytes = print_plan(plan, records, [], GGUF_ALIGNMENT)
+    if os.path.exists(args.out):
+        raise ValueError(f"refusing to overwrite {args.out}")
+    free = shutil.disk_usage(os.path.dirname(os.path.abspath(args.out)) or ".").free
+    if free < data_start + data_bytes + (8 << 30):
+        raise ValueError("insufficient disk space (+8 GiB reserve)")
+    header = b"GGUF" + struct.pack("<IQQ", 3, len(plan), len(records))
+    header += b"".join(records) + b"".join(tensor_header(item) for item in plan)
+    header += bytes(data_start - len(header))
+    partial = args.out + ".partial"
+    N_HC = db_hc(db)
+    with open(partial, "xb") as fp:
+        fp.write(header)
+        for index, item in enumerate(plan):
+            if fp.tell() != data_start + item.offset:
+                raise ValueError(f"offset drift at {item.name}")
+            if item.transform:
+                src = q.to_f32(db, item.source)              # hc_ffn_{fn|base|scale}
+                if item.transform == "hc_head_fn":
+                    arr = src[:N_HC, :]
+                elif item.transform == "hc_head_base":
+                    arr = src[:N_HC]
+                else:                                        # hc_head_scale
+                    arr = src[:1]
+                data = q.encode(np.ascontiguousarray(arr, dtype=np.float32), item.qtype)
+            elif item.is_expert:
+                parts = []
+                for e in range(item.expert_count):
+                    v = q.to_f32(db, item.source.format(expert=e))
+                    parts.append(q.encode(v, item.qtype))
+                data = b"".join(parts)
+            else:
+                data = q.encode(q.to_f32(db, item.source), item.qtype)
+            if len(data) != item.nbytes:
+                raise ValueError(f"{item.name}: {len(data)} bytes, expected {item.nbytes}")
+            fp.write(data)
+            fp.write(bytes(align(item.nbytes, GGUF_ALIGNMENT) - item.nbytes))
+            print(f"[{index+1}/{len(plan)}] {item.name}: {item.nbytes/(1<<20):.1f} MiB", flush=True)
+    os.rename(partial, args.out)
+    print(f"wrote {args.out} ({data_start + data_bytes} bytes)", file=sys.stderr)
+
+
+def db_hc(db):
+    # N_HC from a known hc_ffn_base length (mix_hc = (hc+2)*hc) -> solve hc.
+    n = db.info("mtp.0.hc_ffn_base")["shape"][0]
+    hc = int(round(((n) ** 0.5)))
+    while (hc + 2) * hc != n:
+        hc += 1 if (hc + 2) * hc < n else -1
+        if hc < 1 or hc > 64:
+            raise ValueError(f"cannot solve hc from mix_hc={n}")
+    return hc
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--hf", required=True)
@@ -213,8 +273,7 @@ def main():
             total = sum(align(qtype_nbytes(i.qtype, i.shape), GGUF_ALIGNMENT) for i in plan)
             print(f"planned data bytes: {total} ({total/2**30:.2f} GiB)", file=sys.stderr)
         else:
-            raise SystemExit("full write path: wire write_gguf with synth handling "
-                             "(hc_head slice) before running; dry-run validated first.")
+            write_dspark(args, plan, records, db)
     finally:
         db.close()
 
