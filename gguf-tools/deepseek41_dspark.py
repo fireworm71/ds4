@@ -181,6 +181,7 @@ def dspark_records(c, revision):
         kv_u32("deepseek4.dspark_block_size", c["dspark_block_size"]),
         kv_u32("deepseek4.dspark_markov_rank", c["dspark_markov_rank"]),
         kv_u32("deepseek4.dspark_noise_token_id", c["dspark_noise_token_id"]),
+        kv_u32("deepseek4.dspark_n_routed_experts", c["dspark_n_routed_experts"]),
         kv_u32_array("deepseek4.dspark_target_layer_ids", tl),
     ]
     return recs

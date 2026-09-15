@@ -2730,9 +2730,11 @@ typedef struct {
     uint32_t block_size;
     uint32_t markov_rank;
     uint32_t noise_token_id;
+    uint32_t n_experts;      /* drafter routed-expert count; V4.1 DSpark=128 */
     uint32_t target_layer_count;
     uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
     bool has_metadata;
+    bool has_n_experts;
     bool has_main_proj;
     bool has_main_norm;
     bool has_markov_head;
@@ -2847,6 +2849,20 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
                                 &s.target_layer_count)) {
         s.has_metadata = true;
         s.has_target_layers = true;
+    }
+    static const char *const nexp_keys[] = {
+        "deepseek4.dspark.n_routed_experts",
+        "deepseek4.dspark_n_routed_experts",
+        "dspark.n_routed_experts",
+    };
+    if (model_get_u32_any(m, nexp_keys, sizeof(nexp_keys) / sizeof(nexp_keys[0]),
+                          &s.n_experts)) {
+        s.has_metadata = true;
+        s.has_n_experts = true;
+    } else {
+        /* Back-compat: the vision-exp DSpark checkpoint shares the backbone's
+         * expert count and stamps no drafter-specific key. */
+        s.n_experts = DS4_N_EXPERT;
     }
 
     uint32_t max_stage = 0;
@@ -4503,6 +4519,7 @@ typedef struct {
     uint32_t noise_token_id;
     uint32_t target_layer_count;
     uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
+    uint32_t n_experts;
     uint32_t present_tensors;
     uint32_t missing_tensors;
     uint32_t invalid_tensors;
@@ -5792,21 +5809,22 @@ static void dspark_weights_validate_block_layout(
     dspark_validate_tensor_layout(dw, l->ffn_norm, "ffn_norm",
                                   DS4_DSPARK_LAYOUT_F32, 1,
                                   DS4_N_EMBD, 0, 0);
+    const uint32_t nexp = dw->n_experts ? dw->n_experts : DS4_N_EXPERT;
     dspark_validate_tensor_layout(dw, l->ffn_gate_inp, "ffn_gate_inp",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
-                                  DS4_N_EMBD, DS4_N_EXPERT, 0);
+                                  DS4_N_EMBD, nexp, 0);
     dspark_validate_tensor_layout(dw, l->ffn_exp_probs_b, "exp_probs_b",
                                   DS4_DSPARK_LAYOUT_F32, 1,
-                                  DS4_N_EXPERT, 0, 0);
+                                  nexp, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_exps, "ffn_gate_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, nexp);
     dspark_validate_tensor_layout(dw, l->ffn_up_exps, "ffn_up_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, nexp);
     dspark_validate_tensor_layout(dw, l->ffn_down_exps, "ffn_down_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+                                  DS4_N_FF_EXP, DS4_N_EMBD, nexp);
     if (l->ffn_gate_exps &&
         l->ffn_up_exps &&
         l->ffn_gate_exps->type != l->ffn_up_exps->type) {
@@ -7826,6 +7844,7 @@ static void dspark_weights_bind_optional(
 
     dw->n_stages = summary->stages < DS4_DSPARK_MAX_STAGES ?
                    summary->stages : DS4_DSPARK_MAX_STAGES;
+    dw->n_experts = summary->n_experts ? summary->n_experts : DS4_N_EXPERT;
     dw->block_size = summary->block_size;
     dw->markov_rank = summary->markov_rank;
     dw->noise_token_id = summary->noise_token_id;
