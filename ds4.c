@@ -57425,6 +57425,8 @@ struct ds4_session {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_gpu_graph ds41_graph;
     bool ds41_graph_ready;
+    ds41_verify_ctx ds41_vc;      /* DSpark verify undo log; rows fixed at first use */
+    bool ds41_vc_ready;
 #endif
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
@@ -68963,6 +68965,10 @@ void ds4_session_free(ds4_session *s) {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
+            if (s->ds41_vc_ready) {
+                ds41_verify_free(&s->ds41_vc);
+                s->ds41_vc_ready = false;
+            }
             ds41_graph_free(&s->ds41_graph);
             /* V4.1 DSpark sessions also carry a small s->graph scratch
              * allocation for the drafter (see session create). */
@@ -74629,6 +74635,103 @@ int ds4_sessions_eval_batch_with_prefill(
 }
 
 #ifndef DS4_NO_GPU
+/* V4.1 DSpark verification.
+ *
+ * The shared verifier (metal_graph_verify_suffix_tops) re-decodes the block on
+ * s->graph, which for V4.1 is only the drafter's small scratch graph -- that is
+ * why every draft was rejected before this path existed. V4.1 decodes on
+ * s->ds41_graph, so it verifies there, in one batch, and rolls the rejected
+ * tail back through the ported verify transaction.
+ *
+ * On entry drafts[0] has already been checked against the target's current
+ * logits by the caller, the session sits at the frontier, and the graph has
+ * not yet seen any draft. On return the session has advanced by exactly the
+ * number of accepted tokens and s->logits holds the last accepted row, so the
+ * next step continues as if those tokens had been decoded serially.
+ */
+static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
+                                          const int *drafts, int draft_n,
+                                          int eos_token, bool ignore_eos,
+                                          bool think_mode, int *accepted,
+                                          int accepted_cap,
+                                          char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    const bool stats_enabled = ds4_dspark_stats_enabled();
+    if (!s->ds41_graph_ready || !g->valid || draft_n <= 0 ||
+        g->pos != (uint32_t)s->checkpoint.len) {
+        return n_accept;                      /* nothing mutated: stay serial */
+    }
+    if (s->ds41_vc_ready && s->ds41_vc.rows != (uint32_t)draft_n) {
+        ds41_verify_free(&s->ds41_vc);
+        s->ds41_vc_ready = false;
+    }
+    if (!s->ds41_vc_ready) {
+        if (!ds41_verify_alloc(&s->ds41_vc, (uint32_t)draft_n)) return n_accept;
+        s->ds41_vc_ready = true;
+    }
+    const double verify_t0 = stats_enabled ? now_sec() : 0.0;
+    /* Up to here nothing has been mutated, so a failure is drained and the
+     * caller may finish serially. Past the batch the graph has advanced and
+     * only ds41_verify_commit puts the frontier back. */
+    if (!ds41_graph_verify_rows(g, &e->model, &e->weights, drafts,
+                                (uint32_t)draft_n, &s->ds41_vc)) {
+        g->valid = false;
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen,
+                             "V4.1 DSpark verify failed at position %d", s->checkpoint.len);
+        return -1;
+    }
+    if (stats_enabled) s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
+
+    /* Longest prefix whose predecessor row predicts it. drafts[0] is already
+     * known to match the target's current logits. */
+    int commit = 1;
+    /* DS4_DS41_VERIFY_COMMIT1=1 accepts only drafts[0], which the caller has
+     * already matched against the target's own logits. Any divergence from
+     * serial output under that setting is the batch's effect on state, not the
+     * accept rule -- a diagnostic separation, not a mode. */
+    const bool commit1_only = getenv("DS4_DS41_VERIFY_COMMIT1") != NULL;
+    for (int i = 1; !commit1_only && i < draft_n; i++) {
+        const float *row = s->ds41_vc.row_logits + (size_t)(i - 1) * DS4_N_VOCAB;
+        if (sample_argmax(row, DS4_N_VOCAB) != drafts[i]) break;
+        commit++;
+    }
+    for (int i = 0; i < commit; i++) {
+        if (!ignore_eos && drafts[i] == eos_token) { commit = i + 1; break; }
+        if (think_mode &&
+            ds4_token_is_stop_for_think_mode(e, drafts[i], s->checkpoint.len + i)) {
+            commit = i + 1;
+            break;
+        }
+    }
+    if (!ds41_verify_commit(g, &s->ds41_vc, (uint32_t)commit)) {
+        g->valid = false;
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "V4.1 DSpark verify commit failed");
+        return -1;
+    }
+    for (int i = 0; i < commit; i++) token_vec_push(&s->checkpoint, drafts[i]);
+    s->checkpoint_valid = true;
+    /* The last accepted row's logits are the state the next step reads. */
+    memcpy(s->logits, s->ds41_vc.row_logits + (size_t)(commit - 1) * DS4_N_VOCAB,
+           (size_t)DS4_N_VOCAB * sizeof(float));
+    s->mtp_draft_valid = false;
+    s->dspark_draft_valid = false;
+    s->dspark_draft_len = 0;
+    if (stats_enabled) {
+        s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
+        s->dspark_stats.accepted_draft_tokens += (uint64_t)(commit - 1);
+        ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                  (uint32_t)(commit - 1));
+        if (commit == draft_n) s->dspark_stats.full_accepts++;
+        else s->dspark_stats.partial_accepts++;
+    }
+    int out = n_accept;
+    for (int i = 0; i < commit && out < accepted_cap; i++) accepted[out++] = drafts[i];
+    return out;
+}
+
 static int ds4_session_eval_dspark_speculative_argmax(
         ds4_session *s,
         int          n_accept,
@@ -74786,6 +74889,16 @@ static int ds4_session_eval_dspark_speculative_argmax(
         return n_accept;
     }
     if (drafts[0] == eos_token) draft_n = 1;
+    /* V4.1 verifies on its own graph. Everything below this point -- frontier
+     * snapshot, suffix verify, replay -- operates on s->graph, which for V4.1
+     * holds only the drafter's scratch, so it can never verify a V4.1 draft. */
+    if (ds4_session_is_ds41(s)) {
+        const int rc = ds4_session_ds41_dspark_verify(s, n_accept, drafts, draft_n,
+                                                      eos_token, ignore_eos, think_mode,
+                                                      accepted, accepted_cap, err, errlen);
+        DS4_DSPARK_STATS_FINISH();
+        return rc;
+    }
     ds4_engine *e = s->engine;
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
