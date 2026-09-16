@@ -158,6 +158,27 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
         }
     }
     uint8_t raw[DS4_ENGRAM_ROW_BYTES];
+#ifndef __APPLE__
+    /* Queue every row with the kernel before reading any of them. These rows are
+     * hash-scattered with no locality, and decode reads them at queue depth 1,
+     * so each pread pays the device's full random-read latency INCLUDING its
+     * tail (measured p99 is ~3.4x the median, and at depth 1 every tail event
+     * lands on the critical path whole). WILLNEED lets the device see all the
+     * requests at once without spawning threads, so unlike a reader pool it
+     * costs ~nothing when the pages are already resident. Advisory: if the
+     * kernel ignores it the reads below are still correct.
+     * DS4_ENGRAM_FADVISE=0 disables, for A/B. */
+    static int fadvise_on = -1;
+    if (fadvise_on < 0) {
+        const char *env = getenv("DS4_ENGRAM_FADVISE");
+        fadvise_on = (env && env[0] == '0') ? 0 : 1;
+    }
+    if (fadvise_on && count > 1) {
+        for (size_t i = 0; i < count; i++)
+            posix_fadvise(t->fd, (off_t)(t->offset + (uint64_t)rows[i] * sizeof(raw)),
+                          (off_t)sizeof(raw), POSIX_FADV_WILLNEED);
+    }
+#endif
     for (size_t i = 0; i < count; i++) {
         if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * sizeof(raw), raw)) return false;
         for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
@@ -269,6 +290,13 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
             .out = out + start * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM, .readers = 1};
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
+        /* Decode reads one token's COLS rows (24) per table, far below the
+         * prefill batch sizes this threshold was written for, and paid the full
+         * serial latency: measured 11.46 ms/token in-engine, ~19.6% of a TP2
+         * decode step. The rows are hash-scattered with no usable locality, so
+         * concurrency is the only lever -- 8 readers measured 1.70 ms/token vs
+         * 10.55 serial, and beat 16 readers once per-call thread spawn is
+         * counted. Large batches keep the full reader set. */
         if (count >= 256) {
             batch.readers = ENGRAM_READERS;
 #ifdef __APPLE__

@@ -40563,8 +40563,26 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
+    /* DS4_ENGRAM_PROFILE=1: report what the serial decode-time Engram reads
+     * actually cost. Decode issues 2 tables x DS4_ENGRAM_COLS rows at queue
+     * depth 1 (ds4_engram.c:161) while prefill uses the threaded batch path. */
+    static int engram_prof = -1;
+    if (engram_prof < 0) engram_prof = getenv("DS4_ENGRAM_PROFILE") ? 1 : 0;
+    const double engram_t0 = engram_prof ? now_sec() : 0;
     for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
+        /* Passes all COLS rows in one call so the readahead hints inside cover
+         * the whole token's scattered set before the first blocking read. */
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
+    }
+    if (engram_prof) {
+        static double engram_ms = 0;
+        static uint64_t engram_tokens = 0;
+        engram_ms += (now_sec() - engram_t0) * 1000.0;
+        engram_tokens++;
+        if ((engram_tokens % 16u) == 0)
+            fprintf(stderr, "ds4: engram decode I/O %.3f ms/token mean over %llu tokens\n",
+                    engram_ms / (double)engram_tokens,
+                    (unsigned long long)engram_tokens);
     }
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
