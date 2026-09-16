@@ -144,6 +144,19 @@ int main(int argc, char **argv) {
             if (memcmp(buf, ref, (size_t)span) != 0) {
                 fprintf(stderr, "FAIL: promoted span at %llu has WRONG BYTES\n",
                         (unsigned long long)off);
+                uint64_t bad = 0;
+                while (bad < span && ((char*)buf)[bad] == ((char*)ref)[bad]) bad++;
+                fprintf(stderr, "  first differing byte at +%llu of %llu\n",
+                        (unsigned long long)bad, (unsigned long long)span);
+                fprintf(stderr, "  local (spark) :");
+                for (int q = 0; q < 16; q++) fprintf(stderr, " %02x",
+                        (unsigned char)((char*)ref)[bad + q]);
+                fprintf(stderr, "\n  remote(promax):");
+                for (int q = 0; q < 16; q++) fprintf(stderr, " %02x",
+                        (unsigned char)((char*)buf)[bad + q]);
+                fprintf(stderr, "\n  is remote all-zero here? ");
+                { int nz = 0; for (uint64_t q = 0; q < span; q++) if (((char*)buf)[q]) { nz = 1; break; }
+                  fprintf(stderr, "%s\n", nz ? "no, it has data" : "YES - slot never filled"); }
                 g_fail = 1; break;
             }
             promoted_ok++;

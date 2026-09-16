@@ -46,6 +46,9 @@ void ds4_rdma_tier_stats(uint64_t *reads, uint64_t *bytes, uint64_t *ns);
 void ds4_rdma_tier_promote(const void *src, uint64_t offset, uint64_t bytes);
 void ds4_rdma_tier_promote_stats(uint64_t *promoted, uint64_t *hits,
                                  uint64_t *skipped, uint32_t *slots);
+/* Promoted slots that failed read-back. Nonzero means the peer returned bytes
+ * that were not what was promoted; those slots are discarded, never served. */
+uint64_t ds4_rdma_tier_promote_corrupt(void);
 
 void ds4_rdma_tier_close(void);
 

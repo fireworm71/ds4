@@ -53,6 +53,7 @@ void ds4_rdma_tier_promote(const void *s, uint64_t o, uint64_t b) { (void)s; (vo
 void ds4_rdma_tier_promote_stats(uint64_t *p, uint64_t *h, uint64_t *k, uint32_t *n) {
     if (p) *p = 0; if (h) *h = 0; if (k) *k = 0; if (n) *n = 0;
 }
+uint64_t ds4_rdma_tier_promote_corrupt(void) { return 0; }
 void ds4_rdma_tier_close(void) { }
 
 #else /* DS4_RT_HAVE_VERBS */
@@ -165,7 +166,7 @@ static struct {
     /* admission: how many times an uncovered offset has been read from disk */
     struct { uint64_t offset; uint32_t seen; } seen_tab[4096];
     /* async promotion queue -- the fetch path must never wait on the fabric */
-    struct rt_pq { uint64_t offset; uint32_t bytes; int wbuf; } *pq;
+    struct rt_pq { uint64_t offset; uint32_t bytes; int wbuf; uint64_t sig; } *pq;
     int      pq_head, pq_tail, pq_cap;
     pthread_mutex_t pqlock;
     pthread_cond_t  pqcv;
@@ -176,7 +177,9 @@ static struct {
     void    *wbuf; struct ibv_mr *wbuf_mr[RT_MAX_LEGS];
     int      n_wbuf; unsigned char *wbuf_busy;
     pthread_mutex_t wlock;
-    uint64_t promoted, promote_skipped, promote_hits;
+    uint64_t promoted, promote_skipped, promote_hits, promote_corrupt;
+    void *vbuf; struct ibv_mr *vbuf_mr[RT_MAX_LEGS];   /* worker-only read-back */
+    int   verify_promotions;
     int      gid_index;
     int      active;
     uint64_t reads, rbytes, ns;
@@ -536,6 +539,24 @@ static int rt_read_raw(rt_conn *c, void *dst, struct ibv_mr **mr,
 
 /* ---- promotion: directory, admission, and the worker ---- */
 
+/* Sampled signature. A full hash of every promoted span would sit on the fetch
+ * path, which is the one place that must stay cheap; 16 spread samples cost a
+ * handful of loads and catch the failure modes that actually occur here -- an
+ * unfilled slot, a stale slot, bytes from the wrong offset. It is a corruption
+ * detector, not a checksum: a single flipped bit can slip through. */
+static uint64_t rt_sig(const void *p, uint64_t bytes) {
+    const unsigned char *b = (const unsigned char *)p;
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ bytes;
+    for (int i = 0; i < 16; i++) {
+        uint64_t off = (bytes > 8) ? (uint64_t)i * ((bytes - 8) / 15u) : 0;
+        if (off + 8 > bytes) off = bytes - 8;
+        uint64_t w;
+        memcpy(&w, b + off, 8);
+        h ^= w + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    }
+    return h;
+}
+
 static int rt_post_write(rt_conn *c, int leg, const void *src, uint32_t lkey,
                          uint64_t raddr, uint64_t bytes) {
     struct ibv_sge sge;
@@ -663,6 +684,24 @@ static void *rt_worker(void *arg) {
         rt_release(idx);
         rt_wbuf_put(job.wbuf);
 
+        /* Read it back before publishing. Promotion is off the critical path,
+         * so this costs nothing that matters, and it is the difference between
+         * a corrupted slot being detected and it being served as model weights. */
+        if (ok && G.verify_promotions && G.vbuf) {
+            int vidx = 0;
+            rt_conn *vc = rt_acquire(&vidx);
+            const int got = rt_read_raw(vc, G.vbuf, G.vbuf_mr, slot_off, job.bytes);
+            rt_release(vidx);
+            if (!got || rt_sig(G.vbuf, job.bytes) != job.sig) {
+                ok = 0;
+                if (__sync_fetch_and_add(&G.promote_corrupt, 1) == 0)
+                    fprintf(stderr,
+                        "ds4: rdma promotion READ-BACK MISMATCH at model offset %llu "
+                        "-- discarding that slot. The model file still serves it, so "
+                        "output is unaffected; promotion is suspect on this peer.\n",
+                        (unsigned long long)job.offset);
+            }
+        }
         pthread_mutex_lock(&G.dirlock);
         if (ok) { G.slot[slot].valid = 1; G.slot[slot].stamp = ++G.stamp; G.promoted++; }
         else    { G.slot[slot].valid = 0; G.promote_skipped++; }
@@ -685,6 +724,7 @@ void ds4_rdma_tier_promote(const void *src, uint64_t offset, uint64_t bytes) {
     pthread_mutex_unlock(&G.dirlock);
     if (have) return;
 
+    const uint64_t sig = G.verify_promotions ? rt_sig(src, bytes) : 0;
     int wb = -1;
     if (G.promote_mode == RT_PROMOTE_D1) {
         wb = rt_wbuf_take();
@@ -702,6 +742,7 @@ void ds4_rdma_tier_promote(const void *src, uint64_t offset, uint64_t bytes) {
     G.pq[G.pq_tail].offset = offset;
     G.pq[G.pq_tail].bytes = (uint32_t)bytes;
     G.pq[G.pq_tail].wbuf = wb;
+    G.pq[G.pq_tail].sig = sig;
     G.pq_tail = next;
     pthread_cond_signal(&G.pqcv);
     pthread_mutex_unlock(&G.pqlock);
@@ -747,6 +788,8 @@ void ds4_rdma_tier_stats(uint64_t *reads, uint64_t *bytes, uint64_t *ns) {
     if (bytes) *bytes = G.rbytes;
     if (ns) *ns = G.ns;
 }
+
+uint64_t ds4_rdma_tier_promote_corrupt(void) { return G.promote_corrupt; }
 
 void ds4_rdma_tier_promote_stats(uint64_t *promoted, uint64_t *hits, uint64_t *skipped,
                                  uint32_t *slots) {
@@ -933,7 +976,24 @@ int ds4_rdma_tier_open(int model_fd, uint64_t model_bytes) {
                 if (!G.wbuf_mr[l]) G.wbuf = NULL;
             }
         }
-        if (!G.slot || !G.pq || (G.promote_mode == RT_PROMOTE_D1 && !G.wbuf)) {
+        G.verify_promotions = 1;
+        { const char *v = getenv("DS4_EXPERT_TIER_RDMA_VERIFY");
+          if (v && (v[0] == '0' || v[0] == 'n')) G.verify_promotions = 0; }
+        if (G.verify_promotions) {
+            if (posix_memalign(&G.vbuf, 4096, (size_t)G.slot_bytes) != 0) G.vbuf = NULL;
+            for (int l = 0; G.vbuf && l < G.n_legs; l++) {
+                G.vbuf_mr[l] = G.api.reg_mr(G.dev[l].pd, G.vbuf, (size_t)G.slot_bytes,
+                                            IBV_ACCESS_LOCAL_WRITE);
+                if (!G.vbuf_mr[l]) G.vbuf = NULL;
+            }
+            if (!G.vbuf) {
+                fprintf(stderr, "ds4: rdma promotion read-back buffer unavailable; "
+                                "promotion disabled rather than run unverified\n");
+                G.promote_mode = RT_PROMOTE_OFF;
+            }
+        }
+        if (G.promote_mode != RT_PROMOTE_OFF &&
+            (!G.slot || !G.pq || (G.promote_mode == RT_PROMOTE_D1 && !G.wbuf))) {
             fprintf(stderr, "ds4: rdma promotion setup failed; continuing read-only\n");
             G.promote_mode = RT_PROMOTE_OFF;
         } else if (pthread_create(&G.worker, NULL, rt_worker, NULL) != 0) {
@@ -968,9 +1028,12 @@ void ds4_rdma_tier_close(void) {
         pthread_join(G.worker, NULL);
         G.worker_live = 0;
     }
-    for (int l = 0; l < G.n_legs; l++)
+    for (int l = 0; l < G.n_legs; l++) {
         if (G.wbuf_mr[l]) { G.api.dereg_mr(G.wbuf_mr[l]); G.wbuf_mr[l] = NULL; }
+        if (G.vbuf_mr[l]) { G.api.dereg_mr(G.vbuf_mr[l]); G.vbuf_mr[l] = NULL; }
+    }
     free(G.wbuf); G.wbuf = NULL;
+    free(G.vbuf); G.vbuf = NULL;
     free(G.wbuf_busy); G.wbuf_busy = NULL;
     free(G.slot); G.slot = NULL;
     free(G.pq); G.pq = NULL;
