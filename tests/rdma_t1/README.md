@@ -11,28 +11,21 @@ verifies every byte.
 
 ## Status
 
-**Code complete and correctness-validated. The fabric measurement is NOT done
-— it needs a server on promaxgb10-493d, which this session had no access to**
-(spark's `authorized_keys` holds a promax key, so ssh runs promax→spark only,
-and no promax agent was running).
+**T1 PASSES.** Measured 2026-09-16, spark-0fb3 ↔ promaxgb10-493d, 200 iters
+per arm, byte verification on:
 
-Validated so far, by same-device loopback on spark-0fb3 alone:
+| span | single leg | **striped** | speedup |
+|---|---|---|---|
+| Q2 9.49 MiB | 756.8 µs (13.15 GB/s) | **433.3 µs (22.96 GB/s)** | 1.75× |
+| Q4 18.98 MiB | 1488.0 µs (13.38 GB/s) | **829.1 µs (24.00 GB/s)** | 1.79× |
 
-| arm | result |
-|---|---|
-| striped, Q2 span 9.49 MiB | byte-exact, 50.0/50.0 split across the two NICs |
-| striped, Q4 span 18.98 MiB | byte-exact, 50.0/50.0 split |
-| `--single` baseline | byte-exact, all bytes on dev A, 0.00 GB on dev B |
-| trap guard, one device twice | refuses to run |
+(medians; min-to-min is 1.80× for both). Against local NVMe that is 2.74× /
+2.34×. **ALL BYTES MATCH in all four arms**, striped arms split exactly
+50.0/50.0 by per-NIC counter, and single-leg arms leave the idle NIC at 0.00 GB.
 
-That exercises the handshake, the INIT→RTR→RTS recipe including the rd_atomic
-attributes, the striped address split, and per-leg counter attribution.
-
-⚠️ **The loopback timings are NOT fabric numbers and must not be quoted as
-T1's result.** Loopback traffic is turned around inside the HCA. For the
-record they were 420 µs (Q2 striped), 836 µs (Q4 striped), 810 µs (Q2 single);
-the first two land near T0's fabric figures by coincidence, which is exactly
-the kind of too-good agreement methodology rule 7 says to distrust.
+Mins land within 0.6% of the `ib_read_bw` figures T0 predicted; medians run
+1–5% higher, which is the expected cost of a per-operation QD1 median against
+a QD16 throughput average. Full detail in `misc/T1_RESULT.md` (untracked).
 
 ## Running it for real
 
