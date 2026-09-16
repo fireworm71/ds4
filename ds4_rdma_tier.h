@@ -49,6 +49,9 @@ void ds4_rdma_tier_promote_stats(uint64_t *promoted, uint64_t *hits,
 /* Promoted slots that failed read-back. Nonzero means the peer returned bytes
  * that were not what was promoted; those slots are discarded, never served. */
 uint64_t ds4_rdma_tier_promote_corrupt(void);
+/* How many spans were offered for promotion and how many admission rejected.
+ * offered>0 with promoted==0 means the admission policy is the reason. */
+void ds4_rdma_tier_promote_offered(uint64_t *offered, uint64_t *rejected);
 
 void ds4_rdma_tier_close(void);
 

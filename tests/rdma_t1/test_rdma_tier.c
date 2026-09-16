@@ -114,7 +114,8 @@ int main(int argc, char **argv) {
                (double)g_cov / 1048576.0);
         const uint64_t span = 4u << 20;
         int promoted_ok = 0, tried = 0;
-        for (int k = 0; k < 6 && !g_fail; k++) {
+        const int nprom = getenv("T1_TEST_PROMOTE_N") ? atoi(getenv("T1_TEST_PROMOTE_N")) : 6;
+        for (int k = 0; k < nprom && !g_fail; k++) {
             const uint64_t off = g_cov + (uint64_t)k * span;
             struct stat st2; fstat(g_fd, &st2);
             if (off + span > (uint64_t)st2.st_size) break;
@@ -157,6 +158,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "\n  is remote all-zero here? ");
                 { int nz = 0; for (uint64_t q = 0; q < span; q++) if (((char*)buf)[q]) { nz = 1; break; }
                   fprintf(stderr, "%s\n", nz ? "no, it has data" : "YES - slot never filled"); }
+                if (getenv("T1_TEST_PROMOTE_N")) { continue; }
                 g_fail = 1; break;
             }
             promoted_ok++;

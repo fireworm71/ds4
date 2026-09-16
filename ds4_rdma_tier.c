@@ -54,6 +54,7 @@ void ds4_rdma_tier_promote_stats(uint64_t *p, uint64_t *h, uint64_t *k, uint32_t
     if (p) *p = 0; if (h) *h = 0; if (k) *k = 0; if (n) *n = 0;
 }
 uint64_t ds4_rdma_tier_promote_corrupt(void) { return 0; }
+void ds4_rdma_tier_promote_offered(uint64_t *o, uint64_t *r) { if (o) *o = 0; if (r) *r = 0; }
 void ds4_rdma_tier_close(void) { }
 
 #else /* DS4_RT_HAVE_VERBS */
@@ -163,8 +164,15 @@ static struct {
     struct rt_slot { uint64_t offset; uint32_t bytes; uint32_t valid; uint64_t stamp; } *slot;
     uint64_t stamp;
     pthread_mutex_t dirlock;
-    /* admission: how many times an uncovered offset has been read from disk */
-    struct { uint64_t offset; uint32_t seen; } seen_tab[4096];
+    /* Admission: how many times an uncovered offset has been read from disk.
+     * MUST be large relative to the number of distinct uncovered offsets in a
+     * run. At 4096 entries against ~15.7k distinct offsets this thrashed so
+     * badly that NOTHING was ever admitted -- every counter was reset by a
+     * colliding offset before it could reach the threshold, and the failure was
+     * silent because rejections were not counted. Both fixed. */
+    struct rt_seen { uint64_t offset; uint32_t seen; } *seen_tab;
+    size_t seen_cap;
+    uint64_t promote_rejected, promote_offered;
     /* async promotion queue -- the fetch path must never wait on the fabric */
     struct rt_pq { uint64_t offset; uint32_t bytes; int wbuf; uint64_t sig; } *pq;
     int      pq_head, pq_tail, pq_cap;
@@ -177,7 +185,7 @@ static struct {
     void    *wbuf; struct ibv_mr *wbuf_mr[RT_MAX_LEGS];
     int      n_wbuf; unsigned char *wbuf_busy;
     pthread_mutex_t wlock;
-    uint64_t promoted, promote_skipped, promote_hits, promote_corrupt;
+    uint64_t promoted, promote_skipped, promote_hits, promote_corrupt, promote_readfail;
     void *vbuf; struct ibv_mr *vbuf_mr[RT_MAX_LEGS];   /* worker-only read-back */
     int   verify_promotions;
     int      gid_index;
@@ -603,8 +611,9 @@ static uint32_t rt_dir_victim_locked(void) {
  * be read again. D2 can afford a lower threshold than D1 because its promotion
  * costs the peer's idle disk rather than this box's memory bandwidth. */
 static int rt_admit(uint64_t offset) {
-    const size_t n = sizeof G.seen_tab / sizeof G.seen_tab[0];
-    size_t h = (size_t)((offset >> 12) % n);
+    const size_t n = G.seen_cap;
+    if (!n) return 0;
+    size_t h = (size_t)(((offset >> 12) * 0x9E3779B97F4A7C15ull) % n);
     if (G.seen_tab[h].offset != offset) { G.seen_tab[h].offset = offset; G.seen_tab[h].seen = 1; }
     else if (G.seen_tab[h].seen < 1000000u) G.seen_tab[h].seen++;
     return G.seen_tab[h].seen >= G.min_seen;
@@ -692,14 +701,26 @@ static void *rt_worker(void *arg) {
             rt_conn *vc = rt_acquire(&vidx);
             const int got = rt_read_raw(vc, G.vbuf, G.vbuf_mr, slot_off, job.bytes);
             rt_release(vidx);
-            if (!got || rt_sig(G.vbuf, job.bytes) != job.sig) {
+            if (!got) {
                 ok = 0;
-                if (__sync_fetch_and_add(&G.promote_corrupt, 1) == 0)
+                if (__sync_fetch_and_add(&G.promote_readfail, 1) == 0)
+                    fprintf(stderr, "ds4: rdma promotion read-back could not READ the "
+                                    "slot back (offset %llu)\n",
+                            (unsigned long long)job.offset);
+            } else if (rt_sig(G.vbuf, job.bytes) != job.sig) {
+                ok = 0;
+                if (__sync_fetch_and_add(&G.promote_corrupt, 1) == 0) {
+                    int zero = 1;
+                    for (uint64_t q = 0; q < job.bytes; q++)
+                        if (((const unsigned char *)G.vbuf)[q]) { zero = 0; break; }
                     fprintf(stderr,
                         "ds4: rdma promotion READ-BACK MISMATCH at model offset %llu "
-                        "-- discarding that slot. The model file still serves it, so "
-                        "output is unaffected; promotion is suspect on this peer.\n",
-                        (unsigned long long)job.offset);
+                        "(slot reads back %s) -- discarding. The model file still serves "
+                        "that span, so output is unaffected.\n",
+                        (unsigned long long)job.offset,
+                        zero ? "ALL ZERO: the fill never became visible"
+                             : "as different data");
+                }
             }
         }
         pthread_mutex_lock(&G.dirlock);
@@ -716,7 +737,8 @@ void ds4_rdma_tier_promote(const void *src, uint64_t offset, uint64_t bytes) {
     if (!G.active || G.promote_mode == RT_PROMOTE_OFF || !G.n_slots) return;
     if (!bytes || bytes > G.slot_bytes) return;
     if (offset + bytes <= G.region_bytes) return;   /* already in the prefix */
-    if (!rt_admit(offset)) return;
+    __sync_fetch_and_add(&G.promote_offered, 1);
+    if (!rt_admit(offset)) { __sync_fetch_and_add(&G.promote_rejected, 1); return; }
 
     pthread_mutex_lock(&G.dirlock);
     uint32_t dup;
@@ -789,7 +811,12 @@ void ds4_rdma_tier_stats(uint64_t *reads, uint64_t *bytes, uint64_t *ns) {
     if (ns) *ns = G.ns;
 }
 
-uint64_t ds4_rdma_tier_promote_corrupt(void) { return G.promote_corrupt; }
+uint64_t ds4_rdma_tier_promote_corrupt(void) { return G.promote_corrupt + G.promote_readfail; }
+
+void ds4_rdma_tier_promote_offered(uint64_t *offered, uint64_t *rejected) {
+    if (offered) *offered = G.promote_offered;
+    if (rejected) *rejected = G.promote_rejected;
+}
 
 void ds4_rdma_tier_promote_stats(uint64_t *promoted, uint64_t *hits, uint64_t *skipped,
                                  uint32_t *slots) {
@@ -958,6 +985,11 @@ int ds4_rdma_tier_open(int model_fd, uint64_t model_bytes) {
         pthread_mutex_init(&G.wlock, NULL);
         pthread_cond_init(&G.pqcv, NULL);
         G.slot = (struct rt_slot *)calloc(G.n_slots, sizeof *G.slot);
+        G.seen_cap = 1u << 20;      /* ~12 MB; must dwarf the distinct-offset count */
+        { const char *c = getenv("DS4_EXPERT_TIER_RDMA_SEEN_CAP");
+          if (c && c[0]) { unsigned long v = strtoul(c, NULL, 0); if (v >= 1024) G.seen_cap = v; } }
+        G.seen_tab = (struct rt_seen *)calloc(G.seen_cap, sizeof *G.seen_tab);
+        if (!G.seen_tab) G.seen_cap = 0;
         G.pq_cap = 1024;
         G.pq = (struct rt_pq *)calloc((size_t)G.pq_cap, sizeof *G.pq);
         if (G.promote_mode == RT_PROMOTE_D1) {
@@ -993,7 +1025,8 @@ int ds4_rdma_tier_open(int model_fd, uint64_t model_bytes) {
             }
         }
         if (G.promote_mode != RT_PROMOTE_OFF &&
-            (!G.slot || !G.pq || (G.promote_mode == RT_PROMOTE_D1 && !G.wbuf))) {
+            (!G.slot || !G.pq || !G.seen_tab ||
+             (G.promote_mode == RT_PROMOTE_D1 && !G.wbuf))) {
             fprintf(stderr, "ds4: rdma promotion setup failed; continuing read-only\n");
             G.promote_mode = RT_PROMOTE_OFF;
         } else if (pthread_create(&G.worker, NULL, rt_worker, NULL) != 0) {
@@ -1036,6 +1069,7 @@ void ds4_rdma_tier_close(void) {
     free(G.vbuf); G.vbuf = NULL;
     free(G.wbuf_busy); G.wbuf_busy = NULL;
     free(G.slot); G.slot = NULL;
+    free(G.seen_tab); G.seen_tab = NULL; G.seen_cap = 0;
     free(G.pq); G.pq = NULL;
     for (int i = 0; i < G.n_conns; i++) {
         for (int l = 0; l < G.n_legs; l++) {

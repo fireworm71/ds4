@@ -276,6 +276,13 @@ int main(int argc, char **argv) {
         if (posix_memalign(&region, 4096, region_bytes)) t1_die("alloc failed");
         t1_fill(region, prefix_bytes, 1);
     }
+    /* Touch the promotion slots before anything registers or reads them. They
+     * are otherwise untouched anonymous pages whose first write arrives during
+     * a promotion, i.e. after the HCA may already hold a mapping for them --
+     * and under ODP that mapping is of the shared zero page, not the frame the
+     * write lands in. Faulting them in up front removes the question. */
+    if (n_slots && region_bytes > cache_off)
+        memset((char *)region + cache_off, 0, (size_t)(region_bytes - cache_off));
     if (!g_want_odp && mlock(region, region_bytes))
         fprintf(stderr, "region-server: WARNING mlock failed (%s) -- the region can be\n"
                         "   paged out, which makes every number here a lie\n", strerror(errno));
