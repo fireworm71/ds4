@@ -108,6 +108,55 @@ int main(int argc, char **argv) {
                (unsigned long long)reads, (double)bytes / 1073741824.0,
                (double)bytes / dt / 1e9, reads ? (double)ns / 1e3 / (double)reads : 0.0);
     }
+    /* ---- T4: promotion of spans past the mirrored prefix ---- */
+    if (!g_fail && getenv("T1_TEST_PROMOTE")) {
+        printf("-- promotion (spans past the %.0f MiB prefix) --\n",
+               (double)g_cov / 1048576.0);
+        const uint64_t span = 4u << 20;
+        int promoted_ok = 0, tried = 0;
+        for (int k = 0; k < 6 && !g_fail; k++) {
+            const uint64_t off = g_cov + (uint64_t)k * span;
+            struct stat st2; fstat(g_fd, &st2);
+            if (off + span > (uint64_t)st2.st_size) break;
+            tried++;
+            /* must not be served before it is promoted */
+            if (ds4_rdma_tier_read(buf, off, span)) {
+                fprintf(stderr, "FAIL: uncovered offset %llu served before promotion\n",
+                        (unsigned long long)off);
+                g_fail = 1; break;
+            }
+            uint64_t done = 0;
+            while (done < span) {
+                ssize_t r = pread(g_fd, (char *)ref + done, (size_t)(span - done),
+                                  (off_t)(off + done));
+                if (r <= 0) break;
+                done += (uint64_t)r;
+            }
+            /* offer it until admission lets it through, then wait for the worker */
+            for (int a = 0; a < 8; a++) ds4_rdma_tier_promote(ref, off, span);
+            int landed = 0;
+            for (int w = 0; w < 400 && !landed; w++) {
+                if (ds4_rdma_tier_read(buf, off, span)) landed = 1;
+                else { struct timespec ts = {0, 10 * 1000 * 1000}; nanosleep(&ts, NULL); }
+            }
+            if (!landed) { printf("   offset %llu: not promoted within 4 s\n",
+                                  (unsigned long long)off); continue; }
+            if (memcmp(buf, ref, (size_t)span) != 0) {
+                fprintf(stderr, "FAIL: promoted span at %llu has WRONG BYTES\n",
+                        (unsigned long long)off);
+                g_fail = 1; break;
+            }
+            promoted_ok++;
+        }
+        uint64_t pr = 0, ph = 0, pk = 0; uint32_t ps = 0;
+        ds4_rdma_tier_promote_stats(&pr, &ph, &pk, &ps);
+        printf("   %d/%d promoted and byte-exact; stats: %llu promoted, %llu hits, "
+               "%llu skipped, %u slots\n", promoted_ok, tried,
+               (unsigned long long)pr, (unsigned long long)ph,
+               (unsigned long long)pk, ps);
+        if (promoted_ok == 0 && tried) { fprintf(stderr, "FAIL: nothing promoted\n"); g_fail = 1; }
+    }
+
     ds4_rdma_tier_close();
     printf("%s\n", g_fail ? "*** FAILED ***" : "ALL CHECKS PASSED");
     return g_fail ? 2 : 0;

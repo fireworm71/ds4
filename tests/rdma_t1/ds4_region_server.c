@@ -28,10 +28,19 @@ typedef struct {
 } leg_setup;
 
 static void *region;
-static uint64_t region_bytes;
+static uint64_t region_bytes;      /* prefix + promotion slots */
+static uint64_t prefix_bytes;      /* model bytes mirrored from offset 0 */
+static uint64_t cache_off;         /* where the slots start */
+static uint64_t slot_bytes;
+static uint32_t n_slots;
+static int model_fd = -1;          /* kept open: D2 preads slots from it */
 static t1_ep dev_a, dev_b;
 static pthread_mutex_t accept_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile uint64_t live_clients;
+static volatile uint64_t promote_loads;
+/* LOCAL_WRITE is required alongside REMOTE_WRITE by the verbs spec; D1 clients
+ * RDMA-WRITE promoted spans straight into the slots. */
+#define RT_SRV_ACCESS (IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE)
 static int g_want_odp;
 
 /* Pinned registration is preferred: it is what the fabric numbers assume. When
@@ -41,11 +50,10 @@ static int g_want_odp;
  * first touch, so the first pass over the region is slower than the rest. */
 static struct ibv_mr *reg_region(struct ibv_pd *pd, void *addr, size_t len, int *odp) {
     if (!g_want_odp) {
-        struct ibv_mr *mr = ibv_reg_mr(pd, addr, len, IBV_ACCESS_REMOTE_READ);
+        struct ibv_mr *mr = ibv_reg_mr(pd, addr, len, RT_SRV_ACCESS);
         if (mr) { *odp = 0; return mr; }
     }
-    struct ibv_mr *mr = ibv_reg_mr(pd, addr, len,
-                                   IBV_ACCESS_REMOTE_READ | IBV_ACCESS_ON_DEMAND);
+    struct ibv_mr *mr = ibv_reg_mr(pd, addr, len, RT_SRV_ACCESS | IBV_ACCESS_ON_DEMAND);
     *odp = mr ? 1 : 0;
     return mr;
 }
@@ -68,12 +76,13 @@ static int serve_leg(t1_ep *dev, struct ibv_mr *mr, int fd, uint32_t psn,
     t1_ep tmp = *dev;            /* t1_connect works on a t1_ep; borrow one */
     tmp.cq = cq; tmp.qp = qp;
     t1_hs mine, peer;
-    t1_fill_hs(&mine, &tmp, psn, (uint64_t)(uintptr_t)region, region_bytes, 0, mr->rkey);
+    t1_fill_hs(&mine, &tmp, psn, (uint64_t)(uintptr_t)region, prefix_bytes, 0, mr->rkey);
+    mine.cache_off = cache_off; mine.slot_bytes = slot_bytes; mine.n_slots = n_slots;
     if (t1_send_all(fd, &mine, sizeof mine) || t1_recv_all(fd, &peer, sizeof peer) ||
         peer.magic != T1_HS_MAGIC || peer.version != T1_HS_VERSION) {
         ibv_destroy_qp(qp); ibv_destroy_cq(cq); return 0;
     }
-    t1_connect(&tmp, &peer, psn, IBV_ACCESS_REMOTE_READ);
+    t1_connect(&tmp, &peer, psn, RT_SRV_ACCESS);
     *out_cq = cq; *out_qp = qp;
     return 1;
 }
@@ -92,9 +101,33 @@ static void *pair_thread(void *vp) {
             __sync_fetch_and_add(&live_clients, 1);
             fprintf(stderr, "region-server: pair up (A qp %u, B qp %u); %llu live\n",
                     qp_a->qp_num, qp_b->qp_num, (unsigned long long)live_clients);
-            uint8_t bye;
-            (void)t1_recv_all(fd_a, &bye, 1);   /* returns when the client goes */
-            (void)t1_recv_all(fd_b, &bye, 1);
+            /* Command loop. D2 promotion arrives here as T1_CMD_LOAD; D1
+             * writes its slot with RDMA and never says anything. Returns when
+             * the client closes, which is also how a read-only client behaves. */
+            for (;;) {
+                t1_cmd cmd;
+                if (t1_recv_all(fd_a, &cmd, sizeof cmd)) break;
+                if (cmd.op == T1_CMD_BYE) break;
+                t1_rsp rsp = { cmd.op, 1u };
+                if (cmd.op == T1_CMD_LOAD && model_fd >= 0 && cmd.slot < n_slots &&
+                    cmd.bytes && cmd.bytes <= slot_bytes) {
+                    char *dst = (char *)region + cache_off +
+                                (uint64_t)cmd.slot * slot_bytes;
+                    uint64_t done = 0;
+                    int ok = 1;
+                    while (done < cmd.bytes) {
+                        ssize_t k = pread(model_fd, dst + done,
+                                          (size_t)(cmd.bytes - done),
+                                          (off_t)(cmd.offset + done));
+                        if (k < 0) { if (errno == EINTR) continue; ok = 0; break; }
+                        if (k == 0) { ok = 0; break; }
+                        done += (uint64_t)k;
+                    }
+                    rsp.status = ok ? 0u : 1u;
+                    __sync_fetch_and_add(&promote_loads, 1);
+                }
+                if (t1_send_all(fd_a, &rsp, sizeof rsp)) break;
+            }
             __sync_fetch_and_sub(&live_clients, 1);
             fprintf(stderr, "region-server: pair gone; %llu live\n",
                     (unsigned long long)live_clients);
@@ -141,6 +174,7 @@ int main(int argc, char **argv) {
     const char *dev_a_name = "rocep1s0f1", *dev_b_name = "roceP2p1s0f1";
     const char *file = NULL;
     int port_a = 19515, port_b = 19516, gid_index = T1_DEFAULT_GID_INDEX, pattern = 0;
+    slot_bytes = 8ull << 20;
     uint64_t want = 0, size = 256ull << 20;
 
     for (int i = 1; i < argc; i++) {
@@ -154,6 +188,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--port-a") && i + 1 < argc) port_a = atoi(argv[++i]);
         else if (!strcmp(a, "--port-b") && i + 1 < argc) port_b = atoi(argv[++i]);
         else if (!strcmp(a, "--gid-index") && i + 1 < argc) gid_index = atoi(argv[++i]);
+        else if (!strcmp(a, "--cache-slots") && i + 1 < argc) n_slots = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--slot-bytes") && i + 1 < argc) slot_bytes = strtoull(argv[++i], NULL, 0);
         else usage();
     }
     if (!file && !pattern) usage();
@@ -207,30 +243,38 @@ int main(int argc, char **argv) {
         if (fd < 0) t1_die("open(%s): %s", file, strerror(errno));
         struct stat st;
         if (fstat(fd, &st)) t1_die("fstat(%s): %s", file, strerror(errno));
-        region_bytes = (uint64_t)st.st_size;
-        if (want && want < region_bytes) region_bytes = want;
-        if (region_bytes == 0) t1_die("%s is empty", file);
+        prefix_bytes = (uint64_t)st.st_size;
+        if (want && want < prefix_bytes) prefix_bytes = want;
+        if (prefix_bytes == 0) t1_die("%s is empty", file);
+        /* Slots sit after the mirrored prefix, in the same registration, so a
+         * promoted span is read exactly like a prefix span -- one rkey, one
+         * address space, no second MR to keep straight. */
+        cache_off = (prefix_bytes + 4095ull) & ~4095ull;
+        region_bytes = cache_off + (uint64_t)n_slots * slot_bytes;
         if (posix_memalign(&region, 4096, region_bytes))
             t1_die("cannot allocate %.2f GiB", (double)region_bytes / 1073741824.0);
+        model_fd = open(file, O_RDONLY);   /* stays open: D2 preads slots from it */
         fprintf(stderr, "region-server: reading %.2f GiB from %s ...\n",
-                (double)region_bytes / 1073741824.0, file);
+                (double)prefix_bytes / 1073741824.0, file);
         uint64_t done = 0;
-        while (done < region_bytes) {
+        while (done < prefix_bytes) {
             ssize_t k = pread(fd, (char *)region + done,
-                              (size_t)(region_bytes - done > (64u << 20)
-                                       ? (64u << 20) : region_bytes - done),
+                              (size_t)(prefix_bytes - done > (64u << 20)
+                                       ? (64u << 20) : prefix_bytes - done),
                               (off_t)done);
             if (k < 0) { if (errno == EINTR) continue; t1_die("pread: %s", strerror(errno)); }
-            if (k == 0) { region_bytes = done; break; }   /* short file */
+            if (k == 0) { prefix_bytes = done; break; }   /* short file */
             done += (uint64_t)k;
         }
         close(fd);
         fprintf(stderr, "region-server: loaded %.2f GiB\n",
-                (double)region_bytes / 1073741824.0);
+                (double)prefix_bytes / 1073741824.0);
     } else {
-        region_bytes = size & ~7ull;
+        prefix_bytes = size & ~7ull;
+        cache_off = (prefix_bytes + 4095ull) & ~4095ull;
+        region_bytes = cache_off + (uint64_t)n_slots * slot_bytes;
         if (posix_memalign(&region, 4096, region_bytes)) t1_die("alloc failed");
-        t1_fill(region, region_bytes, 1);
+        t1_fill(region, prefix_bytes, 1);
     }
     if (!g_want_odp && mlock(region, region_bytes))
         fprintf(stderr, "region-server: WARNING mlock failed (%s) -- the region can be\n"
@@ -259,6 +303,10 @@ int main(int argc, char **argv) {
            dev_a_name, (unsigned long long)dev_a.node_guid, dev_a.mr->rkey, port_a);
     printf("region-server: leg B %-14s guid 0x%016llx rkey 0x%08x :%d\n",
            dev_b_name, (unsigned long long)dev_b.node_guid, dev_b.mr->rkey, port_b);
+    printf("region-server: prefix %.2f GiB + %u promotion slots x %.2f MiB (%.2f GiB)\n",
+           (double)prefix_bytes / 1073741824.0, n_slots,
+           (double)slot_bytes / 1048576.0,
+           (double)(region_bytes - cache_off) / 1073741824.0);
     printf("region-server: distinct devices confirmed; serving many pairs.\n");
     fflush(stdout);
 

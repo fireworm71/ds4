@@ -31,7 +31,7 @@
  * byte-order conversion, but it does need a version tag so a stale binary on
  * one side fails loudly instead of reading garbage rkeys. */
 #define T1_HS_MAGIC 0x54315253u  /* "T1RS" */
-#define T1_HS_VERSION 2u
+#define T1_HS_VERSION 3u
 
 typedef struct {
     uint32_t magic;
@@ -46,7 +46,21 @@ typedef struct {
     uint64_t seed;       /* pattern seed, so the client can verify bytes */
     uint64_t node_guid;  /* WHICH REMOTE DEVICE -- see t1_assert_distinct() */
     char     dev[64];    /* its name, for the human */
+    /* v3: promotion cache geometry. The region is [0,cache_off) of model
+     * prefix, then n_slots slots of slot_bytes each. Zero when the peer serves
+     * a prefix only (t1_server). */
+    uint64_t cache_off;
+    uint64_t slot_bytes;
+    uint32_t n_slots;
+    uint32_t _pad;
 } t1_hs;
+
+/* Promotion control messages, sent on the leg-A socket after the handshake.
+ * D2 only: D1 writes the slot directly with RDMA and needs no protocol. */
+#define T1_CMD_LOAD 1u   /* service preads model_offset into slot */
+#define T1_CMD_BYE  2u
+typedef struct { uint32_t op, slot; uint64_t offset, bytes; } t1_cmd;
+typedef struct { uint32_t op, status; } t1_rsp;
 
 static inline void t1_die(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);

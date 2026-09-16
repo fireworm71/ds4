@@ -40,6 +40,13 @@ uint64_t ds4_rdma_tier_bytes(void);
 /* Cumulative successful reads, bytes, and nanoseconds spent in them. */
 void ds4_rdma_tier_stats(uint64_t *reads, uint64_t *bytes, uint64_t *ns);
 
+/* Promotion (plan T4): offer a span that local disk just served, so the peer
+ * can hold it for next time. Never blocks and never fails visibly -- a span
+ * that is not promoted is simply read from the model file again. */
+void ds4_rdma_tier_promote(const void *src, uint64_t offset, uint64_t bytes);
+void ds4_rdma_tier_promote_stats(uint64_t *promoted, uint64_t *hits,
+                                 uint64_t *skipped, uint32_t *slots);
+
 void ds4_rdma_tier_close(void);
 
 #ifdef __cplusplus

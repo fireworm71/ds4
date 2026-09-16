@@ -49,6 +49,10 @@ uint64_t ds4_rdma_tier_bytes(void) { return 0; }
 void ds4_rdma_tier_stats(uint64_t *r, uint64_t *b, uint64_t *n) {
     if (r) *r = 0; if (b) *b = 0; if (n) *n = 0;
 }
+void ds4_rdma_tier_promote(const void *s, uint64_t o, uint64_t b) { (void)s; (void)o; (void)b; }
+void ds4_rdma_tier_promote_stats(uint64_t *p, uint64_t *h, uint64_t *k, uint32_t *n) {
+    if (p) *p = 0; if (h) *h = 0; if (k) *k = 0; if (n) *n = 0;
+}
 void ds4_rdma_tier_close(void) { }
 
 #else /* DS4_RT_HAVE_VERBS */
@@ -61,13 +65,39 @@ void ds4_rdma_tier_close(void) { }
 
 /* Wire handshake -- must stay byte-identical to tests/rdma_t1/t1_common.h. */
 #define RT_HS_MAGIC   0x54315253u
-#define RT_HS_VERSION 2u
+#define RT_HS_VERSION 3u
 typedef struct {
     uint32_t magic, version, qpn, psn, lid, rkey;
     uint8_t  gid[16];
     uint64_t addr, len, seed, node_guid;
     char     dev[64];
+    uint64_t cache_off;      /* v3: promotion slots start here in the region */
+    uint64_t slot_bytes;
+    uint32_t n_slots;
+    uint32_t _pad;
 } rt_hs;
+
+#define RT_CMD_LOAD 1u
+#define RT_CMD_BYE  2u
+typedef struct { uint32_t op, slot; uint64_t offset, bytes; } rt_cmd;
+typedef struct { uint32_t op, status; } rt_rsp;
+
+/* Promotion (plan T4). The prefix covers the model's leading bytes; anything
+ * past it is served by local disk unless it has been PROMOTED into one of the
+ * peer's slots. Two ways to fill a slot:
+ *   D1  this side RDMA-WRITEs the bytes it just read from disk.
+ *   D2  this side asks the peer to pread them from its own copy of the model.
+ * D1 spends the (otherwise idle) reverse direction of the fabric; D2 spends the
+ * peer's (otherwise idle) NVMe and costs this box nothing but a 24-byte message.
+ *
+ * The DIRECTORY LIVES HERE, not on the peer, and that is deliberate. If the
+ * peer owned slot residency it could evict and reuse a slot underneath an
+ * in-flight one-sided READ, and this side -- having no expectation of the
+ * bytes -- could not tell. Owning the directory means a slot is never read
+ * after being reassigned. */
+#define RT_PROMOTE_OFF 0
+#define RT_PROMOTE_D1  1
+#define RT_PROMOTE_D2  2
 
 typedef struct {
     struct ibv_device **(*get_device_list)(int *);
@@ -122,8 +152,31 @@ static struct {
     rt_mrc   mrc[RT_MAX_MRC];
     int      n_mrc;
     pthread_mutex_t mrlock;
-    uint64_t region_bytes;
+    uint64_t region_bytes;          /* prefix only: what maps 1:1 to the model */
+    uint64_t cache_off, slot_bytes;
+    uint32_t n_slots;
     uint64_t remote_guid[RT_MAX_LEGS];
+    /* promotion */
+    int      promote_mode;
+    uint32_t min_seen;
+    struct rt_slot { uint64_t offset; uint32_t bytes; uint32_t valid; uint64_t stamp; } *slot;
+    uint64_t stamp;
+    pthread_mutex_t dirlock;
+    /* admission: how many times an uncovered offset has been read from disk */
+    struct { uint64_t offset; uint32_t seen; } seen_tab[4096];
+    /* async promotion queue -- the fetch path must never wait on the fabric */
+    struct rt_pq { uint64_t offset; uint32_t bytes; int wbuf; } *pq;
+    int      pq_head, pq_tail, pq_cap;
+    pthread_mutex_t pqlock;
+    pthread_cond_t  pqcv;
+    pthread_t worker;
+    int      worker_live, stopping;
+    /* D1 write staging: the fetch buffer is reused immediately, so the bytes
+     * must be copied somewhere stable for the duration of the WRITE. */
+    void    *wbuf; struct ibv_mr *wbuf_mr[RT_MAX_LEGS];
+    int      n_wbuf; unsigned char *wbuf_busy;
+    pthread_mutex_t wlock;
+    uint64_t promoted, promote_skipped, promote_hits;
     int      gid_index;
     int      active;
     uint64_t reads, rbytes, ns;
@@ -361,6 +414,9 @@ static int rt_open_leg(rt_conn *c, int leg) {
     c->rkey[leg]  = peer.rkey;
     if (G.region_bytes == 0 || peer.len < G.region_bytes) G.region_bytes = peer.len;
     G.remote_guid[leg] = peer.node_guid;
+    G.cache_off = peer.cache_off;
+    G.slot_bytes = peer.slot_bytes;
+    G.n_slots = peer.n_slots;
     return 1;
 }
 
@@ -478,15 +534,203 @@ static int rt_read_raw(rt_conn *c, void *dst, struct ibv_mr **mr,
     return a && b;
 }
 
+/* ---- promotion: directory, admission, and the worker ---- */
+
+static int rt_post_write(rt_conn *c, int leg, const void *src, uint32_t lkey,
+                         uint64_t raddr, uint64_t bytes) {
+    struct ibv_sge sge;
+    memset(&sge, 0, sizeof sge);
+    sge.addr = (uint64_t)(uintptr_t)src;
+    sge.length = (uint32_t)bytes;
+    sge.lkey = lkey;
+    struct ibv_send_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof wr);
+    wr.wr_id = (uint64_t)leg;
+    wr.sg_list = &sge; wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = raddr;
+    wr.wr.rdma.rkey = c->rkey[leg];
+    return ibv_post_send(c->qp[leg], &wr, &bad) == 0;
+}
+
+/* Directory is a linear scan over slots. n_slots is in the thousands and the
+ * promotion rate measured in T3 is ~80 spans/s, so this costs microseconds in
+ * a path that is already paying hundreds. Kept simple on purpose. */
+static int rt_dir_find_locked(uint64_t offset, uint32_t bytes, uint32_t *out) {
+    for (uint32_t i = 0; i < G.n_slots; i++)
+        if (G.slot[i].valid && G.slot[i].offset == offset && G.slot[i].bytes == bytes) {
+            G.slot[i].stamp = ++G.stamp;
+            *out = i;
+            return 1;
+        }
+    return 0;
+}
+
+static uint32_t rt_dir_victim_locked(void) {
+    uint32_t best = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < G.n_slots; i++) {
+        if (!G.slot[i].valid) return i;          /* free slot first */
+        if (G.slot[i].stamp < oldest) { oldest = G.slot[i].stamp; best = i; }
+    }
+    return best;
+}
+
+/* seen >= min_seen before promoting. 61.3% of everything loaded is never reused
+ * even once, so promoting on first sight spends slots on spans that will never
+ * be read again. D2 can afford a lower threshold than D1 because its promotion
+ * costs the peer's idle disk rather than this box's memory bandwidth. */
+static int rt_admit(uint64_t offset) {
+    const size_t n = sizeof G.seen_tab / sizeof G.seen_tab[0];
+    size_t h = (size_t)((offset >> 12) % n);
+    if (G.seen_tab[h].offset != offset) { G.seen_tab[h].offset = offset; G.seen_tab[h].seen = 1; }
+    else if (G.seen_tab[h].seen < 1000000u) G.seen_tab[h].seen++;
+    return G.seen_tab[h].seen >= G.min_seen;
+}
+
+static int rt_wbuf_take(void) {
+    pthread_mutex_lock(&G.wlock);
+    for (int i = 0; i < G.n_wbuf; i++)
+        if (!G.wbuf_busy[i]) { G.wbuf_busy[i] = 1; pthread_mutex_unlock(&G.wlock); return i; }
+    pthread_mutex_unlock(&G.wlock);
+    return -1;
+}
+static void rt_wbuf_put(int i) {
+    if (i < 0) return;
+    pthread_mutex_lock(&G.wlock);
+    G.wbuf_busy[i] = 0;
+    pthread_mutex_unlock(&G.wlock);
+}
+
+static void *rt_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&G.pqlock);
+        while (G.pq_head == G.pq_tail && !G.stopping)
+            pthread_cond_wait(&G.pqcv, &G.pqlock);
+        if (G.stopping && G.pq_head == G.pq_tail) { pthread_mutex_unlock(&G.pqlock); break; }
+        struct rt_pq job = G.pq[G.pq_head];
+        G.pq_head = (G.pq_head + 1) % G.pq_cap;
+        pthread_mutex_unlock(&G.pqlock);
+
+        if (!G.active) { rt_wbuf_put(job.wbuf); continue; }
+
+        pthread_mutex_lock(&G.dirlock);
+        uint32_t dup;
+        if (rt_dir_find_locked(job.offset, job.bytes, &dup)) {
+            pthread_mutex_unlock(&G.dirlock);
+            rt_wbuf_put(job.wbuf);
+            continue;
+        }
+        const uint32_t slot = rt_dir_victim_locked();
+        G.slot[slot].valid = 0;              /* nothing reads it while it loads */
+        G.slot[slot].offset = job.offset;
+        G.slot[slot].bytes = job.bytes;
+        pthread_mutex_unlock(&G.dirlock);
+
+        const uint64_t slot_off = G.cache_off + (uint64_t)slot * G.slot_bytes;
+        int ok = 0;
+        int idx = 0;
+        rt_conn *c = rt_acquire(&idx);
+        if (G.promote_mode == RT_PROMOTE_D1) {
+            const char *src = (const char *)G.wbuf + (size_t)job.wbuf * G.slot_bytes;
+            const uint64_t deadline = rt_now_ns() + RT_POLL_TIMEOUT_NS;
+            if (G.n_legs == 1) {
+                ok = rt_post_write(c, 0, src, G.wbuf_mr[0]->lkey,
+                                   c->raddr[0] + slot_off, job.bytes) &&
+                     rt_wait(c, 0, deadline);
+            } else {
+                const uint64_t half = job.bytes / 2, rest = job.bytes - half;
+                if (rt_post_write(c, 0, src, G.wbuf_mr[0]->lkey,
+                                  c->raddr[0] + slot_off, half) &&
+                    rt_post_write(c, 1, src + half, G.wbuf_mr[1]->lkey,
+                                  c->raddr[1] + slot_off + half, rest)) {
+                    const int a = rt_wait(c, 0, deadline);
+                    const int b = rt_wait(c, 1, deadline);
+                    ok = a && b;
+                }
+            }
+        } else {                               /* D2: the peer loads it itself */
+            rt_cmd cmd = { RT_CMD_LOAD, slot, job.offset, job.bytes };
+            rt_rsp rsp;
+            pthread_mutex_lock(&G.wlock);      /* the control socket is shared */
+            ok = !rt_send_all(G.conn[0].sock[0], &cmd, sizeof cmd) &&
+                 !rt_recv_all(G.conn[0].sock[0], &rsp, sizeof rsp) &&
+                 rsp.status == 0u;
+            pthread_mutex_unlock(&G.wlock);
+        }
+        rt_release(idx);
+        rt_wbuf_put(job.wbuf);
+
+        pthread_mutex_lock(&G.dirlock);
+        if (ok) { G.slot[slot].valid = 1; G.slot[slot].stamp = ++G.stamp; G.promoted++; }
+        else    { G.slot[slot].valid = 0; G.promote_skipped++; }
+        pthread_mutex_unlock(&G.dirlock);
+    }
+    return NULL;
+}
+
+/* Called from the fetch path right after a span was served by local disk.
+ * Never blocks: it copies (D1) or just records (D2) and returns. */
+void ds4_rdma_tier_promote(const void *src, uint64_t offset, uint64_t bytes) {
+    if (!G.active || G.promote_mode == RT_PROMOTE_OFF || !G.n_slots) return;
+    if (!bytes || bytes > G.slot_bytes) return;
+    if (offset + bytes <= G.region_bytes) return;   /* already in the prefix */
+    if (!rt_admit(offset)) return;
+
+    pthread_mutex_lock(&G.dirlock);
+    uint32_t dup;
+    const int have = rt_dir_find_locked(offset, (uint32_t)bytes, &dup);
+    pthread_mutex_unlock(&G.dirlock);
+    if (have) return;
+
+    int wb = -1;
+    if (G.promote_mode == RT_PROMOTE_D1) {
+        wb = rt_wbuf_take();
+        if (wb < 0) { __sync_fetch_and_add(&G.promote_skipped, 1); return; }
+        memcpy((char *)G.wbuf + (size_t)wb * G.slot_bytes, src, (size_t)bytes);
+    }
+    pthread_mutex_lock(&G.pqlock);
+    const int next = (G.pq_tail + 1) % G.pq_cap;
+    if (next == G.pq_head) {                    /* queue full: drop, never block */
+        pthread_mutex_unlock(&G.pqlock);
+        rt_wbuf_put(wb);
+        __sync_fetch_and_add(&G.promote_skipped, 1);
+        return;
+    }
+    G.pq[G.pq_tail].offset = offset;
+    G.pq[G.pq_tail].bytes = (uint32_t)bytes;
+    G.pq[G.pq_tail].wbuf = wb;
+    G.pq_tail = next;
+    pthread_cond_signal(&G.pqcv);
+    pthread_mutex_unlock(&G.pqlock);
+}
+
 int ds4_rdma_tier_read(void *dst, uint64_t offset, uint64_t bytes) {
     if (!G.active || bytes == 0) return 0;
-    if (bytes > G.region_bytes || offset > G.region_bytes - bytes) return 0;
+    uint64_t remote_off;
+    int from_slot = 0;
+    if (bytes <= G.region_bytes && offset <= G.region_bytes - bytes) {
+        remote_off = offset;                      /* mirrored prefix */
+    } else if (G.n_slots && bytes <= G.slot_bytes) {
+        uint32_t slot;
+        pthread_mutex_lock(&G.dirlock);
+        const int hit = rt_dir_find_locked(offset, (uint32_t)bytes, &slot);
+        pthread_mutex_unlock(&G.dirlock);
+        if (!hit) return 0;
+        remote_off = G.cache_off + (uint64_t)slot * G.slot_bytes;
+        from_slot = 1;
+    } else {
+        return 0;
+    }
     struct ibv_mr *mr[RT_MAX_LEGS];
     if (!rt_mr_get(dst, (size_t)bytes, mr)) return 0;
     int idx = 0;
     rt_conn *c = rt_acquire(&idx);
     const uint64_t t0 = rt_now_ns();
-    const int ok = rt_read_raw(c, dst, mr, offset, bytes);
+    const int ok = rt_read_raw(c, dst, mr, remote_off, bytes);
+    if (ok && from_slot) __sync_fetch_and_add(&G.promote_hits, 1);
     const uint64_t dt = rt_now_ns() - t0;
     rt_release(idx);
     if (!ok) { rt_disable("a read did not complete"); return 0; }
@@ -502,6 +746,14 @@ void ds4_rdma_tier_stats(uint64_t *reads, uint64_t *bytes, uint64_t *ns) {
     if (reads) *reads = G.reads;
     if (bytes) *bytes = G.rbytes;
     if (ns) *ns = G.ns;
+}
+
+void ds4_rdma_tier_promote_stats(uint64_t *promoted, uint64_t *hits, uint64_t *skipped,
+                                 uint32_t *slots) {
+    if (promoted) *promoted = G.promoted;
+    if (hits) *hits = G.promote_hits;
+    if (skipped) *skipped = G.promote_skipped;
+    if (slots) *slots = G.n_slots;
 }
 
 /* Sample the remote region against the real model file. A tier that is stale,
@@ -638,6 +890,67 @@ int ds4_rdma_tier_open(int model_fd, uint64_t model_bytes) {
         ds4_rdma_tier_close();
         return 0;
     }
+    /* Promotion (T4). Off unless asked for, and it never affects correctness:
+     * a slot that fails to fill simply stays invalid and the model file serves
+     * that span, exactly as before. */
+    {
+        const char *pm = getenv("DS4_EXPERT_TIER_RDMA_PROMOTE");
+        if (pm && G.n_slots && G.slot_bytes) {
+            if (!strcmp(pm, "d1")) G.promote_mode = RT_PROMOTE_D1;
+            else if (!strcmp(pm, "d2")) G.promote_mode = RT_PROMOTE_D2;
+            else if (strcmp(pm, "off") != 0)
+                fprintf(stderr, "ds4: DS4_EXPERT_TIER_RDMA_PROMOTE must be d1, d2 or off\n");
+        } else if (pm && !G.n_slots) {
+            fprintf(stderr, "ds4: promotion asked for but the peer advertises no slots "
+                            "(start it with --cache-slots)\n");
+        }
+    }
+    if (G.promote_mode != RT_PROMOTE_OFF) {
+        G.min_seen = 2;
+        { const char *m = getenv("DS4_EXPERT_TIER_RDMA_MIN_SEEN");
+          if (m && m[0]) G.min_seen = (uint32_t)strtoul(m, NULL, 10); }
+        if (G.min_seen < 1) G.min_seen = 1;
+        pthread_mutex_init(&G.dirlock, NULL);
+        pthread_mutex_init(&G.pqlock, NULL);
+        pthread_mutex_init(&G.wlock, NULL);
+        pthread_cond_init(&G.pqcv, NULL);
+        G.slot = (struct rt_slot *)calloc(G.n_slots, sizeof *G.slot);
+        G.pq_cap = 1024;
+        G.pq = (struct rt_pq *)calloc((size_t)G.pq_cap, sizeof *G.pq);
+        if (G.promote_mode == RT_PROMOTE_D1) {
+            G.n_wbuf = 8;
+            { const char *w = getenv("DS4_EXPERT_TIER_RDMA_WBUFS");
+              if (w && w[0]) G.n_wbuf = atoi(w); }
+            if (G.n_wbuf < 1) G.n_wbuf = 1;
+            if (G.n_wbuf > 64) G.n_wbuf = 64;
+            G.wbuf_busy = (unsigned char *)calloc((size_t)G.n_wbuf, 1);
+            if (posix_memalign(&G.wbuf, 4096, (size_t)G.n_wbuf * G.slot_bytes) != 0)
+                G.wbuf = NULL;
+            for (int l = 0; G.wbuf && l < G.n_legs; l++) {
+                G.wbuf_mr[l] = G.api.reg_mr(G.dev[l].pd, G.wbuf,
+                                            (size_t)G.n_wbuf * G.slot_bytes,
+                                            IBV_ACCESS_LOCAL_WRITE);
+                if (!G.wbuf_mr[l]) G.wbuf = NULL;
+            }
+        }
+        if (!G.slot || !G.pq || (G.promote_mode == RT_PROMOTE_D1 && !G.wbuf)) {
+            fprintf(stderr, "ds4: rdma promotion setup failed; continuing read-only\n");
+            G.promote_mode = RT_PROMOTE_OFF;
+        } else if (pthread_create(&G.worker, NULL, rt_worker, NULL) != 0) {
+            fprintf(stderr, "ds4: rdma promotion worker failed to start; read-only\n");
+            G.promote_mode = RT_PROMOTE_OFF;
+        } else {
+            G.worker_live = 1;
+            fprintf(stderr, "ds4: rdma promotion %s: %u slots x %.2f MiB (%.2f GiB), "
+                            "admit at seen>=%u%s\n",
+                    G.promote_mode == RT_PROMOTE_D1 ? "D1 (write span)"
+                                                    : "D2 (peer loads from its disk)",
+                    G.n_slots, (double)G.slot_bytes / 1048576.0,
+                    (double)G.n_slots * (double)G.slot_bytes / 1073741824.0,
+                    G.min_seen,
+                    G.promote_mode == RT_PROMOTE_D1 ? "" : "");
+        }
+    }
     fprintf(stderr,
             "ds4: rdma expert tier active: %.2f GiB from %s, %d leg%s x %d pair%s, verified\n",
             (double)G.region_bytes / 1073741824.0, G.dev[0].host,
@@ -647,6 +960,20 @@ int ds4_rdma_tier_open(int model_fd, uint64_t model_bytes) {
 }
 
 void ds4_rdma_tier_close(void) {
+    if (G.worker_live) {
+        pthread_mutex_lock(&G.pqlock);
+        G.stopping = 1;
+        pthread_cond_broadcast(&G.pqcv);
+        pthread_mutex_unlock(&G.pqlock);
+        pthread_join(G.worker, NULL);
+        G.worker_live = 0;
+    }
+    for (int l = 0; l < G.n_legs; l++)
+        if (G.wbuf_mr[l]) { G.api.dereg_mr(G.wbuf_mr[l]); G.wbuf_mr[l] = NULL; }
+    free(G.wbuf); G.wbuf = NULL;
+    free(G.wbuf_busy); G.wbuf_busy = NULL;
+    free(G.slot); G.slot = NULL;
+    free(G.pq); G.pq = NULL;
     for (int i = 0; i < G.n_conns; i++) {
         for (int l = 0; l < G.n_legs; l++) {
             if (G.conn[i].qp[l]) G.api.destroy_qp(G.conn[i].qp[l]);
