@@ -70,6 +70,8 @@
 /tests/test_engram
 /tests/rdma_t1/t1_server
 /tests/rdma_t1/t1_client
+/tests/rdma_t1/ds4_region_server
+/tests/rdma_t1/test_rdma_tier
 *.o
 *.dSYM/
 __pycache__/

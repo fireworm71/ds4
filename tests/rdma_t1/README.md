@@ -93,3 +93,66 @@ boxes. promax can read its own unprivileged at
   makes the numbers lie.
 * Handshake structs are exchanged raw. Both boxes are aarch64 LE, which is
   fine for a prototype but is not a wire format.
+
+---
+
+# T2: the tier inside ds4
+
+`ds4_rdma_tier.c` / `.h` (repo root) hook the transport into ds4 at
+`cuda_model_stage_read()`, the single choke point every weight/expert span goes
+through. Off unless `DS4_EXPERT_TIER_RDMA` is set, and never authoritative:
+every path returns 0 rather than failing, and ds4 falls through to the model
+file. A slow read costs latency; a wrong one would cost correct output.
+
+## Running it
+
+**On the peer (the box with the RAM):**
+
+    ./ds4_region_server --file /path/to/the-same-model.gguf
+
+It loads the model's leading bytes into mlocked RAM, registers them on both
+NICs, and serves many client pairs at once — ds4 fetches from up to 32 threads,
+and a one-pair-at-a-time server would serialise all of them. `--bytes N` caps
+how much to hold.
+
+**On the ds4 box:**
+
+    DS4_EXPERT_TIER_RDMA=10.99.0.2:19515,10.99.2.2:19516 ds4 ...
+
+| variable | meaning |
+|---|---|
+| `DS4_EXPERT_TIER_RDMA` | `host:port[,host:port]` — one entry per leg. Unset = off. |
+| `DS4_EXPERT_TIER_RDMA_QPS` | connection pairs in the pool (default 8). Size it to `DS4_CUDA_EXPERT_FETCH_THREADS`. |
+| `DS4_EXPERT_TIER_RDMA_GID` | local GID index (default 3, RoCEv2 here) |
+| `DS4_EXPERT_TIER_RDMA_DEBUG` | trace connection setup |
+
+`DS4_FETCH_STATS=1` reports the tier against the local disk — bytes *and*
+nanoseconds, so a tier that serves many bytes but saves little time shows up as
+exactly that.
+
+## What it does on its own
+
+* **Verifies before serving.** At startup it RDMA-reads five offsets, including
+  the last block, and compares them against ds4's own model fd. Any mismatch and
+  the tier refuses to activate. An over-large region is the likeliest mistake and
+  shows up only at the end, hence the last block.
+* **Picks its own devices**, matching each leg's peer address to the local
+  device whose RoCEv2 GID sits on the same /24.
+* **Refuses the T0 trap.** If both legs report the same remote device GUID it
+  drops to one leg, because two QPs sharing a remote device split it 50/50 and
+  stripe to nothing — one leg at full speed is strictly better.
+* **Disables itself on any read failure**, once, for the rest of the process.
+  A dead QP would otherwise be retried on every span, and the model file already
+  serves everything correctly.
+* **Pools connections** so parallel fetch threads do not serialise, and caches
+  the memory registration of ds4's staging buffers, keyed on (base, length), so
+  a grown buffer re-registers instead of handing back an MR over freed memory.
+
+## Testing it without ds4
+
+    ./test_rdma_tier <file> [threads]
+
+against a `ds4_region_server --file <same file>`. Checks open + verification,
+byte-exactness at many offsets including an unaligned offset with an odd length,
+and concurrent reads from many threads. Loopback on one box is a correctness
+test only — the timings are HCA-internal and mean nothing.

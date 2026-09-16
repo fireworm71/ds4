@@ -1,0 +1,667 @@
+/* Remote-RAM expert tier over one-sided RDMA READ. See ds4_rdma_tier.h.
+ *
+ * Shape: two legs, one per NIC, each a plain RC QP to a peer that has
+ * registered the model's leading bytes and then gone passive. A span is split
+ * in half, one half per leg, both in flight at once. T0 established that the
+ * halves only aggregate when the two legs land on DIFFERENT REMOTE devices --
+ * two QPs on one remote device split that device 50/50 and buy nothing -- so
+ * the remote GUIDs are compared at startup and the second leg is dropped if
+ * they match.
+ *
+ * ds4 fetches from up to 32 threads at once, so connections are pooled: a
+ * thread takes a pair, uses it, returns it. A shared QP would serialise the
+ * fetch path and give back exactly what the striping won.
+ */
+
+#include "ds4_rdma_tier.h"
+
+#include <errno.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#if defined(__linux__) && defined(__has_include)
+#if __has_include(<infiniband/verbs.h>)
+#include <infiniband/verbs.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#define DS4_RT_HAVE_VERBS 1
+#endif
+#endif
+
+#ifndef DS4_RT_HAVE_VERBS
+
+int ds4_rdma_tier_open(int model_fd, uint64_t model_bytes) {
+    (void)model_fd; (void)model_bytes;
+    if (getenv("DS4_EXPERT_TIER_RDMA"))
+        fprintf(stderr, "ds4: DS4_EXPERT_TIER_RDMA set but this build has no verbs headers\n");
+    return 0;
+}
+int ds4_rdma_tier_read(void *d, uint64_t o, uint64_t b) { (void)d; (void)o; (void)b; return 0; }
+uint64_t ds4_rdma_tier_bytes(void) { return 0; }
+void ds4_rdma_tier_stats(uint64_t *r, uint64_t *b, uint64_t *n) {
+    if (r) *r = 0; if (b) *b = 0; if (n) *n = 0;
+}
+void ds4_rdma_tier_close(void) { }
+
+#else /* DS4_RT_HAVE_VERBS */
+
+#define RT_MAX_LEGS   2
+#define RT_MAX_CONNS  64
+#define RT_MAX_MRC    96
+#define RT_GID_DEFAULT 3
+#define RT_POLL_TIMEOUT_NS 2000000000ull   /* 2 s: a healthy span takes ~0.4 ms */
+
+/* Wire handshake -- must stay byte-identical to tests/rdma_t1/t1_common.h. */
+#define RT_HS_MAGIC   0x54315253u
+#define RT_HS_VERSION 2u
+typedef struct {
+    uint32_t magic, version, qpn, psn, lid, rkey;
+    uint8_t  gid[16];
+    uint64_t addr, len, seed, node_guid;
+    char     dev[64];
+} rt_hs;
+
+typedef struct {
+    struct ibv_device **(*get_device_list)(int *);
+    void (*free_device_list)(struct ibv_device **);
+    const char *(*get_device_name)(struct ibv_device *);
+    struct ibv_context *(*open_device)(struct ibv_device *);
+    int (*close_device)(struct ibv_context *);
+    int (*query_port)(struct ibv_context *, uint8_t, struct ibv_port_attr *);
+    int (*query_gid)(struct ibv_context *, uint8_t, int, union ibv_gid *);
+    struct ibv_pd *(*alloc_pd)(struct ibv_context *);
+    int (*dealloc_pd)(struct ibv_pd *);
+    struct ibv_mr *(*reg_mr)(struct ibv_pd *, void *, size_t, int);
+    int (*dereg_mr)(struct ibv_mr *);
+    struct ibv_cq *(*create_cq)(struct ibv_context *, int, void *,
+                                struct ibv_comp_channel *, int);
+    int (*destroy_cq)(struct ibv_cq *);
+    struct ibv_qp *(*create_qp)(struct ibv_pd *, struct ibv_qp_init_attr *);
+    int (*destroy_qp)(struct ibv_qp *);
+    int (*modify_qp)(struct ibv_qp *, struct ibv_qp_attr *, int);
+    void *handle;
+} rt_api;
+
+typedef struct {
+    struct ibv_context *ctx;
+    struct ibv_pd      *pd;
+    union ibv_gid       gid;
+    enum ibv_mtu        mtu;
+    char                name[64];
+    char                host[64];      /* peer address for this leg */
+    int                 port;
+} rt_dev;
+
+typedef struct {
+    struct ibv_cq *cq[RT_MAX_LEGS];
+    struct ibv_qp *qp[RT_MAX_LEGS];
+    uint64_t       raddr[RT_MAX_LEGS];
+    uint32_t       rkey[RT_MAX_LEGS];
+    int            sock[RT_MAX_LEGS];
+} rt_conn;
+
+typedef struct { void *base; size_t len; struct ibv_mr *mr[RT_MAX_LEGS]; } rt_mrc;
+
+static struct {
+    rt_api   api;
+    rt_dev   dev[RT_MAX_LEGS];
+    int      n_legs;
+    rt_conn  conn[RT_MAX_CONNS];
+    int      n_conns;
+    unsigned char busy[RT_MAX_CONNS];
+    pthread_mutex_t lock;
+    pthread_cond_t  cv;
+    rt_mrc   mrc[RT_MAX_MRC];
+    int      n_mrc;
+    pthread_mutex_t mrlock;
+    uint64_t region_bytes;
+    uint64_t remote_guid[RT_MAX_LEGS];
+    int      gid_index;
+    int      active;
+    uint64_t reads, rbytes, ns;
+} G;
+
+/* DS4_EXPERT_TIER_RDMA_DEBUG=1 traces setup. Connection problems here are
+ * remote and silent by nature -- the alternative is guessing at a hang. */
+static int rt_dbg_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_EXPERT_TIER_RDMA_DEBUG") != NULL;
+    return on;
+}
+#define rt_dbg(...) do { if (rt_dbg_on()) { \
+    fprintf(stderr, "ds4-rdma: " __VA_ARGS__); fflush(stderr); } } while (0)
+
+static uint64_t rt_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* One-way trip to inactive. Called from the read path on any hard failure:
+ * a broken QP would otherwise be retried on every span for the rest of the
+ * run, and the model file already serves everything correctly. */
+static void rt_disable(const char *why) {
+    if (G.active) {
+        G.active = 0;
+        fprintf(stderr, "ds4: rdma expert tier disabled (%s); the model file "
+                        "serves everything from here\n", why);
+    }
+}
+
+static int rt_load_api(void) {
+    if (G.api.handle) return 1;
+    void *h = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen("libibverbs.so", RTLD_NOW | RTLD_LOCAL);
+    if (!h) return 0;
+#define RT_SYM(f, n) do { \
+        G.api.f = (__typeof__(G.api.f))dlsym(h, n); \
+        if (!G.api.f) { dlclose(h); memset(&G.api, 0, sizeof G.api); return 0; } \
+    } while (0)
+    RT_SYM(get_device_list, "ibv_get_device_list");
+    RT_SYM(free_device_list, "ibv_free_device_list");
+    RT_SYM(get_device_name, "ibv_get_device_name");
+    RT_SYM(open_device, "ibv_open_device");
+    RT_SYM(close_device, "ibv_close_device");
+    RT_SYM(query_port, "ibv_query_port");
+    RT_SYM(query_gid, "ibv_query_gid");
+    RT_SYM(alloc_pd, "ibv_alloc_pd");
+    RT_SYM(dealloc_pd, "ibv_dealloc_pd");
+    RT_SYM(reg_mr, "ibv_reg_mr");
+    RT_SYM(dereg_mr, "ibv_dereg_mr");
+    RT_SYM(create_cq, "ibv_create_cq");
+    RT_SYM(destroy_cq, "ibv_destroy_cq");
+    RT_SYM(create_qp, "ibv_create_qp");
+    RT_SYM(destroy_qp, "ibv_destroy_qp");
+    RT_SYM(modify_qp, "ibv_modify_qp");
+#undef RT_SYM
+    G.api.handle = h;
+    return 1;
+}
+
+/* ---- tcp handshake ---- */
+
+static int rt_send_all(int fd, const void *p, size_t n) {
+    const char *c = (const char *)p;
+    while (n) {
+        ssize_t k = send(fd, c, n, 0);
+        if (k < 0) { if (errno == EINTR) continue; return -1; }
+        if (k == 0) return -1;
+        c += k; n -= (size_t)k;
+    }
+    return 0;
+}
+static int rt_recv_all(int fd, void *p, size_t n) {
+    char *c = (char *)p;
+    while (n) {
+        ssize_t k = recv(fd, c, n, 0);
+        if (k < 0) { if (errno == EINTR) continue; return -1; }
+        if (k == 0) return -1;
+        c += k; n -= (size_t)k;
+    }
+    return 0;
+}
+static int rt_connect_tcp(const char *host, int port) {
+    char svc[16];
+    snprintf(svc, sizeof svc, "%d", port);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, svc, &hints, &res) != 0) return -1;
+    int fd = socket(res->ai_family, res->ai_socktype, 0);
+    if (fd >= 0 && connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); fd = -1; }
+    freeaddrinfo(res);
+    if (fd >= 0) { int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); }
+    return fd;
+}
+
+/* ---- device selection ----
+ * Pick, for each leg, the local device whose RoCEv2 GID is an IPv4 on the same
+ * /24 as that leg's peer address. On this fabric 10.99.0.x and 10.99.2.x are
+ * distinct /30s on one segment, so the /24 is unambiguous and needs no routing
+ * table parsing. */
+static int rt_gid_ipv4(const union ibv_gid *g, uint32_t *out) {
+    uint64_t hi;
+    uint16_t mid, tag;
+    memcpy(&hi, &g->raw[0], 8);
+    memcpy(&mid, &g->raw[8], 2);
+    memcpy(&tag, &g->raw[10], 2);
+    if (hi != 0 || mid != 0 || tag != 0xffff) return 0;
+    memcpy(out, &g->raw[12], 4);
+    return 1;
+}
+
+static int rt_open_dev(rt_dev *d) {
+    struct in_addr want;
+    if (inet_pton(AF_INET, d->host, &want) != 1) {
+        fprintf(stderr, "ds4: rdma tier: '%s' is not an IPv4 address\n", d->host);
+        return 0;
+    }
+    int n = 0;
+    struct ibv_device **list = G.api.get_device_list(&n);
+    if (!list) return 0;
+    int ok = 0;
+    for (int i = 0; i < n && !ok; i++) {
+        struct ibv_context *ctx = G.api.open_device(list[i]);
+        if (!ctx) continue;
+        struct ibv_port_attr port;
+        union ibv_gid gid;
+        uint32_t ip = 0;
+        if (G.api.query_port(ctx, 1, &port) == 0 && port.state == IBV_PORT_ACTIVE &&
+            G.api.query_gid(ctx, 1, G.gid_index, &gid) == 0 && rt_gid_ipv4(&gid, &ip) &&
+            (ip & htonl(0xffffff00u)) == (want.s_addr & htonl(0xffffff00u))) {
+            d->ctx = ctx;
+            d->gid = gid;
+            d->mtu = port.active_mtu;
+            snprintf(d->name, sizeof d->name, "%s", G.api.get_device_name(list[i]));
+            d->pd = G.api.alloc_pd(ctx);
+            if (d->pd) ok = 1;
+            else { G.api.close_device(ctx); d->ctx = NULL; }
+        } else {
+            G.api.close_device(ctx);
+        }
+    }
+    G.api.free_device_list(list);
+    if (!ok)
+        fprintf(stderr, "ds4: rdma tier: no ACTIVE device with a RoCEv2 GID on %s's /24\n",
+                d->host);
+    return ok;
+}
+
+/* ---- one connection leg ----
+ * The peer accepts BOTH legs of a pair before handshaking either, so every
+ * socket must be connected before any handshake starts. Doing connect and
+ * handshake together per leg deadlocks: this side waits for leg A's handshake
+ * while the peer is still blocked in accept() for leg B. */
+static int rt_connect_leg_socket(rt_conn *c, int leg) {
+    rt_dev *d = &G.dev[leg];
+    c->sock[leg] = rt_connect_tcp(d->host, d->port);
+    if (c->sock[leg] < 0) {
+        fprintf(stderr, "ds4: rdma tier: cannot reach %s:%d\n", d->host, d->port);
+        return 0;
+    }
+    return 1;
+}
+
+static int rt_open_leg(rt_conn *c, int leg) {
+    rt_dev *d = &G.dev[leg];
+    rt_dbg("leg %d: handshake start (%s:%d via %s)\n", leg, d->host, d->port, d->name);
+    c->cq[leg] = G.api.create_cq(d->ctx, 16, NULL, NULL, 0);
+    if (!c->cq[leg]) return 0;
+    struct ibv_qp_init_attr qa;
+    memset(&qa, 0, sizeof qa);
+    qa.send_cq = c->cq[leg]; qa.recv_cq = c->cq[leg];
+    qa.qp_type = IBV_QPT_RC;
+    qa.cap.max_send_wr = 16; qa.cap.max_recv_wr = 16;
+    qa.cap.max_send_sge = 1; qa.cap.max_recv_sge = 1;
+    c->qp[leg] = G.api.create_qp(d->pd, &qa);
+    if (!c->qp[leg]) return 0;
+
+    const uint32_t psn = 0x0f0f0fu + (uint32_t)leg;
+    rt_hs peer, mine;
+    rt_dbg("leg %d: waiting for peer handshake (%zu bytes)\n", leg, sizeof peer);
+    if (rt_recv_all(c->sock[leg], &peer, sizeof peer)) return 0;
+    rt_dbg("leg %d: got peer hs qpn=%u rkey=0x%x len=%llu dev=%s\n", leg,
+           peer.qpn, peer.rkey, (unsigned long long)peer.len, peer.dev);
+    if (peer.magic != RT_HS_MAGIC || peer.version != RT_HS_VERSION) {
+        fprintf(stderr, "ds4: rdma tier: handshake mismatch from %s:%d -- the peer "
+                        "server is a different build\n", d->host, d->port);
+        return 0;
+    }
+    memset(&mine, 0, sizeof mine);
+    mine.magic = RT_HS_MAGIC; mine.version = RT_HS_VERSION;
+    mine.qpn = c->qp[leg]->qp_num; mine.psn = psn;
+    memcpy(mine.gid, d->gid.raw, 16);
+    snprintf(mine.dev, sizeof mine.dev, "%s", d->name);
+    if (rt_send_all(c->sock[leg], &mine, sizeof mine)) return 0;
+
+    struct ibv_qp_attr a;
+    memset(&a, 0, sizeof a);
+    a.qp_state = IBV_QPS_INIT;
+    a.pkey_index = 0; a.port_num = 1;
+    a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE;
+    if (G.api.modify_qp(c->qp[leg], &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+                                        IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) return 0;
+    memset(&a, 0, sizeof a);
+    a.qp_state = IBV_QPS_RTR;
+    a.path_mtu = d->mtu;
+    a.dest_qp_num = peer.qpn;
+    a.rq_psn = peer.psn;
+    a.max_dest_rd_atomic = 16;
+    a.min_rnr_timer = 12;
+    a.ah_attr.dlid = (uint16_t)peer.lid;
+    a.ah_attr.port_num = 1;
+    a.ah_attr.is_global = 1;
+    memcpy(a.ah_attr.grh.dgid.raw, peer.gid, 16);
+    a.ah_attr.grh.sgid_index = (uint8_t)G.gid_index;
+    a.ah_attr.grh.hop_limit = 1;
+    if (G.api.modify_qp(c->qp[leg], &a, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                                        IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                                        IBV_QP_MAX_DEST_RD_ATOMIC |
+                                        IBV_QP_MIN_RNR_TIMER)) return 0;
+    memset(&a, 0, sizeof a);
+    a.qp_state = IBV_QPS_RTS;
+    a.sq_psn = psn;
+    a.timeout = 14; a.retry_cnt = 7; a.rnr_retry = 7;
+    a.max_rd_atomic = 16;
+    if (G.api.modify_qp(c->qp[leg], &a, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+                                        IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                                        IBV_QP_MAX_QP_RD_ATOMIC)) return 0;
+
+    rt_dbg("leg %d: RTS\n", leg);
+
+    c->raddr[leg] = peer.addr;
+    c->rkey[leg]  = peer.rkey;
+    if (G.region_bytes == 0 || peer.len < G.region_bytes) G.region_bytes = peer.len;
+    G.remote_guid[leg] = peer.node_guid;
+    return 1;
+}
+
+/* The peer sends its go byte on every leg only once the WHOLE pair is wired,
+ * so this waits in its own pass. Folding it into rt_open_leg() deadlocks: this
+ * side would block for leg 0's go while the peer is still waiting for leg 1's
+ * handshake, which this side has not sent yet. */
+static int rt_wait_go(rt_conn *c, int leg) {
+    uint8_t go = 0;
+    if (rt_recv_all(c->sock[leg], &go, 1) || go != 1) return 0;
+    rt_dbg("leg %d: ready\n", leg);
+    return 1;
+}
+
+/* ---- pool ---- */
+static rt_conn *rt_acquire(int *idx) {
+    pthread_mutex_lock(&G.lock);
+    for (;;) {
+        for (int i = 0; i < G.n_conns; i++) {
+            if (!G.busy[i]) {
+                G.busy[i] = 1;
+                pthread_mutex_unlock(&G.lock);
+                *idx = i;
+                return &G.conn[i];
+            }
+        }
+        pthread_cond_wait(&G.cv, &G.lock);
+    }
+}
+static void rt_release(int idx) {
+    pthread_mutex_lock(&G.lock);
+    G.busy[idx] = 0;
+    pthread_cond_signal(&G.cv);
+    pthread_mutex_unlock(&G.lock);
+}
+
+/* ---- memory-region cache ----
+ * ds4's staging buffers are a small set of long-lived cudaHostAlloc'd blocks,
+ * so registering per read would dominate the transfer. Keyed on (base, len):
+ * a grown buffer reuses the pointer but changes the length, which misses and
+ * re-registers rather than handing back an MR over freed memory. */
+static int rt_mr_get(void *base, size_t len, struct ibv_mr **out) {
+    pthread_mutex_lock(&G.mrlock);
+    for (int i = 0; i < G.n_mrc; i++) {
+        if (G.mrc[i].base == base && G.mrc[i].len >= len) {
+            for (int l = 0; l < G.n_legs; l++) out[l] = G.mrc[i].mr[l];
+            pthread_mutex_unlock(&G.mrlock);
+            return 1;
+        }
+    }
+    if (G.n_mrc >= RT_MAX_MRC) { pthread_mutex_unlock(&G.mrlock); return 0; }
+    rt_mrc *e = &G.mrc[G.n_mrc];
+    memset(e, 0, sizeof *e);
+    for (int l = 0; l < G.n_legs; l++) {
+        e->mr[l] = G.api.reg_mr(G.dev[l].pd, base, len, IBV_ACCESS_LOCAL_WRITE);
+        if (!e->mr[l]) {
+            for (int k = 0; k < l; k++) G.api.dereg_mr(e->mr[k]);
+            pthread_mutex_unlock(&G.mrlock);
+            return 0;
+        }
+    }
+    e->base = base; e->len = len;
+    G.n_mrc++;
+    for (int l = 0; l < G.n_legs; l++) out[l] = e->mr[l];
+    pthread_mutex_unlock(&G.mrlock);
+    return 1;
+}
+
+/* ---- the read itself ---- */
+static int rt_post(rt_conn *c, int leg, void *dst, uint32_t lkey,
+                   uint64_t raddr, uint64_t bytes) {
+    struct ibv_sge sge;
+    memset(&sge, 0, sizeof sge);
+    sge.addr = (uint64_t)(uintptr_t)dst;
+    sge.length = (uint32_t)bytes;
+    sge.lkey = lkey;
+    struct ibv_send_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof wr);
+    wr.wr_id = (uint64_t)leg;
+    wr.sg_list = &sge; wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = raddr;
+    wr.wr.rdma.rkey = c->rkey[leg];
+    return ibv_post_send(c->qp[leg], &wr, &bad) == 0;   /* inline over ctx->ops */
+}
+
+static int rt_wait(rt_conn *c, int leg, uint64_t deadline) {
+    struct ibv_wc wc;
+    for (;;) {
+        int n = ibv_poll_cq(c->cq[leg], 1, &wc);
+        if (n < 0) return 0;
+        if (n > 0) return wc.status == IBV_WC_SUCCESS;
+        if (rt_now_ns() > deadline) return 0;
+    }
+}
+
+static int rt_read_raw(rt_conn *c, void *dst, struct ibv_mr **mr,
+                       uint64_t off, uint64_t bytes) {
+    const uint64_t deadline = rt_now_ns() + RT_POLL_TIMEOUT_NS;
+    if (G.n_legs == 1) {
+        if (!rt_post(c, 0, dst, mr[0]->lkey, c->raddr[0] + off, bytes)) return 0;
+        return rt_wait(c, 0, deadline);
+    }
+    const uint64_t half = bytes / 2;
+    const uint64_t rest = bytes - half;
+    if (!rt_post(c, 0, dst, mr[0]->lkey, c->raddr[0] + off, half)) return 0;
+    if (!rt_post(c, 1, (char *)dst + half, mr[1]->lkey,
+                 c->raddr[1] + off + half, rest)) {
+        (void)rt_wait(c, 0, deadline);   /* drain leg 0 before giving the pair back */
+        return 0;
+    }
+    const int a = rt_wait(c, 0, deadline);
+    const int b = rt_wait(c, 1, deadline);
+    return a && b;
+}
+
+int ds4_rdma_tier_read(void *dst, uint64_t offset, uint64_t bytes) {
+    if (!G.active || bytes == 0) return 0;
+    if (bytes > G.region_bytes || offset > G.region_bytes - bytes) return 0;
+    struct ibv_mr *mr[RT_MAX_LEGS];
+    if (!rt_mr_get(dst, (size_t)bytes, mr)) return 0;
+    int idx = 0;
+    rt_conn *c = rt_acquire(&idx);
+    const uint64_t t0 = rt_now_ns();
+    const int ok = rt_read_raw(c, dst, mr, offset, bytes);
+    const uint64_t dt = rt_now_ns() - t0;
+    rt_release(idx);
+    if (!ok) { rt_disable("a read did not complete"); return 0; }
+    __sync_fetch_and_add(&G.reads, 1);
+    __sync_fetch_and_add(&G.rbytes, bytes);
+    __sync_fetch_and_add(&G.ns, dt);
+    return 1;
+}
+
+uint64_t ds4_rdma_tier_bytes(void) { return G.active ? G.region_bytes : 0; }
+
+void ds4_rdma_tier_stats(uint64_t *reads, uint64_t *bytes, uint64_t *ns) {
+    if (reads) *reads = G.reads;
+    if (bytes) *bytes = G.rbytes;
+    if (ns) *ns = G.ns;
+}
+
+/* Sample the remote region against the real model file. A tier that is stale,
+ * short or shifted would feed wrong weights, which is far worse than slow, so
+ * this runs before the tier is ever used and refuses on any mismatch. The last
+ * block is always probed: an over-large region is the likeliest mistake and
+ * shows up only at the end. */
+static int rt_verify(int model_fd, uint64_t model_bytes) {
+    if (model_fd < 0 || G.region_bytes == 0) return 0;
+    if (model_bytes && G.region_bytes > model_bytes) G.region_bytes = model_bytes;
+    const uint64_t blk = 65536;
+    if (G.region_bytes < blk) return 0;
+    void *rbuf = NULL, *mbuf = NULL;
+    if (posix_memalign(&rbuf, 4096, (size_t)blk) || posix_memalign(&mbuf, 4096, (size_t)blk)) {
+        free(rbuf); free(mbuf); return 0;
+    }
+    struct ibv_mr *mr[RT_MAX_LEGS];
+    memset(mr, 0, sizeof mr);
+    int ok = 1;
+    for (int l = 0; l < G.n_legs && ok; l++) {
+        mr[l] = G.api.reg_mr(G.dev[l].pd, rbuf, (size_t)blk, IBV_ACCESS_LOCAL_WRITE);
+        if (!mr[l]) ok = 0;
+    }
+    const uint64_t span = G.region_bytes;
+    const uint64_t probes[] = { 0, span / 4, span / 2, (span / 4) * 3, span - blk };
+    for (size_t i = 0; ok && i < sizeof probes / sizeof probes[0]; i++) {
+        uint64_t off = probes[i] & ~4095ull;
+        if (off + blk > span) continue;
+        int idx = 0;
+        rt_conn *c = rt_acquire(&idx);
+        const int got = rt_read_raw(c, rbuf, mr, off, blk);
+        rt_release(idx);
+        if (!got) {
+            fprintf(stderr, "ds4: rdma expert tier: probe read at %llu failed\n",
+                    (unsigned long long)off);
+            ok = 0; break;
+        }
+        uint64_t done = 0;
+        while (done < blk) {
+            ssize_t k = pread(model_fd, (char *)mbuf + done, (size_t)(blk - done),
+                              (off_t)(off + done));
+            if (k <= 0) { if (k < 0 && errno == EINTR) continue; ok = 0; break; }
+            done += (uint64_t)k;
+        }
+        if (ok && memcmp(rbuf, mbuf, (size_t)blk) != 0) {
+            fprintf(stderr,
+                    "ds4: rdma expert tier does NOT match the model at offset %llu"
+                    " -- refusing to use it (is the peer serving this same file?)\n",
+                    (unsigned long long)off);
+            ok = 0;
+        }
+    }
+    for (int l = 0; l < G.n_legs; l++) if (mr[l]) G.api.dereg_mr(mr[l]);
+    free(rbuf); free(mbuf);
+    return ok;
+}
+
+int ds4_rdma_tier_open(int model_fd, uint64_t model_bytes) {
+    const char *spec = getenv("DS4_EXPERT_TIER_RDMA");
+    if (!spec || !spec[0]) return 0;
+    if (G.active) return 1;
+
+    memset(&G, 0, sizeof G);
+    pthread_mutex_init(&G.lock, NULL);
+    pthread_cond_init(&G.cv, NULL);
+    pthread_mutex_init(&G.mrlock, NULL);
+    G.gid_index = RT_GID_DEFAULT;
+    { const char *g = getenv("DS4_EXPERT_TIER_RDMA_GID"); if (g && g[0]) G.gid_index = atoi(g); }
+
+    /* "host:port[,host:port]" -- one entry per leg. */
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok && G.n_legs < RT_MAX_LEGS;
+         tok = strtok_r(NULL, ",", &save)) {
+        char *colon = strrchr(tok, ':');
+        if (!colon) {
+            fprintf(stderr, "ds4: DS4_EXPERT_TIER_RDMA leg '%s' needs host:port\n", tok);
+            return 0;
+        }
+        *colon = '\0';
+        snprintf(G.dev[G.n_legs].host, sizeof G.dev[G.n_legs].host, "%s", tok);
+        G.dev[G.n_legs].port = atoi(colon + 1);
+        G.n_legs++;
+    }
+    if (G.n_legs == 0) return 0;
+    if (!rt_load_api()) {
+        fprintf(stderr, "ds4: DS4_EXPERT_TIER_RDMA set but libibverbs is not loadable\n");
+        return 0;
+    }
+    for (int l = 0; l < G.n_legs; l++) {
+        if (!rt_open_dev(&G.dev[l])) return 0;
+        rt_dbg("leg %d: peer %s:%d via local device %s\n", l, G.dev[l].host,
+               G.dev[l].port, G.dev[l].name);
+    }
+
+    int want = 8;
+    { const char *q = getenv("DS4_EXPERT_TIER_RDMA_QPS"); if (q && q[0]) want = atoi(q); }
+    if (want < 1) want = 1;
+    if (want > RT_MAX_CONNS) want = RT_MAX_CONNS;
+
+    for (int i = 0; i < want; i++) {
+        rt_conn *c = &G.conn[i];
+        for (int l = 0; l < RT_MAX_LEGS; l++) c->sock[l] = -1;
+        int ok = 1;
+        rt_dbg("pair %d: connecting sockets\n", i);
+        for (int l = 0; l < G.n_legs && ok; l++) ok = rt_connect_leg_socket(c, l);
+        for (int l = 0; l < G.n_legs && ok; l++) ok = rt_open_leg(c, l);
+        for (int l = 0; l < G.n_legs && ok; l++) ok = rt_wait_go(c, l);
+        if (!ok) {
+            if (i == 0) {
+                fprintf(stderr, "ds4: rdma expert tier: could not establish a "
+                                "connection to the peer\n");
+                return 0;
+            }
+            break;              /* fewer pairs than asked for is fine */
+        }
+        G.n_conns = i + 1;
+    }
+
+    /* T0's trap: two legs on one REMOTE device split that device 50/50 and
+     * stripe to exactly nothing. One leg at full speed beats two that share. */
+    if (G.n_legs == 2 && G.remote_guid[0] == G.remote_guid[1]) {
+        fprintf(stderr,
+                "ds4: rdma expert tier: both legs land on the same remote device "
+                "(guid 0x%016llx); striping would buy nothing, using one leg\n",
+                (unsigned long long)G.remote_guid[0]);
+        G.n_legs = 1;
+    }
+
+    G.active = 1;
+    if (!rt_verify(model_fd, model_bytes)) {
+        G.active = 0;
+        ds4_rdma_tier_close();
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4: rdma expert tier active: %.2f GiB from %s, %d leg%s x %d pair%s, verified\n",
+            (double)G.region_bytes / 1073741824.0, G.dev[0].host,
+            G.n_legs, G.n_legs == 1 ? "" : "s",
+            G.n_conns, G.n_conns == 1 ? "" : "s");
+    return 1;
+}
+
+void ds4_rdma_tier_close(void) {
+    for (int i = 0; i < G.n_conns; i++) {
+        for (int l = 0; l < G.n_legs; l++) {
+            if (G.conn[i].qp[l]) G.api.destroy_qp(G.conn[i].qp[l]);
+            if (G.conn[i].cq[l]) G.api.destroy_cq(G.conn[i].cq[l]);
+            if (G.conn[i].sock[l] >= 0) close(G.conn[i].sock[l]);
+        }
+    }
+    for (int i = 0; i < G.n_mrc; i++)
+        for (int l = 0; l < G.n_legs; l++)
+            if (G.mrc[i].mr[l]) G.api.dereg_mr(G.mrc[i].mr[l]);
+    for (int l = 0; l < G.n_legs; l++) {
+        if (G.dev[l].pd) G.api.dealloc_pd(G.dev[l].pd);
+        if (G.dev[l].ctx) G.api.close_device(G.dev[l].ctx);
+    }
+    G.n_conns = 0; G.n_mrc = 0; G.active = 0;
+}
+
+#endif /* DS4_RT_HAVE_VERBS */
