@@ -68,6 +68,8 @@
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli
 /tests/test_engram
+/tests/rdma_t1/t1_server
+/tests/rdma_t1/t1_client
 *.o
 *.dSYM/
 __pycache__/
