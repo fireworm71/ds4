@@ -16,6 +16,7 @@
  */
 #include <pthread.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include "t1_common.h"
 
@@ -142,6 +143,52 @@ int main(int argc, char **argv) {
     if (!strcmp(dev_a_name, dev_b_name))
         t1_die("--dev-a and --dev-b are the same device -- two QPs on one device\n"
                "     do not aggregate. See the T0 trap in the plan.");
+
+    /* Check the pinning budget BEFORE spending minutes loading. ibv_reg_mr pins
+     * the whole region, so RLIMIT_MEMLOCK below the region size fails the
+     * registration outright -- free RAM is irrelevant. A process may raise its
+     * own soft limit up to the hard limit without root, so try that first;
+     * that alone fixes the common case where hard is unlimited and soft is not. */
+    {
+        uint64_t need = want ? want : (uint64_t)0;
+        if (file && need == 0) {
+            struct stat pst;
+            if (stat(file, &pst) == 0) need = (uint64_t)pst.st_size;
+        } else if (!file) {
+            need = size;
+        }
+        struct rlimit rl;
+        if (need && getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
+            if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < need) {
+                struct rlimit up = rl;
+                up.rlim_cur = rl.rlim_max;          /* no root needed for this */
+                if (setrlimit(RLIMIT_MEMLOCK, &up) == 0) {
+                    (void)getrlimit(RLIMIT_MEMLOCK, &rl);
+                    if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= need)
+                        fprintf(stderr, "region-server: raised memlock soft limit "
+                                        "to the hard limit\n");
+                }
+            }
+            if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < need) {
+                fprintf(stderr,
+                  "region-server: REFUSING TO START.\n"
+                  "  memlock limit is %.2f GiB but the region needs %.2f GiB, and\n"
+                  "  ibv_reg_mr pins all of it -- registration would fail no matter\n"
+                  "  how much RAM is free. (Checked before loading so you do not wait\n"
+                  "  for the read first.)\n"
+                  "  Fix, cheapest first:\n"
+                  "    ulimit -Hl                       # if this says unlimited, then\n"
+                  "    ulimit -l unlimited              # works in this shell, no root\n"
+                  "    --bytes %llu   # or just serve what fits\n"
+                  "  Otherwise, as root, add to /etc/security/limits.conf and re-login:\n"
+                  "    <user> hard memlock unlimited\n"
+                  "    <user> soft memlock unlimited\n",
+                  (double)rl.rlim_cur / 1073741824.0, (double)need / 1073741824.0,
+                  (unsigned long long)rl.rlim_cur);
+                return 1;
+            }
+        }
+    }
 
     if (file) {
         int fd = open(file, O_RDONLY);
