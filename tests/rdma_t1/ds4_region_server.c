@@ -32,6 +32,23 @@ static uint64_t region_bytes;
 static t1_ep dev_a, dev_b;
 static pthread_mutex_t accept_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile uint64_t live_clients;
+static int g_want_odp;
+
+/* Pinned registration is preferred: it is what the fabric numbers assume. When
+ * RLIMIT_MEMLOCK forbids it, an on-demand-paging MR registers the same memory
+ * without pinning -- ConnectX-7 reports rc_odp_caps SUPPORT_READ, which is
+ * exactly what a one-sided READ responder needs. Pages fault into the HCA on
+ * first touch, so the first pass over the region is slower than the rest. */
+static struct ibv_mr *reg_region(struct ibv_pd *pd, void *addr, size_t len, int *odp) {
+    if (!g_want_odp) {
+        struct ibv_mr *mr = ibv_reg_mr(pd, addr, len, IBV_ACCESS_REMOTE_READ);
+        if (mr) { *odp = 0; return mr; }
+    }
+    struct ibv_mr *mr = ibv_reg_mr(pd, addr, len,
+                                   IBV_ACCESS_REMOTE_READ | IBV_ACCESS_ON_DEMAND);
+    *odp = mr ? 1 : 0;
+    return mr;
+}
 
 typedef struct { int fd_a, fd_b; } pair_arg;
 
@@ -171,21 +188,16 @@ int main(int argc, char **argv) {
             }
             if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < need) {
                 fprintf(stderr,
-                  "region-server: REFUSING TO START.\n"
-                  "  memlock limit is %.2f GiB but the region needs %.2f GiB, and\n"
-                  "  ibv_reg_mr pins all of it -- registration would fail no matter\n"
-                  "  how much RAM is free. (Checked before loading so you do not wait\n"
-                  "  for the read first.)\n"
-                  "  Fix, cheapest first:\n"
-                  "    ulimit -Hl                       # if this says unlimited, then\n"
-                  "    ulimit -l unlimited              # works in this shell, no root\n"
-                  "    --bytes %llu   # or just serve what fits\n"
-                  "  Otherwise, as root, add to /etc/security/limits.conf and re-login:\n"
+                  "region-server: memlock limit is %.2f GiB but the region needs\n"
+                  "  %.2f GiB. Falling back to an ON-DEMAND PAGING registration, which\n"
+                  "  does not pin and so is not bound by that limit. The pages are\n"
+                  "  resident (this process just read them) but the kernel MAY evict\n"
+                  "  them under pressure, in which case timings understate the fabric.\n"
+                  "  For pinned registration instead, as root and then re-login:\n"
                   "    <user> hard memlock unlimited\n"
                   "    <user> soft memlock unlimited\n",
-                  (double)rl.rlim_cur / 1073741824.0, (double)need / 1073741824.0,
-                  (unsigned long long)rl.rlim_cur);
-                return 1;
+                  (double)rl.rlim_cur / 1073741824.0, (double)need / 1073741824.0);
+                g_want_odp = 1;
             }
         }
     }
@@ -220,7 +232,7 @@ int main(int argc, char **argv) {
         if (posix_memalign(&region, 4096, region_bytes)) t1_die("alloc failed");
         t1_fill(region, region_bytes, 1);
     }
-    if (mlock(region, region_bytes))
+    if (!g_want_odp && mlock(region, region_bytes))
         fprintf(stderr, "region-server: WARNING mlock failed (%s) -- the region can be\n"
                         "   paged out, which makes every number here a lie\n", strerror(errno));
 
@@ -229,9 +241,17 @@ int main(int argc, char **argv) {
     if (dev_a.node_guid == dev_b.node_guid)
         t1_die("%s and %s are one device (guid 0x%llx) -- cannot stripe",
                dev_a_name, dev_b_name, (unsigned long long)dev_a.node_guid);
-    dev_a.mr = ibv_reg_mr(dev_a.pd, region, region_bytes, IBV_ACCESS_REMOTE_READ);
-    dev_b.mr = ibv_reg_mr(dev_b.pd, region, region_bytes, IBV_ACCESS_REMOTE_READ);
-    if (!dev_a.mr || !dev_b.mr) t1_die("reg_mr: %s", strerror(errno));
+    int odp_a = 0, odp_b = 0;
+    dev_a.mr = reg_region(dev_a.pd, region, region_bytes, &odp_a);
+    dev_b.mr = reg_region(dev_b.pd, region, region_bytes, &odp_b);
+    if (!dev_a.mr || !dev_b.mr)
+        t1_die("reg_mr failed: %s\n"
+               "     Even on-demand paging did not register the region. Serve less\n"
+               "     with --bytes, or raise memlock as root.", strerror(errno));
+    if (odp_a || odp_b)
+        fprintf(stderr, "region-server: registered WITHOUT pinning (on-demand paging).\n"
+                        "   Expect the first pass over the region to be slower, and keep\n"
+                        "   an eye on free RAM -- these pages are evictable.\n");
 
     printf("region-server: %.2f GiB @ %p from %s\n",
            (double)region_bytes / 1073741824.0, region, file ? file : "(pattern)");
