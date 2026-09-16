@@ -27,6 +27,7 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_image.h"
+#include "ds4_rdma_tier.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -104,6 +105,107 @@ static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
+
+/* Optional second backing store for weight/expert spans (DS4_EXPERT_TIER).
+ * A faster device holding a mirror of the model's first g_tier_bytes bytes --
+ * e.g. remote RAM over NVMe-oF, measured here at 22+ GB/s against 7.95 GB/s for
+ * the local disk. Reads are issued through ds4's own O_DIRECT path, so unlike a
+ * loop/device-mapper composite (which converts O_DIRECT into buffered I/O on the
+ * backing file and was measured 6-8x SLOWER end to end) this keeps the direct
+ * path intact. Falls back to the model file whenever a span is not covered. */
+static int g_tier_fd = -1;
+static uint64_t g_tier_align = 1;
+static uint64_t g_tier_bytes = 0;
+static uint64_t g_tier_hits = 0;
+static uint64_t g_tier_misses = 0;
+/* Per-backing-store attribution: bytes AND nanoseconds, so a tier that serves
+ * many bytes but saves little time is visible as such (44% of bytes at 1.28x
+ * buys ~10% of load, which the byte counter alone would overstate). */
+static uint64_t g_tier_ns = 0, g_tier_rd_bytes = 0;
+static uint64_t g_disk_ns = 0, g_disk_rd_bytes = 0;
+/* Per-phase attribution. T3 measured the RDMA tier's whole-run effect and found
+ * generation gaining 3x what prefill gained -- the opposite of what the plan
+ * expected -- but DS4_FETCH_STATS aggregates both phases, so it cannot say how
+ * much of the saved read time landed in each. These split it. Phase is 1 for
+ * prefill (prompt processing) and 0 for decode, taken from the expert-cache
+ * slot count, which is how the cache stats already tell the two apart. */
+static int g_fetch_phase;
+static uint64_t g_ph_tier_ns[2], g_ph_tier_bytes[2], g_ph_tier_reads[2];
+static uint64_t g_ph_disk_ns[2], g_ph_disk_bytes[2], g_ph_disk_reads[2];
+/* Where, in the model file, do the spans that MISS the tier live? The tier
+ * mirrors a prefix chosen only because a prefix is the simplest thing to
+ * mirror. If the misses concentrate somewhere else -- particularly decode's,
+ * which cost the most wall per byte -- then the same peer RAM aimed at that
+ * range is worth more than the prefix. 64 buckets over the file, per phase. */
+enum { CUDA_MISS_HIST_BUCKETS = 64 };
+static uint64_t g_ph_miss_hist[2][CUDA_MISS_HIST_BUCKETS];
+/* Bucket width captured when the first span is recorded: the report runs at
+ * exit, by which time the model size global may already be cleared. */
+static uint64_t g_hist_bucket_bytes;
+/* COMPLEMENT CACHE (DS4_CUDA_EXPERT_EVICT_TIER_FIRST).
+ *
+ * The peer holds a fixed range of the model; this cache holds whatever it
+ * holds. Any expert resident in BOTH is a wasted slot -- the tier is only ever
+ * consulted on a miss here, so a byte both boxes hold is capacity spent twice.
+ *
+ * Measured shape that makes this worth doing: the working set is ~154 GiB (the
+ * rest of the file is never touched), the peer covers 90 GiB of it, and this
+ * cache is 80 GiB. The part the peer does NOT cover is ~64 GiB -- which fits
+ * here with room to spare. So if eviction prefers experts the peer already has,
+ * this cache drifts towards holding the complement, and almost every miss
+ * lands on the peer at ~21.5 GB/s instead of on local NVMe at ~5.8.
+ *
+ * It is a cost-aware victim choice, not a correctness change: re-fetching a
+ * covered expert costs a tier read, re-fetching an uncovered one costs a disk
+ * read ~3.7x slower, so at equal age the covered slot is the cheaper thing to
+ * lose. Plain LRU is blind to that difference. */
+static uint64_t g_tier_cover_bytes;
+static uint64_t g_evict_covered, g_evict_uncovered;
+static int cuda_expert_evict_tier_first(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DS4_CUDA_EXPERT_EVICT_TIER_FIRST");
+        on = e && e[0] && e[0] != '0' ? 1 : 0;
+    }
+    return on;
+}
+static uint64_t g_ph_hit_hist[2][CUDA_MISS_HIST_BUCKETS];
+/* How many spans a single parallel fetch actually has to work with. The thread
+ * cap is useless if the batch never contains that many jobs, so this answers
+ * "how often do we reach depth N" directly rather than by inference. */
+enum { CUDA_FETCH_DEPTH_BUCKETS = 34 };
+static uint64_t g_fetch_depth_hist[CUDA_FETCH_DEPTH_BUCKETS];
+static uint64_t g_fetch_jobs_total = 0, g_fetch_calls_total = 0;
+static inline uint64_t cuda_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Where in the model do weight/expert fetches actually land? The hot experts
+ * live in ds4's resident expert cache, so what reaches the disk is by
+ * definition the NOT-hot set -- mirroring "the first N GiB" may cover entirely
+ * the wrong region. DS4_READ_HIST=1 buckets every stage read by file offset so
+ * placement can be decided from measurement instead of assumption. */
+enum { CUDA_READ_HIST_BUCKETS = 32 };
+static uint64_t g_read_hist_bytes[CUDA_READ_HIST_BUCKETS];
+static uint64_t g_read_hist_count[CUDA_READ_HIST_BUCKETS];
+extern "C" void ds4_gpu_expert_tier_report(void);
+static int cuda_read_hist_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("DS4_READ_HIST") != NULL;
+        if (on) atexit(ds4_gpu_expert_tier_report);
+    }
+    return on;
+}
+static void cuda_read_hist_note(uint64_t offset, uint64_t bytes) {
+    if (!cuda_read_hist_enabled() || g_model_file_size == 0) return;
+    uint64_t b = offset / (g_model_file_size / CUDA_READ_HIST_BUCKETS + 1);
+    if (b >= CUDA_READ_HIST_BUCKETS) b = CUDA_READ_HIST_BUCKETS - 1;
+    g_read_hist_bytes[b] += bytes;
+    g_read_hist_count[b]++;
+}
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
@@ -179,6 +281,16 @@ struct cuda_stream_expert_slot {
     uint8_t  lives;  /* unspent second chances, DS4_CUDA_EXPERT_EVICT only */
 };
 static std::vector<cuda_stream_expert_slot> g_stream_expert_slots;
+/* All three spans must be covered: a partly covered expert still costs a disk
+ * read for the remainder, so it is not the cheap victim it looks like. */
+static inline int cuda_slot_tier_covered(const cuda_stream_expert_slot &c,
+                                         uint64_t gate_bytes, uint64_t down_bytes,
+                                         uint64_t cover) {
+    if (!cover) return 0;
+    return c.gate + gate_bytes <= cover &&
+           c.up   + gate_bytes <= cover &&
+           c.down + down_bytes <= cover;
+}
 /*
  * DS4_CUDA_ROUTE_DUMP=<path> -- append one line per decode (token, layer):
  *   <token> <layer> <e0> <e1> ... <e{n-1}>
@@ -2246,10 +2358,101 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     return 1;
 }
 
-static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
-                                 uint64_t offset, uint64_t bytes,
-                                 const char **payload) {
+/* Read a span from the faster tier if it covers it. Same aligned-O_DIRECT shape
+ * as the model path below. Returns 0 if not covered or the read failed, in which
+ * case the caller falls through to the model file -- the tier is never
+ * authoritative, so a failure here costs latency and not correctness. */
+static int cuda_tier_stage_read(void *stage, uint64_t stage_bytes,
+                                uint64_t offset, uint64_t bytes,
+                                const char **payload) {
+    if (g_tier_fd < 0 || g_tier_bytes == 0) return 0;
+    if (bytes > g_tier_bytes || offset > g_tier_bytes - bytes) return 0;
+    const uint64_t align = g_tier_align > 1 ? g_tier_align : 1;
+    const uint64_t aligned_off = cuda_round_down(offset, align);
+    const uint64_t delta = offset - aligned_off;
+    const uint64_t read_size = cuda_round_up(delta + bytes, align);
+    if (read_size > stage_bytes || aligned_off > g_tier_bytes ||
+        read_size > g_tier_bytes - aligned_off) return 0;
+    const int saved_errno = errno;
+    const uint64_t t0 = cuda_now_ns();
+    if (cuda_pread_full(g_tier_fd, stage, read_size, aligned_off)) {
+        *payload = (const char *)stage + delta;
+        errno = saved_errno;
+        g_tier_hits++;
+        g_tier_ns += cuda_now_ns() - t0;
+        g_tier_rd_bytes += read_size;
+        return 1;
+    }
+    errno = saved_errno;
+    return 0;
+}
+
+/* Same contract as cuda_tier_stage_read(): 1 and *payload set on success, 0 to
+ * fall through to the model file. RDMA needs no O_DIRECT alignment dance -- the
+ * span lands exactly where it was asked for -- so the payload is the staging
+ * buffer itself. Shares the tier counters so DS4_FETCH_STATS attribution works
+ * unchanged; only one tier is ever active at a time. */
+static int cuda_rdma_tier_stage_read(void *stage, uint64_t stage_bytes,
+                                     uint64_t offset, uint64_t bytes,
+                                     const char **payload) {
+    const uint64_t covered = ds4_rdma_tier_bytes();
+    if (covered == 0) return 0;
+    if (bytes > covered || offset > covered - bytes || bytes > stage_bytes) return 0;
+    const int saved_errno = errno;
+    const uint64_t t0 = cuda_now_ns();
+    if (!ds4_rdma_tier_read(stage, offset, bytes)) { errno = saved_errno; return 0; }
+    errno = saved_errno;
     *payload = (const char *)stage;
+    const uint64_t dt = cuda_now_ns() - t0;
+    const int ph = g_fetch_phase ? 1 : 0;
+    __sync_fetch_and_add(&g_tier_hits, 1);
+    __sync_fetch_and_add(&g_tier_ns, dt);
+    __sync_fetch_and_add(&g_tier_rd_bytes, bytes);
+    __sync_fetch_and_add(&g_ph_tier_ns[ph], dt);
+    __sync_fetch_and_add(&g_ph_tier_bytes[ph], bytes);
+    __sync_fetch_and_add(&g_ph_tier_reads[ph], 1);
+    if (g_hist_bucket_bytes) {
+        uint64_t b = offset / g_hist_bucket_bytes;
+        if (b >= CUDA_MISS_HIST_BUCKETS) b = CUDA_MISS_HIST_BUCKETS - 1;
+        __sync_fetch_and_add(&g_ph_hit_hist[ph][b], bytes);
+    }
+    return 1;
+}
+
+/* Set when a span was served by local disk rather than a tier, so the wrapper
+ * below knows what is worth offering to the remote tier for next time. */
+static __thread int g_stage_from_disk;
+
+static int cuda_model_stage_read_impl(void *stage, uint64_t stage_bytes,
+                                      uint64_t offset, uint64_t bytes,
+                                      const char **payload) {
+    g_stage_from_disk = 0;
+    if (!g_hist_bucket_bytes && g_model_file_size)
+        g_hist_bucket_bytes = g_model_file_size / CUDA_MISS_HIST_BUCKETS + 1;
+    *payload = (const char *)stage;
+    cuda_read_hist_note(offset, bytes);
+    if (cuda_tier_stage_read(stage, stage_bytes, offset, bytes, payload)) return 1;
+    if (cuda_rdma_tier_stage_read(stage, stage_bytes, offset, bytes, payload)) return 1;
+    if (g_tier_fd >= 0 || ds4_rdma_tier_bytes() != 0)
+        __sync_fetch_and_add(&g_tier_misses, 1);
+    g_stage_from_disk = 1;
+    const uint64_t disk_t0 = cuda_now_ns();
+    const int disk_ph = g_fetch_phase ? 1 : 0;
+    struct cuda_disk_timer {                 /* charge the local path on every exit */
+        uint64_t t0; uint64_t bytes; int ph; uint64_t off;
+        ~cuda_disk_timer() {
+            const uint64_t d = cuda_now_ns() - t0;
+            g_disk_ns += d; g_disk_rd_bytes += bytes;
+            if (g_hist_bucket_bytes) {
+                uint64_t b = off / g_hist_bucket_bytes;
+                if (b >= CUDA_MISS_HIST_BUCKETS) b = CUDA_MISS_HIST_BUCKETS - 1;
+                __sync_fetch_and_add(&g_ph_miss_hist[ph][b], bytes);
+            }
+            __sync_fetch_and_add(&g_ph_disk_ns[ph], d);
+            __sync_fetch_and_add(&g_ph_disk_bytes[ph], bytes);
+            __sync_fetch_and_add(&g_ph_disk_reads[ph], 1);
+        }
+    } disk_timer{disk_t0, bytes, disk_ph, offset};
 #if defined(__linux__) && defined(O_DIRECT)
     if (g_model_direct_fd >= 0 && g_model_direct_align > 1 && g_model_file_size != 0) {
         const uint64_t aligned_off = cuda_round_down(offset, g_model_direct_align);
@@ -2281,6 +2484,18 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     (void)stage_bytes;
 #endif
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
+}
+
+/* T4: a span that local disk just served is a candidate for the peer's RAM.
+ * Promotion is asynchronous and advisory -- it never changes what this call
+ * returns, and costs nothing when promotion is off. */
+static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
+                                 uint64_t offset, uint64_t bytes,
+                                 const char **payload) {
+    const int ok = cuda_model_stage_read_impl(stage, stage_bytes, offset, bytes, payload);
+    if (ok && g_stage_from_disk && *payload)
+        ds4_rdma_tier_promote(*payload, offset, bytes);
+    return ok;
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -4547,6 +4762,224 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
     return 0;
 }
 
+/* DS4_EXPERT_TIER=<path> mirrors the model's leading bytes on a faster device.
+ * DS4_EXPERT_TIER_BYTES caps how much of it to trust (default: the whole
+ * device/file). The mirror must be byte-identical to the model over that range;
+ * it is read instead of the model file, not validated against it. */
+static void cuda_expert_tier_open(void) {
+    if (g_tier_fd >= 0) { (void)close(g_tier_fd); g_tier_fd = -1; }
+    g_tier_align = 1;
+    g_tier_bytes = 0;
+    const char *path = getenv("DS4_EXPERT_TIER");
+    if (!path || !path[0]) return;
+    int flags = O_RDONLY;
+#if defined(__linux__) && defined(O_DIRECT)
+    if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) flags |= O_DIRECT;
+#endif
+    int fd = open(path, flags);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: expert tier '%s' unavailable: %s\n", path, strerror(errno));
+        return;
+    }
+    uint64_t span = 0;
+    struct stat st;
+    if (fstat(fd, &st) == 0) {
+        if (S_ISREG(st.st_mode) && st.st_size > 0) span = (uint64_t)st.st_size;
+        if (st.st_blksize > 1) g_tier_align = (uint64_t)st.st_blksize;
+    }
+    if (span == 0) {                      /* block device: ask the device */
+        const off_t end = lseek(fd, 0, SEEK_END);
+        if (end > 0) span = (uint64_t)end;
+        (void)lseek(fd, 0, SEEK_SET);
+    }
+#if defined(__linux__) && defined(O_DIRECT)
+    if ((flags & O_DIRECT) && g_tier_align < 512) g_tier_align = 512;
+#endif
+    const char *cap = getenv("DS4_EXPERT_TIER_BYTES");
+    if (cap && cap[0]) {
+        const unsigned long long want = strtoull(cap, NULL, 10);
+        if (want != 0 && want < span) span = (uint64_t)want;
+    }
+    if (g_model_file_size != 0 && span > g_model_file_size) span = g_model_file_size;
+    if (span == 0) { (void)close(fd); return; }
+
+    /* VERIFY the mirror against the model before trusting it. A tier that is
+     * stale, short, or offset would silently feed garbage weights -- output
+     * would be wrong rather than slow, which is far worse. Sample several
+     * offsets across the covered range including the last block, since a
+     * too-large DS4_EXPERT_TIER_BYTES is the likeliest mistake and shows up
+     * only at the end. */
+    if (g_model_fd >= 0) {
+        const uint64_t blk = 4096;
+        const uint64_t last = span > blk ? cuda_round_down(span - blk, blk) : 0;
+        const uint64_t probes[] = { 0, cuda_round_down(span / 4, blk),
+                                    cuda_round_down(span / 2, blk),
+                                    cuda_round_down((span / 4) * 3, blk), last };
+        void *ta = NULL, *mb = NULL;
+        int ok = (posix_memalign(&ta, blk, blk) == 0) &&
+                 (posix_memalign(&mb, blk, blk) == 0);
+        for (size_t i = 0; ok && i < sizeof(probes) / sizeof(probes[0]); i++) {
+            const uint64_t off = probes[i];
+            if (off + blk > span) continue;
+            if (!cuda_pread_full(fd, ta, blk, off) ||
+                !cuda_pread_full(g_model_fd, mb, blk, off) ||
+                memcmp(ta, mb, (size_t)blk) != 0) {
+                fprintf(stderr,
+                        "ds4: expert tier '%s' does NOT match the model at offset %llu"
+                        " -- disabling it (check DS4_EXPERT_TIER_BYTES)\n",
+                        path, (unsigned long long)off);
+                ok = 0;
+            }
+        }
+        free(ta); free(mb);
+        if (!ok) { (void)close(fd); return; }
+    }
+
+    g_tier_fd = fd;
+    g_tier_bytes = span;
+    fprintf(stderr, "ds4: expert tier '%s' covering %.2f GiB of the model, verified (align=%llu)\n",
+            path, (double)span / 1073741824.0, (unsigned long long)g_tier_align);
+}
+
+extern "C" void ds4_gpu_expert_tier_report(void) {
+    {
+        uint64_t rr = 0, rb = 0, rn = 0;
+        ds4_rdma_tier_stats(&rr, &rb, &rn);
+        uint64_t pr = 0, ph = 0, pk = 0; uint32_t ps = 0;
+        ds4_rdma_tier_promote_stats(&pr, &ph, &pk, &ps);
+        const uint64_t pc = ds4_rdma_tier_promote_corrupt();
+        uint64_t po = 0, pj = 0;
+        ds4_rdma_tier_promote_offered(&po, &pj);
+        if (po && !pr)
+            fprintf(stderr,
+                "ds4: rdma promotion: %llu spans offered, %llu rejected by admission, "
+                "NONE promoted -- lower DS4_EXPERT_TIER_RDMA_MIN_SEEN or raise "
+                "DS4_EXPERT_TIER_RDMA_SEEN_CAP\n",
+                (unsigned long long)po, (unsigned long long)pj);
+        if (pr || ph || pk)
+            fprintf(stderr,
+                "ds4: rdma promotion: %llu spans promoted into %u slots, %llu slot hits, "
+                "%llu skipped, %llu failed read-back\n",
+                (unsigned long long)pr, ps, (unsigned long long)ph,
+                (unsigned long long)pk, (unsigned long long)pc);
+        if (rr) fprintf(stderr,
+                "ds4: rdma tier: %llu spans / %.2f GiB / %.2f s (%.2f GB/s, %.1f us/span)\n",
+                (unsigned long long)rr, (double)rb / 1073741824.0, (double)rn / 1e9,
+                rn ? (double)rb / (double)rn : 0.0,
+                rr ? (double)rn / 1e3 / (double)rr : 0.0);
+    }
+    if (g_tier_fd >= 0 || g_disk_rd_bytes != 0 || ds4_rdma_tier_bytes() != 0) {
+        const uint64_t total = g_tier_hits + g_tier_misses;
+        const double tg = (double)g_tier_rd_bytes / 1073741824.0;
+        const double dg = (double)g_disk_rd_bytes / 1073741824.0;
+        const double ts = (double)g_tier_ns / 1e9, ds = (double)g_disk_ns / 1e9;
+        fprintf(stderr,
+                "ds4: backing-store split: tier %llu reads / %.2f GiB / %.2f s"
+                " (%.2f GB/s) | disk %llu reads / %.2f GiB / %.2f s (%.2f GB/s)\n",
+                (unsigned long long)g_tier_hits, tg, ts,
+                ts > 0 ? tg * 1.073741824 / ts : 0.0,
+                (unsigned long long)g_tier_misses, dg, ds,
+                ds > 0 ? dg * 1.073741824 / ds : 0.0);
+        if (ts + ds > 0) {
+            fprintf(stderr,
+                    "ds4: backing-store time attribution: tier %.1f%% of bytes,"
+                    " %.1f%% of read time; disk %.1f%% of bytes, %.1f%% of read time\n",
+                    tg + dg > 0 ? 100.0 * tg / (tg + dg) : 0.0,
+                    100.0 * ts / (ts + ds),
+                    tg + dg > 0 ? 100.0 * dg / (tg + dg) : 0.0,
+                    100.0 * ds / (ts + ds));
+        }
+        (void)total;
+    }
+    for (int ph = 1; ph >= 0; ph--) {
+        const uint64_t tb = g_ph_tier_bytes[ph], db = g_ph_disk_bytes[ph];
+        const uint64_t tn = g_ph_tier_ns[ph], dn = g_ph_disk_ns[ph];
+        if (!tb && !db) continue;
+        fprintf(stderr,
+            "ds4: %s: tier %llu reads / %.2f GiB / %.2f s (%.2f GB/s) | "
+            "disk %llu reads / %.2f GiB / %.2f s (%.2f GB/s) | tier %.1f%% of bytes, "
+            "%.1f%% of read time\n",
+            ph ? "PREFILL" : "DECODE ",
+            (unsigned long long)g_ph_tier_reads[ph], (double)tb / 1073741824.0,
+            (double)tn / 1e9, tn ? (double)tb / (double)tn : 0.0,
+            (unsigned long long)g_ph_disk_reads[ph], (double)db / 1073741824.0,
+            (double)dn / 1e9, dn ? (double)db / (double)dn : 0.0,
+            (tb + db) ? 100.0 * (double)tb / (double)(tb + db) : 0.0,
+            (tn + dn) ? 100.0 * (double)tn / (double)(tn + dn) : 0.0);
+    }
+    if (g_evict_covered || g_evict_uncovered) {
+        const uint64_t t = g_evict_covered + g_evict_uncovered;
+        fprintf(stderr,
+            "ds4: complement cache: evicted %llu covered / %llu uncovered (%.1f%% covered)"
+            " -- higher is the policy working, it keeps what the peer cannot serve\n",
+            (unsigned long long)g_evict_covered, (unsigned long long)g_evict_uncovered,
+            t ? 100.0 * (double)g_evict_covered / (double)t : 0.0);
+    }
+    if (g_hist_bucket_bytes) {
+        const double gib_per = (double)g_hist_bucket_bytes / 1073741824.0;
+        for (int ph = 1; ph >= 0; ph--) {
+            uint64_t miss_tot = 0, hit_tot = 0;
+            for (int i = 0; i < CUDA_MISS_HIST_BUCKETS; i++) {
+                miss_tot += g_ph_miss_hist[ph][i]; hit_tot += g_ph_hit_hist[ph][i];
+            }
+            if (!miss_tot && !hit_tot) continue;
+            fprintf(stderr, "ds4: %s read placement (%d buckets x %.1f GiB) "
+                            "-- 'miss' is what the tier did not cover:\n",
+                    ph ? "PREFILL" : "DECODE", CUDA_MISS_HIST_BUCKETS, gib_per);
+            for (int i = 0; i < CUDA_MISS_HIST_BUCKETS; i++) {
+                const uint64_t m = g_ph_miss_hist[ph][i], h = g_ph_hit_hist[ph][i];
+                if (!m && !h) continue;
+                const double mp = miss_tot ? 100.0 * (double)m / (double)miss_tot : 0.0;
+                char bar[33]; int n = (int)(mp * 32.0 / 100.0 + 0.5);
+                if (n > 32) n = 32;
+                memset(bar, '#', (size_t)n); bar[n] = '\0';
+                fprintf(stderr, "   [%6.1f GiB] hit %7.2f GiB  miss %7.2f GiB (%5.1f%% of misses) %s\n",
+                        i * gib_per, (double)h / 1073741824.0,
+                        (double)m / 1073741824.0, mp, bar);
+            }
+        }
+    }
+    if (g_fetch_calls_total) {
+        fprintf(stderr,
+                "ds4: fetch depth (achievable = min(spans, threads)) over %llu calls,"
+                " mean spans/call %.1f:\n",
+                (unsigned long long)g_fetch_calls_total,
+                (double)g_fetch_jobs_total / (double)g_fetch_calls_total);
+        for (int i = 0; i < CUDA_FETCH_DEPTH_BUCKETS; i++) {
+            if (!g_fetch_depth_hist[i]) continue;
+            const double pct =
+                100.0 * (double)g_fetch_depth_hist[i] / (double)g_fetch_calls_total;
+            char bar[41]; int n = (int)(pct * 40.0 / 100.0 + 0.5);
+            if (n > 40) n = 40;
+            memset(bar, '#', (size_t)n); bar[n] = '\0';
+            fprintf(stderr, "   depth %2d%s %6.2f%% (%llu) %s\n",
+                    i, i == CUDA_FETCH_DEPTH_BUCKETS - 1 ? "+" : " ", pct,
+                    (unsigned long long)g_fetch_depth_hist[i], bar);
+        }
+    }
+    if (cuda_read_hist_enabled() && g_model_file_size != 0) {
+        uint64_t tot = 0;
+        for (int i = 0; i < CUDA_READ_HIST_BUCKETS; i++) tot += g_read_hist_bytes[i];
+        if (tot == 0) return;
+        const double gib_per_bucket =
+            (double)g_model_file_size / CUDA_READ_HIST_BUCKETS / 1073741824.0;
+        fprintf(stderr,
+                "ds4: fetch offset histogram (%d buckets x %.1f GiB, total %.1f GiB)\n",
+                CUDA_READ_HIST_BUCKETS, gib_per_bucket, (double)tot / 1073741824.0);
+        for (int i = 0; i < CUDA_READ_HIST_BUCKETS; i++) {
+            if (g_read_hist_bytes[i] == 0) continue;
+            const double pct = 100.0 * (double)g_read_hist_bytes[i] / (double)tot;
+            char bar[41];
+            int n = (int)(pct * 40.0 / 100.0 + 0.5);
+            if (n > 40) n = 40;
+            memset(bar, '#', (size_t)n); bar[n] = '\0';
+            fprintf(stderr, "  [%5.1f-%5.1f GiB] %6.2f%% %8.2f GiB %s\n",
+                    i * gib_per_bucket, (i + 1) * gib_per_bucket, pct,
+                    (double)g_read_hist_bytes[i] / 1073741824.0, bar);
+        }
+    }
+}
+
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
@@ -4579,6 +5012,17 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
             }
         }
 #endif
+    }
+    cuda_expert_tier_open();
+    /* Remote-RAM tier over RDMA (DS4_EXPERT_TIER_RDMA). Off unless set, and
+     * it verifies itself against this same fd before serving a single byte. */
+    (void)ds4_rdma_tier_open(g_model_fd, g_model_file_size);
+    /* Register the stats dump here too. The parallel-fetch path registers it
+     * as well, but only when that path actually runs -- at the default thread
+     * count it may not, and then DS4_FETCH_STATS silently reports nothing. */
+    if (getenv("DS4_FETCH_STATS") != NULL) {
+        static int reg = 0;
+        if (!reg) { reg = 1; atexit(ds4_gpu_expert_tier_report); }
     }
     return 1;
 }
@@ -27278,7 +27722,16 @@ struct cuda_expert_fetch_job {
     uint64_t bytes;
 };
 
-#define CUDA_EXPERT_FETCH_MAX_THREADS 8u
+/* Raised 8 -> 32 to reach the queue depths where a remote-RAM tier actually
+ * pays. Local NVMe is flat with depth (~6-8 GB/s at 1..32 streams) but remote
+ * RAM over dual-NIC NVMe-oF scales 6.41 -> 12.50 -> 20.05 -> 22.23 GB/s at
+ * depth 4/8/16/32, so the old cap of 8 left the whole 16-32 region -- and most
+ * of the fabric -- unreachable. COST: this sizes the static pinned staging
+ * arrays below, ~max_span + 2*align per thread (~19 MiB for Q4 experts), so 32
+ * threads pins ~600 MiB that the expert cache cannot use. Only worth spending
+ * when a faster-with-depth backing store is present; on local-only storage the
+ * measured knee is still 4 (1->4 = +20% decode, 4->8 = -2%). */
+#define CUDA_EXPERT_FETCH_MAX_THREADS 32u
 
 static uint32_t cuda_expert_fetch_threads(void) {
     static int n = -1;
@@ -27345,6 +27798,21 @@ static int cuda_expert_fetch_parallel(const cuda_expert_fetch_job *jobs, size_t 
                                       const void *model_map, uint64_t model_size) {
     if (!n_jobs) return 1;
     if (threads > CUDA_EXPERT_FETCH_MAX_THREADS) threads = CUDA_EXPERT_FETCH_MAX_THREADS;
+    {   /* Record the ACHIEVABLE depth: min(spans available, threads allowed).
+         * A raised thread cap does nothing if batches never carry that many
+         * spans, and that is invisible from throughput alone. */
+        static int reg = -1;
+        if (reg < 0) {
+            reg = getenv("DS4_FETCH_STATS") != NULL;
+            if (reg) atexit(ds4_gpu_expert_tier_report);
+        }
+        const size_t eff = n_jobs < (size_t)threads ? n_jobs : (size_t)threads;
+        const size_t b = eff < CUDA_FETCH_DEPTH_BUCKETS ?
+                         eff : CUDA_FETCH_DEPTH_BUCKETS - 1;
+        g_fetch_depth_hist[b]++;
+        g_fetch_jobs_total += n_jobs;
+        g_fetch_calls_total++;
+    }
     const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
     const uint64_t stage_bytes = max_span + 2u * align;
 
@@ -29125,6 +29593,13 @@ static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
         uint32_t slot_count) {
+    /* Same discriminator the expert-cache stats use: a batch wider than one
+     * decode step's expert budget is prompt processing. */
+    g_fetch_phase = slot_count > DS4_N_EXPERT_USED_MAX_DECODE ? 1 : 0;
+    if (cuda_expert_evict_tier_first()) {
+        const uint64_t r = ds4_rdma_tier_bytes();   /* once per call, not per slot */
+        g_tier_cover_bytes = r > g_tier_bytes ? r : g_tier_bytes;
+    }
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids || !slot_count)
@@ -29382,17 +29857,38 @@ static int cuda_stream_selected_cache_begin_load(
                 }
                 if (victim != UINT32_MAX) g_stream_expert_hand = (victim + 1u) % n;
             } else {
-                uint64_t oldest = stamp;
+                uint64_t oldest = stamp, oldest_cov = stamp;
+                uint32_t victim_cov = UINT32_MAX;
+                const uint64_t cover = g_tier_cover_bytes;
+                const uint64_t gb = table->gate_expert_bytes;
+                const uint64_t db = table->down_expert_bytes;
                 for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
-                    if (g_stream_expert_slots[j].used < oldest) {
-                        oldest = g_stream_expert_slots[j].used;
+                    const cuda_stream_expert_slot &c = g_stream_expert_slots[j];
+                    if (c.used < oldest) {
+                        oldest = c.used;
                         victim = j;
-                        if (!oldest) break;
+                        if (!oldest) break;          /* empty slot beats everything */
+                    }
+                    if (cover && c.used < oldest_cov &&
+                        cuda_slot_tier_covered(c, gb, db, cover)) {
+                        oldest_cov = c.used;
+                        victim_cov = j;
                     }
                 }
+                /* Prefer the oldest slot the peer can serve. Falls back to plain
+                 * LRU when nothing resident is covered, so this can only ever
+                 * change WHICH slot is taken, never whether one is found. */
+                if (cover && victim_cov != UINT32_MAX && oldest != 0) victim = victim_cov;
             }
             if (victim == UINT32_MAX) return 0;
             auto &slot = g_stream_expert_slots[victim];
+            if (slot.used && g_tier_cover_bytes) {
+                if (cuda_slot_tier_covered(slot, table->gate_expert_bytes,
+                                           table->down_expert_bytes, g_tier_cover_bytes))
+                    g_evict_covered++;
+                else
+                    g_evict_uncovered++;
+            }
             if (slot.used) {
                 g_stream_expert_by_gate.erase(slot.gate);
                 if (cuda_expert_cache_stats_enabled()) {
