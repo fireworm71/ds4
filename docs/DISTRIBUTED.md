@@ -101,8 +101,15 @@ See [speculation](SPECULATIVE_DECODING.md) and [serving](SERVER.md).
 
 V4.1 Flash Q2 text inference supports one GPU per rank, with a 50/50 expert
 split. Each Spark holds about 81 GiB of weights, plus context and runtime
-buffers. Engram tables stay on disk. Do not add `--ssd-streaming` or
-`--cuda-tensor-parallel`: those select different memory/execution modes.
+buffers. Engram tables stay on disk. Do not add `--cuda-tensor-parallel`: that
+selects a different execution mode (one GPU per rank on one machine).
+
+A quant too large to hold resident even when halved can add `--ssd-streaming`
+with `DS4_CUDA_TP_STREAMING=1` set on both ranks. Each rank then streams only
+the experts it owns, so the pair's expert cache covers twice what one machine
+can. Set it on both ranks or the session is refused. This trades throughput for
+capacity and is newer than the resident path; prefer resident shards whenever
+the model fits.
 
 Build the same commit with `make cuda-spark` on both machines and download
 `ds41f-q2` on both. RDMA needs the libibverbs development headers at build time,

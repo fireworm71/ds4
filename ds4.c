@@ -67259,7 +67259,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (void)ds4_gpu_build_derived_artifacts(e->model.map,
                                                   e->model.size,
                                                   opt->model_path);
-        } else if (e->backend == DS4_BACKEND_CUDA && tp_shard) {
+        } else if (e->backend == DS4_BACKEND_CUDA && tp_shard &&
+                   !e->ssd_streaming) {
+            /* Same rule as the branch above: a streamed rank holds no expert
+             * blob to repack, and building one would allocate exactly the
+             * residency the expert cache exists to avoid. */
             (void)ds4_gpu_build_derived_artifacts_shard(e->model.map,
                 e->model.size, e->model.file_size, opt->model_path, (uint32_t)tp_shard_rank);
         }

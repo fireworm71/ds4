@@ -24966,6 +24966,16 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+/* TP expert streaming opt-in. Network TP has always required resident
+ * expert shards; with this set each rank streams only the experts it owns
+ * (the owned dispatch has already filtered and rebased the ids, so the
+ * cache never sees the peer's half). Off by default until measured. */
+static int cuda_tp_streaming_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_CUDA_TP_STREAMING") != NULL;
+    return on;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -25028,10 +25038,26 @@ static int routed_moe_launch(
         fprintf(stderr, "ds4: dbg moe_launch support_map=%d stream_mode=%d owned=%d base=%p map=%p\n",
                 support_model_map, g_ssd_streaming_mode, owned_filtered,
                 g_support_host_base, model_map);
-    if (g_ssd_streaming_mode && !owned_filtered && !support_model_map) {
+    /* The owned (network TP) dispatch has already rewritten `selected` to
+     * rank-local ids with -1 for the peer's experts, and shifted the three
+     * offsets by the rank's expert base, so the table below keys on exactly
+     * this rank's half of the file. Single-GPU only: the cache refuses
+     * multi-GPU placement, and failing there would be a hard error where the
+     * resident path used to work. */
+    const int owned_streaming =
+        owned_filtered && cuda_tp_streaming_enabled() && g_n_gpus == 1;
+    if (g_ssd_streaming_mode && (!owned_filtered || owned_streaming) &&
+        !support_model_map) {
         const ds4_gpu_stream_expert_table table = {
             model_map, model_size, layer_index, n_total_expert,
             gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes};
+        /* The filter kernel that produced these ids runs on the decode
+         * stream, which is the shared-expert overlap stream while that is
+         * active -- and that one is non-blocking, so the device-to-host read
+         * below is not ordered after it on its own. */
+        if (owned_streaming &&
+            !cuda_ok(cudaStreamSynchronize(cuda_decode_stream()),
+                     "owned expert filter wait")) return 0;
         if ((uint64_t)n_tokens * n_expert > UINT32_MAX ||
             !ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                 &table, selected, n_tokens * n_expert)) return 0;
@@ -29634,7 +29660,16 @@ static int cuda_stream_selected_cache_begin_load(
         std::vector<int32_t> unique, remap(slot_count);
         for (uint32_t i = 0; i < slot_count; i++) {
             const int32_t expert = selected_ids[i];
-            if (expert < 0 || (uint32_t)expert >= table->n_total_expert) {
+            /* Under network TP the owned dispatch marks the peer's experts
+             * -1 with a zeroed route weight. Carry that marker through the
+             * remap untouched: the kernels downstream skip a negative id,
+             * and mapping it to a slot would sum a stranger's expert into
+             * this rank's partial. */
+            if (expert < 0) {
+                remap[i] = -1;
+                continue;
+            }
+            if ((uint32_t)expert >= table->n_total_expert) {
                 fprintf(stderr, "ds4: CUDA streaming expert id %d is outside 0..%u at layer %u\n",
                         expert, table->n_total_expert, table->layer);
                 return 0;
@@ -29990,7 +30025,7 @@ static int cuda_stream_selected_cache_begin_load(
         }
         g_stream_prefill_ids = remap;
         g_stream_prefill_slots = slots;
-        for (auto &id : remap) id = slots[id];
+        for (auto &id : remap) if (id >= 0) id = slots[id];
         if (!cuda_ok(cudaMemcpy(cache.slot_selected_ptr, remap.data(),
                 (size_t)slot_count * sizeof(int32_t), cudaMemcpyHostToDevice),
                 "stream selected-id remap copy")) return 0;

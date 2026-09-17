@@ -620,8 +620,19 @@ int ds4_tp_validate_engine_options(
         tp_set_err(err, errlen, "network tensor parallelism requires Metal or supported CUDA models");
         return 0;
     }
-    if (opt->backend == DS4_BACKEND_CUDA && (opt->cuda_tensor_parallel || opt->ssd_streaming)) {
-        tp_set_err(err, errlen, "network CUDA TP requires one GPU per rank and resident expert shards");
+    if (opt->backend == DS4_BACKEND_CUDA && opt->cuda_tensor_parallel) {
+        tp_set_err(err, errlen, "network CUDA TP requires one GPU per rank");
+        return 0;
+    }
+    /* Streaming and TP were mutually exclusive because the expert cache knew
+     * nothing about sharding. It still does not: the owned dispatch filters
+     * and rebases the ids before the cache sees them, so each rank streams
+     * only its own half. Opt-in until it has been measured on two boxes. */
+    if (opt->backend == DS4_BACKEND_CUDA && opt->ssd_streaming &&
+        getenv("DS4_CUDA_TP_STREAMING") == NULL) {
+        tp_set_err(err, errlen,
+                   "network CUDA TP requires resident expert shards; set "
+                   "DS4_CUDA_TP_STREAMING=1 to stream each rank's own experts");
         return 0;
     }
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
