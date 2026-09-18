@@ -133,3 +133,48 @@ Not settled, and not worth doing unless something changes:
 * Q2 resident. Read-ahead only exists under `--ssd-streaming`, so it cannot
   act there at all; per prep §26 that is the configuration Q2 should actually
   run in.
+
+## Separate finding: the campaign branch already fails `make test-cuda-ssd-cache`
+
+Found while verifying the conflict resolution, and **not caused by it**.
+
+| tree | `make test-cuda-ssd-cache` |
+|---|---|
+| vanilla `origin/main` @ 8db1d1d | **all PASS** |
+| campaign tip `q4tp2-stream` @ 3a297a9 | **FAILS** at `tests/test_cuda_ssd_cache.c:120` |
+| this branch (tip + resolved pick) | same failure, at `:189` after the line shift |
+
+The assertion is `CHECK(!ds4_gpu_stream_expert_cache_begin_selected_load(&table, invalid, 1))`
+with `invalid[] = {-1, ...}` -- it requires a negative expert id to be
+rejected. It is pre-existing: present in both `3a297a9` and `c2c3ce3^`, and
+`c2c3ce3` does not touch it. All three of upstream's *new* read-ahead tests
+pass on the resolved branch, which was the verification this was run for.
+
+Cause, precisely. `cuda_stream_selected_cache_begin_load` at `ds4_cuda.cu:29699`
+on the campaign branch:
+
+```c
+/* Under network TP the owned dispatch marks the peer's experts
+ * -1 with a zeroed route weight. Carry that marker through the
+ * remap untouched ... */
+if (expert < 0) {
+    remap[i] = -1;
+    continue;
+}
+```
+
+Vanilla instead errors on `expert < 0 || expert >= n_total_expert`. So the TP
+ownership work deliberately repurposed a negative id from "invalid" to "the
+peer owns this one", and that is right for TP -- but it retired a guard that
+single-box mode still wants, and left the test asserting the old contract.
+
+This is a contract decision, not an implementation slip, so it is left for the
+campaign owner rather than resolved here. Two defensible fixes:
+
+1. Gate the marker on TP actually being active, and keep rejecting `-1`
+   otherwise. Preserves the single-box guard; the test passes unchanged.
+2. Update the test to the new contract. Cheaper, but then nothing catches a
+   genuine `-1` from the router on a single box.
+
+Option 1 is the safer one: the whole reason the campaign lost a day to the
+sm_75 build was a failure mode that no guard caught.
