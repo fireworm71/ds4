@@ -3507,6 +3507,8 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
 
 static int cuda_expert_cache_stats_enabled(void);
 extern uint64_t g_xc_ns_d2h, g_xc_d2h_calls;
+extern uint64_t g_xc_ns_owned_wait, g_xc_owned_wait_calls;
+extern uint64_t g_xc_ns_glm_d2h, g_xc_glm_d2h_calls;
 
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
@@ -25067,9 +25069,16 @@ static int routed_moe_launch(
          * stream, which is the shared-expert overlap stream while that is
          * active -- and that one is non-blocking, so the device-to-host read
          * below is not ordered after it on its own. */
-        if (owned_streaming &&
-            !cuda_ok(cudaStreamSynchronize(cuda_decode_stream()),
-                     "owned expert filter wait")) return 0;
+        if (owned_streaming) {
+            const bool xc_time = cuda_expert_cache_stats_enabled();
+            const double t0 = xc_time ? cuda_wall_sec() : 0.0;
+            if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()),
+                         "owned expert filter wait")) return 0;
+            if (xc_time) {
+                g_xc_ns_owned_wait += (uint64_t)((cuda_wall_sec() - t0) * 1e9);
+                g_xc_owned_wait_calls++;
+            }
+        }
         if ((uint64_t)n_tokens * n_expert > UINT32_MAX ||
             !ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                 &table, selected, n_tokens * n_expert)) return 0;
@@ -27987,6 +27996,8 @@ static uint32_t g_xc_freq_layers, g_xc_freq_experts;
  * remaining cost so Tier 2 is aimed by measurement rather than by argument. */
 static uint64_t g_xc_ns_body, g_xc_ns_sync, g_xc_body_calls;
 uint64_t g_xc_ns_d2h, g_xc_d2h_calls;   /* drain #1: blocking D2H readback */
+uint64_t g_xc_ns_owned_wait, g_xc_owned_wait_calls;
+uint64_t g_xc_ns_glm_d2h, g_xc_glm_d2h_calls;
 /* Body time split by whether the call actually fetched: a pure-hit call is
  * the machinery cost with no I/O in it, which is the number that decides
  * whether the per-layer toll is overhead or simply cache misses. */
@@ -28025,6 +28036,18 @@ static void cuda_expert_cache_stats_report(void) {
                 "ds4:   tensor_read (D2H) timing: calls=%llu total=%.3f ms/call\n",
                 (unsigned long long)g_xc_d2h_calls,
                 (double)g_xc_ns_d2h / (double)g_xc_d2h_calls / 1e6);
+    }
+    if (g_xc_owned_wait_calls) {
+        fprintf(stderr,
+                "ds4:   owned filter wait (stream sync): calls=%llu total=%.3f ms/call\n",
+                (unsigned long long)g_xc_owned_wait_calls,
+                (double)g_xc_ns_owned_wait / (double)g_xc_owned_wait_calls / 1e6);
+    }
+    if (g_xc_glm_d2h_calls) {
+        fprintf(stderr,
+                "ds4:   GLM selected-id read (D2H): calls=%llu total=%.3f ms/call\n",
+                (unsigned long long)g_xc_glm_d2h_calls,
+                (double)g_xc_ns_glm_d2h / (double)g_xc_glm_d2h_calls / 1e6);
     }
     if (g_xc_hit_calls || g_xc_missy_calls) {
         fprintf(stderr,
@@ -35511,11 +35534,17 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
     } catch (...) {
         return 0;
     }
+    const bool xc_time = cuda_expert_cache_stats_enabled();
+    const double t0 = xc_time ? cuda_wall_sec() : 0.0;
     if (!cuda_ok(cudaMemcpy(ids.data(), selected->ptr,
                             (size_t)n_selected * sizeof(int32_t),
                             cudaMemcpyDeviceToHost),
                  "GLM streaming selected-id read")) {
         return 0;
+    }
+    if (xc_time) {
+        g_xc_ns_glm_d2h += (uint64_t)((cuda_wall_sec() - t0) * 1e9);
+        g_xc_glm_d2h_calls++;
     }
     return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected);
 }
