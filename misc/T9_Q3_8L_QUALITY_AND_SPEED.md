@@ -85,6 +85,43 @@ That also explains the whole series: Q2 at 88.00 is comfortable, the 6L splice
 at 99.05 squeaks through, 8L at 100.07 is the largest shard that fits, and 10L
 at 108.61 never had a chance. **8L is at the edge of what this pair can hold.**
 
+### Max Q4 layers per context, from the measured ceiling
+
+Shard cost is exactly **1.78 GiB per Q4 layer**: `shard(k) = 80.56 + 1.78k`,
+validated against every measured point (k=0 -> 80.56, k=6 -> 91.24,
+k=8 -> 94.80, k=10 -> 98.36). Adding the measured context term at the 4K
+prefill chunk gives `planned(k) = shard(k) + ctx_term`.
+
+Bracket after probing with the 8L at an intermediate context:
+
+| point | planned | result |
+|---|---|---|
+| 8L @ ctx 32768 | 99.86 | works |
+| **8L @ ctx 131072** | **100.72** | **works** (403.21 pp / 19.99 tg) |
+| 8L @ ctx 262144 | 101.86 | fails |
+
+So the ceiling sits between **100.72 (good)** and **101.86 (bad)** -- a 1.14 GiB
+window, narrower than one layer.
+
+Context terms measured at the 4K chunk: 32K -> 5.07, 128K -> 5.92,
+256K -> 7.05 GiB.
+
+**Max Q4 layers by context:**
+
+| ctx-alloc | max k | planned at max k | margin below 100.72 |
+|---|---|---|---|
+| 32768 | **10** | 99.63 | 1.09 |
+| 131072 | **9** | 98.44 | 2.28 |
+| **262144 (256K)** | **7** | **100.07** | **0.65** |
+
+At 256K, k=7 plans 100.07 GiB -- **0.65 GiB below a proven-good point** and
+1.79 GiB below the nearest known failure, so it has real margin. k=8 at 256K is
+the 101.86 that fails. **7 is the answer at 256K**; 8 layers is capped at 128K.
+
+Not yet built or run: a 7-layer splice. The figure is arithmetic from a model
+validated at four points plus a proven-good point above it, not a measurement.
+Confirming it costs a ~15 min splice and a ~19 min transfer.
+
 ### The failure mode is silent, and that is the dangerous part
 
 Past ~101 GiB the run passes admission, both ranks bind, and then the worker
