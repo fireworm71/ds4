@@ -3505,14 +3505,26 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     return ok;
 }
 
+static int cuda_expert_cache_stats_enabled(void);
+extern uint64_t g_xc_ns_d2h, g_xc_d2h_calls;
+
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
+    /* This blocking D2H is drain #1: the router's selected expert ids come
+     * back through here once per layer per token. Timed so the per-layer toll
+     * can be split against begin_load rather than argued about. */
+    const bool xc_time = cuda_expert_cache_stats_enabled();
+    const double t0 = xc_time ? cuda_wall_sec() : 0.0;
     WITH_DEVICE(g_gpu[d].device_id) {
         ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
                                 cudaMemcpyDeviceToHost),
                      "tensor read");
+    }
+    if (xc_time) {
+        g_xc_ns_d2h += (uint64_t)((cuda_wall_sec() - t0) * 1e9);
+        g_xc_d2h_calls++;
     }
     return ok;
 }
@@ -27969,6 +27981,17 @@ static uint32_t cuda_xrec_bucket(uint32_t gap, int never) {
 static uint32_t *g_xc_freq;          /* [layer][expert], decode selections */
 static uint32_t g_xc_freq_layers, g_xc_freq_experts;
 
+/* Phase timing for the per-layer expert path. prep 26/27 attribute the
+ * streaming penalty to a ~374 us per-layer-per-token host<->GPU round trip;
+ * T12 showed the begin_load stream sync is not it. These counters split the
+ * remaining cost so Tier 2 is aimed by measurement rather than by argument. */
+static uint64_t g_xc_ns_body, g_xc_ns_sync, g_xc_body_calls;
+uint64_t g_xc_ns_d2h, g_xc_d2h_calls;   /* drain #1: blocking D2H readback */
+/* Body time split by whether the call actually fetched: a pure-hit call is
+ * the machinery cost with no I/O in it, which is the number that decides
+ * whether the per-layer toll is overhead or simply cache misses. */
+static uint64_t g_xc_ns_hit, g_xc_hit_calls, g_xc_ns_missy, g_xc_missy_calls;
+
 static int cuda_expert_cache_stats_enabled(void) {
     static int on = -1;
     if (on < 0) on = getenv("DS4_CUDA_EXPERT_CACHE_STATS") != NULL;
@@ -27988,6 +28011,30 @@ static void cuda_expert_cache_stats_report(void) {
             (unsigned long long)g_xc_reads,
             g_xc_miss ? (double)g_xc_reads / (double)g_xc_miss : 0.0,
             (double)g_xc_bytes / 1073741824.0);
+    if (g_xc_body_calls) {
+        fprintf(stderr,
+                "ds4:   begin_load timing: calls=%llu body=%.3f ms/call "
+                "(sync %.3f ms/call, %.1f%% of body)\n",
+                (unsigned long long)g_xc_body_calls,
+                (double)g_xc_ns_body / (double)g_xc_body_calls / 1e6,
+                (double)g_xc_ns_sync / (double)g_xc_body_calls / 1e6,
+                g_xc_ns_body ? 100.0 * (double)g_xc_ns_sync / (double)g_xc_ns_body : 0.0);
+    }
+    if (g_xc_d2h_calls) {
+        fprintf(stderr,
+                "ds4:   tensor_read (D2H) timing: calls=%llu total=%.3f ms/call\n",
+                (unsigned long long)g_xc_d2h_calls,
+                (double)g_xc_ns_d2h / (double)g_xc_d2h_calls / 1e6);
+    }
+    if (g_xc_hit_calls || g_xc_missy_calls) {
+        fprintf(stderr,
+                "ds4:   begin_load split: pure-hit calls=%llu %.3f ms/call | "
+                "fetching calls=%llu %.3f ms/call\n",
+                (unsigned long long)g_xc_hit_calls,
+                g_xc_hit_calls ? (double)g_xc_ns_hit / (double)g_xc_hit_calls / 1e6 : 0.0,
+                (unsigned long long)g_xc_missy_calls,
+                g_xc_missy_calls ? (double)g_xc_ns_missy / (double)g_xc_missy_calls / 1e6 : 0.0);
+    }
     {
         uint64_t m = 0, h = 0;
         for (int i = 0; i < 6; i++) { m += g_xrec_gap[i]; h += g_xrec_hit_gap[i]; }
@@ -29669,11 +29716,27 @@ static int cuda_stream_selected_cache_begin_load(
      * cache sustains (99.3% at Q2, 96.2% at Q4) that is almost every call,
      * and the drain is the larger half of the ~374 us per layer per token
      * that separates streaming from resident. */
+    const bool xc_time = cuda_expert_cache_stats_enabled();
+    const double xc_body0 = xc_time ? cuda_wall_sec() : 0.0;
     if (!cuda_stream_selected_all_resident(table, selected_ids, slot_count) ||
         getenv("DS4_CUDA_STRICT_EXPERT_SYNC")) {
+        const double xc_s0 = xc_time ? cuda_wall_sec() : 0.0;
         if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "stream expert reuse wait"))
             return 0;
+        if (xc_time) g_xc_ns_sync += (uint64_t)((cuda_wall_sec() - xc_s0) * 1e9);
     }
+    struct xc_body_timer {
+        bool on; double t0; uint64_t miss0;
+        ~xc_body_timer() {
+            if (on) {
+                const uint64_t ns = (uint64_t)((cuda_wall_sec() - t0) * 1e9);
+                g_xc_ns_body += ns;
+                g_xc_body_calls++;
+                if (g_xc_miss == miss0) { g_xc_ns_hit += ns; g_xc_hit_calls++; }
+                else { g_xc_ns_missy += ns; g_xc_missy_calls++; }
+            }
+        }
+    } xc_body_guard{xc_time, xc_body0, g_xc_miss};
     /* Everything below this point until the mapping is published is the
      * foreground's window; the speculative reader parks for its duration so it
      * never competes with the demand fetch for disk bandwidth. Raised here,
