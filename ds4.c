@@ -66613,10 +66613,51 @@ static int ds4_engine_open_internal(ds4_engine **out,
      * immediately after binding so memory guards account only the bytes this
      * rank owns (replicated dense weights plus its expert shard). */
 #ifndef DS4_NO_GPU
+    const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
+    /* Lever 5: Resident fast path for fitting shards.
+     * When network TP is active and SSD streaming was requested, check whether
+     * this rank's whole expert shard fits the available memory budget. If it
+     * fits, promote to resident mode to bypass the streaming overhead entirely
+     * (recovering +48% decode throughput and CUDA Graphs). */
+    if (e->ssd_streaming && opt->tp.role != DS4_TP_NONE &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        (!gpu_cfg || gpu_cfg->n_gpus <= 1) && !opt->quality &&
+        getenv("DS4_FORCE_SSD_STREAMING") == NULL) {
+        ds4_model_map_span_vec test_spans;
+        if (weights_model_map_sharded_spans(&e->weights, &e->model,
+                                            tp_shard_rank, &test_spans)) {
+            const uint64_t shard_bytes = model_map_span_vec_total_bytes(&test_spans);
+            free(test_spans.v);
+            const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
+            const uint32_t sessions = e->placement_session_count_hint > 0 ?
+                (uint32_t)e->placement_session_count_hint : 1;
+            const uint64_t graph_bytes = ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions);
+            const uint64_t gib = UINT64_C(1073741824);
+            const uint64_t fixed = ds4_add_sat_u64(shard_bytes, ds4_add_sat_u64(graph_bytes, 2u * gib));
+            uint64_t host = glm_graph_host_memory_bytes();
+#ifdef __linux__
+            const long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
+            if (pages > 0 && page_size > 0 && (uint64_t)pages <= UINT64_MAX / (uint64_t)page_size)
+                host = (uint64_t)pages * (uint64_t)page_size;
+#endif
+            uint64_t budget = host / 8u * 7u;
+            const uint64_t recommended = ds4_gpu_recommended_working_set_size();
+            if (recommended && budget > recommended) budget = recommended;
+            if (fixed < budget) {
+                fprintf(stderr,
+                        "ds4: TP expert shard (rank %d, %.2f GiB) fits memory budget (%.2f GiB planned of %.2f GiB safe); "
+                        "promoting to resident mode\n",
+                        tp_shard_rank,
+                        ds4_bytes_to_gib(shard_bytes),
+                        ds4_bytes_to_gib(fixed),
+                        ds4_bytes_to_gib(budget));
+                e->ssd_streaming = false;
+            }
+        }
+    }
     const bool tp_shard =
         opt->tp.role != DS4_TP_NONE &&
         !e->ssd_streaming;
-    const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (tp_shard && (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 ||
         (gpu_cfg && gpu_cfg->n_gpus > 1) || opt->quality)) {
