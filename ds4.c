@@ -66620,17 +66620,30 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (tp_shard && (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 ||
         (gpu_cfg && gpu_cfg->n_gpus > 1) || opt->quality)) {
-        fprintf(stderr, "ds4: network CUDA TP currently requires V4.1 Q2, one GPU per rank, no quality mode\n");
+        fprintf(stderr, "ds4: network CUDA TP currently requires V4.1, one GPU per rank, no quality mode\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
     }
     if (tp_shard) {
+        /* Per layer, not per model: a mixed-quant splice (Q2 base with the
+         * last k layers' routed experts taken from a Q4 donor) is a valid
+         * resident TP shard. The ownership dispatch already carries Q4_K
+         * experts under TP in the streaming path, and both the sharded span
+         * builder and the owned MoE dispatch take expert sizes per layer, so
+         * nothing downstream assumes one global expert type. Each layer must
+         * still be internally uniform -- gate/up/down of one quant family. */
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (e->weights.layer[il].ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
-                e->weights.layer[il].ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
-                e->weights.layer[il].ffn_down_exps->type != DS4_TENSOR_Q2_K) {
-                fprintf(stderr, "ds4: network CUDA TP requires IQ2_XXS gate/up and Q2_K down experts\n");
+            const bool layer_q2 =
+                e->weights.layer[il].ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+                e->weights.layer[il].ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+                e->weights.layer[il].ffn_down_exps->type == DS4_TENSOR_Q2_K;
+            const bool layer_q4 =
+                e->weights.layer[il].ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+                e->weights.layer[il].ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+                e->weights.layer[il].ffn_down_exps->type == DS4_TENSOR_Q4_K;
+            if (!layer_q2 && !layer_q4) {
+                fprintf(stderr, "ds4: network CUDA TP requires IQ2_XXS/Q2_K or Q4_K routed experts (layer %u)\n", il);
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
