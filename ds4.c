@@ -40467,17 +40467,23 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l, uint32_t il, int token) {
-    if (g->tp_world != 2 || g->streaming || g->quality || g->imatrix ||
+    if (g->tp_world != 2 || g->quality || g->imatrix ||
         g->image_count || getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER") ||
         g_expert_profile.active || getenv("DS4_CUDA_MOE_PROFILE") ||
         metal_graph_debug_get_config()->prefix ||
         !ds4_gpu_decode_graphs_supported())
         return ds41_graph_layer(g, m, l, il, token);
-    return ds41_decode_island(g, m, l, il, 0) &&
+    const bool ok = ds41_decode_island(g, m, l, il, 0) &&
         ds41_attention(g, m, l, il, true) && ds41_decode_island(g, m, l, il, 2) &&
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-        ds41_bf16(g->block, DS4_N_EMBD) &&
-        ds41_decode_island(g, m, l, il, 1) &&
+        ds41_bf16(g->block, DS4_N_EMBD);
+    if (!ok) return false;
+    if (g->streaming) {
+        return ds41_graph_after_attention(g, m, l) &&
+            ds41_moe_partial(g, m, l, il, 0) &&
+            ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
+    }
+    return ds41_decode_island(g, m, l, il, 1) &&
         ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
 }
 #endif
