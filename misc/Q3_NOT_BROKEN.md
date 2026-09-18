@@ -54,6 +54,61 @@ does not fit") says resident TP2 is worth +29% pp and +33% tg over streaming
 the same shard. Against Q4 TP2 streaming (174.12 / 10.31) the reference point
 is Q2 TP2 resident at **412.87 / 21.94**.
 
+## 2b. Exact resident footprint, and how much quality the headroom buys
+
+Model weights per rank, routed experts split 50/50 (Engram excluded -- disk-only):
+
+| quant | routed/2 | non-routed | weights/rank | engine reports |
+|---|---|---|---|---|
+| Q2 | 71.19 | 8.78 | 79.98 | ~80.56 |
+| **Q3splice** | **81.87** | **8.78** | **90.65** | **~91.24** |
+| Q4 | 142.38 | 8.78 | 151.17 | ~151.75 (must stream) |
+
+The `engine reports` column adds the +0.58 GiB accounting delta calibrated
+against prep §26's measured Q2 figure of 80.56 GiB/rank.
+
+**Q3splice planned total per rank**, adding the static context buffers the run
+logs print:
+
+| ctx-alloc | model | context/buffers | planned | spare of 113.5 |
+|---|---|---|---|---|
+| 4096 | 91.24 | 1.77 | **93.01** | 20.5 |
+| 8192 | 91.24 | 3.29 | **94.53** | 19.0 |
+| **32768** | 91.24 | 7.81 | **99.05** | **14.5** |
+
+Budget against **MemAvailable 113.5 GiB** (prep §5), not the 121 GiB of total
+RAM, which is never all usable. The same model puts Q2 TP2 resident at
+88.37 GiB planned against the **88.38 GiB recorded in prep §26** -- a 0.01 GiB
+match, which is why these numbers are worth trusting before the run.
+
+### The splice has more headroom than it uses
+
+At ctx-alloc 32768, per rank, varying how many trailing layers take Q4
+experts. Disk verdict assumes the current 362.0 GiB splice is deleted first,
+giving 400.0 GiB to write into:
+
+| last k layers Q4 | planned/rank | memory | new file | disk |
+|---|---|---|---|---|
+| 0 (plain Q2) | 88.37 | fits | 340.6 | fits |
+| 4 | 95.49 | fits | 354.8 | fits |
+| **6** | **99.05** | **fits** | **361.9** | **on disk today** |
+| 8 | 102.61 | fits | 369.1 | fits |
+| 10 | 106.17 | fits | 376.2 | fits |
+| 12 | 109.73 | fits | 383.3 | fits |
+| 14 | 113.29 | tight (0.2 spare) | 390.4 | fits |
+| 16 | 116.85 | no | 397.5 | fits |
+| 18+ | 120.41+ | no | 404.7+ | no |
+
+Each layer promoted from Q2 to Q4 costs 3.56 GiB of file and 1.78 GiB per rank
+(Q2 experts are 3.56 GiB/layer, Q4 7.12 GiB/layer). So **the current six-layer
+splice leaves room for roughly twice as many Q4 layers** -- 12 fits with ~4 GiB
+spare, 14 is too tight to risk.
+
+That is a real quality lever, but it is second in line: measure the artifact
+that already exists before spending 400 GiB of disk and a re-splice on a
+bigger one. Note also that a re-splice is only possible by deleting the
+current file first, and that is not reversible without rebuilding it.
+
 ## 3. What Jason actually saw: ~81 GiB of expert cache reallocated twice per token
 
 Single box, `--ssd-streaming`, 2048-token prefill, 4 decode tokens. The expert
