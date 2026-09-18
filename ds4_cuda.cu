@@ -29615,6 +29615,34 @@ static void cuda_ppf_shutdown(void) {
     }
 }
 
+/* True when this call cannot take a slot: the cache is configured for this
+ * table and every selected expert is already resident. Negative ids are
+ * skipped -- under network TP they mark the peer's experts and are carried
+ * through the remap untouched rather than mapped to a slot. Mirrors the
+ * resize condition below, so a call that would reallocate the cache reports
+ * false and still takes the drain. */
+static bool cuda_stream_selected_all_resident(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *selected_ids,
+        uint32_t slot_count) {
+    const auto &cache = g_stream_selected_cache;
+    if (cache.model_map != table->model_map ||
+        cache.gate_expert_bytes != table->gate_expert_bytes ||
+        cache.down_expert_bytes != table->down_expert_bytes ||
+        g_stream_expert_slots.empty())
+        return false;
+    for (uint32_t i = 0; i < slot_count; i++) {
+        const int32_t expert = selected_ids[i];
+        if (expert < 0) continue;
+        if ((uint32_t)expert >= table->n_total_expert) return false;
+        const uint64_t gate = table->gate_offset +
+                              (uint64_t)expert * table->gate_expert_bytes;
+        if (g_stream_expert_by_gate.find(gate) == g_stream_expert_by_gate.end())
+            return false;
+    }
+    return true;
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -29634,8 +29662,18 @@ static int cuda_stream_selected_cache_begin_load(
         fprintf(stderr, "ds4: CUDA SSD streaming requires single-GPU placement\n");
         return 0;
     }
-    if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "stream expert reuse wait"))
-        return 0;
+    /* The reuse wait exists so the host never overwrites a slot a launched
+     * kernel is still reading. Only a miss takes a slot: on the all-resident
+     * path nothing is evicted and nothing is uploaded, so the drain has no
+     * work to guard. Test that first and skip it -- at the hit rates this
+     * cache sustains (99.3% at Q2, 96.2% at Q4) that is almost every call,
+     * and the drain is the larger half of the ~374 us per layer per token
+     * that separates streaming from resident. */
+    if (!cuda_stream_selected_all_resident(table, selected_ids, slot_count) ||
+        getenv("DS4_CUDA_STRICT_EXPERT_SYNC")) {
+        if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "stream expert reuse wait"))
+            return 0;
+    }
     /* Everything below this point until the mapping is published is the
      * foreground's window; the speculative reader parks for its duration so it
      * never competes with the demand fetch for disk bandwidth. Raised here,
