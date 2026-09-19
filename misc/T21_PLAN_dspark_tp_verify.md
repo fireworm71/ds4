@@ -210,3 +210,73 @@ not a formality.
   quantisations, different KV paths, different model variants, different box
   counts. Those numbers say speculation works on this hardware; they say
   nothing about our delta.
+
+---
+
+# PHASE 2 RESULT: the gate passes -- but `accept_rate` was the wrong metric
+
+Measured 2026-09-19, Q2 single box, SSD streaming, 16K prompt, 256 generated
+tokens, clean `q4v3` sidecar.
+
+| run | cycles for 256 tok | accept_rate | avg_accept | blocks drafted | miss_first |
+|---|---|---|---|---|---|
+| prose, scheduler on | 180 | 20.22% | 0.200 | 33 | 2 / 180 |
+| code, scheduler on | 222 | 10.87% | 0.045 | 21 | -- |
+| prose, `DS4_DSPARK_SCHEDULER=0` | **142** | 17.70% | 0.401 | 64 | 8 / 142 |
+
+## The metric that matters is tokens per target step, not accept_rate
+
+`accept_rate` is `accepted_draft / proposed`, so proposing 5 and accepting 2
+scores 40% while *doubling* throughput. It is the wrong gate. The number that
+determines speedup is how many tokens come out per target step:
+
+```
+scheduler on   256 tokens / 180 cycles = 1.42 tokens per target step
+scheduler off  256 tokens / 142 cycles = 1.80 tokens per target step
+```
+
+**1.80 tokens per target step is a 44% reduction in target work.** The earlier
+"18.75%, probably not worth it" read was an artifact of the metric, not of the
+drafter.
+
+## The drafter is not defective
+
+`miss_first = 2 / 180`: the drafter's first token matches the target's own
+argmax 99% of the time. That is not a broken drafter. The low `accept_rate`
+comes from later block positions, which is expected of a semi-autoregressive
+block draft and is exactly what confidence truncation is for.
+
+The code prompt scoring *worse* than prose (10.87% vs 20.22%) initially looked
+like an inverted result against vLLM's 78%-on-structured claim. With the
+scheduler in play it is not comparable: the code run drafted only 21 blocks in
+222 cycles because the backoff had latched. Content sensitivity should be
+re-measured with the scheduler off before drawing any conclusion.
+
+## The scheduler backoff is the largest single lever
+
+With the scheduler on, **113 of 180 cycles were skipped before drafting**. Its
+`many_no_draft` term (`no_draft * 2 >= cycles`) is self-reinforcing: skipped
+cycles count as no-draft, which keeps the condition true. Turning it off took
+cycles from 180 to 142 for the same 256 tokens.
+
+This is tuning, not redesign, and it is worth doing on its own -- it costs
+nothing and applies to single-box decode today.
+
+## Revised economics for TP2
+
+Decode at Q2 TP2 resident is weight-bandwidth-bound: 46.7 ms/token against a
+prefill rate of 422 tok/s. A 5-row verify batch reads the same weights once, so
+it should cost close to a single decode rather than five. Taking verify ~= one
+decode and propose at the measured 5.4 ms/cycle:
+
+```
+baseline     256 tokens * 46.7 ms                  = 11,955 ms
+speculative  142 cycles * (46.7 + 5.4) ms          =  7,398 ms   -> ~1.6x
+```
+
+Break-even is a verify batch costing under ~1.7x a single-token decode. That is
+a low bar for a batched path that already exists.
+
+**Verdict: proceed to Phase 3.** The residual risk is concentrated in one
+measurable quantity -- the cost of a 5-row verify batch under TP2 -- and not in
+whether the drafter works.
