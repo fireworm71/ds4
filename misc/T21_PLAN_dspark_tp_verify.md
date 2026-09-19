@@ -761,3 +761,80 @@ Then re-run, in order:
 If step 1 comes back clean, the Phase 6 `compressed[]`/`index_cache[]` snapshot
 gap becomes the next blocker, and it is real: it corrupts every partial accept
 regardless of this fix.
+
+---
+
+# PHASE 10: correction -- it is the sweep append itself, and the probe is proven
+
+Phase 9 blamed the `vc` row-by-row pool2 indexing. **That was wrong**, and two
+direct experiments disprove it.
+
+## The probe is sound
+
+`DS4_DS41_VERIFY_STATE_DIFF=2` runs the **decode** path a second time instead
+of the verify, so a correct probe must report nothing:
+
+```
+state-diff token=16 pos0=58 decode_pos=59 verify_pos=59 ok=1
+state-diff arrays_differing=0 of 56
+```
+
+Zero. The save/restore covers everything that matters, so the 35-array diff is
+a real result and not an artifact of the harness.
+
+## Three eliminations, each a single switch
+
+| experiment | switch | result |
+|---|---|---|
+| fix the pool2 output indexing (pair offset, NULL when no pair) | -- | **unchanged**, byte for byte |
+| force the batched pool2 even with `vc` armed | `DS4_DS41_VERIFY_BATCHED_POOL=1` | **unchanged** |
+| plain sweep: `vc` withheld, head skipped | `DS4_DS41_VERIFY_PLAIN_SWEEP=1` | **unchanged** |
+
+The last one is decisive. With `vc` never passed to the sweep and the output
+head skipped, `ds41_graph_verify_rows` is doing nothing but an ordinary
+one-row prefill append -- and it still diverges from a decode append in exactly
+the same 35 arrays, with exactly the same values.
+
+**So the verify context, the row-by-row pooling and the output head are all
+exonerated. The divergence is in the sweep append itself.**
+
+## Restating the finding without the wrong parts
+
+> A one-row `ds41_graph_prefill_sweep` append onto decode-built state does not
+> reproduce a `ds41_graph_step` append. Layers 0-8 agree exactly; `window[9]`
+> onward differ by about one quantisation step, along with
+> `previous_kv[2]`/`previous_score[2]` and `compressed[3]`/`index_cache[3]`.
+
+This has nothing to do with DSpark. DSpark is merely the only caller that
+appends this way, which is why it is the only thing that breaks.
+
+## Why `--decode-consistency` still shows zero
+
+It builds two *whole prefixes*, each internally by its own method, and compares
+final logits: prefill-all versus prefill-part-then-decode-rest. Both are
+self-consistent and they agree bit-exactly. It never appends through one path
+onto state the other built, which is the only configuration that fails. The
+earlier inference that this proved "sweep-append == decode-append" was reading
+more into it than it measures.
+
+## The pool2 indexing fix is kept, on its own merits
+
+It is retained but must not be credited with fixing anything here. It is
+justified independently by `tests/test_deepseek41_metal.c`, which indexes the
+pooled output by pair and passes NULL when a chunk completes none, while the
+`vc` branch indexed by row and always passed a live view. That is a latent
+defect for multi-row blocks at odd start positions even though it is inert for
+the one-row even-position case measured above.
+
+## Next
+
+The harness is now the asset: a validated one-token differential with three
+bisect switches. The remaining question is narrow and DSpark-free -- *why does
+a one-row sweep append differ from a decode append onto the same state?* -- and
+it can be driven entirely from `DS4_DS41_VERIFY_STATE_DIFF` without a drafter,
+a sidecar or a second box.
+
+Layers 0-8 agreeing is the strongest clue left. Layer 8 is a `ds41_kv_source`
+and the first consumer of owner 1's caches is layer 9, so the next bisect
+should probe what layer 8 writes and layer 9 reads, rather than the append
+machinery that has now been cleared three times over.

@@ -40405,26 +40405,38 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
         if (!ds41_project_rows(b->pool_kv, m, l->attn_compressor_kv, b->norm, count, false) ||
             !ds41_project_rows(b->pool_score, m, l->attn_compressor_gate, b->norm, count, false))
             return false;
-        if (vc) {
+        if (vc && getenv("DS4_DS41_VERIFY_BATCHED_POOL") == NULL) {
             /* Verify pass: pool row by row instead of in one batched call. The
              * ratio-2 carry is threaded position to position, and a partial
              * commit has to restore previous_kv/previous_score to the value
              * that stood after the last ACCEPTED row; the batched pool only
              * leaves the value after the last row of all. */
             for (uint32_t r = 0; r < count; r++) {
-                ds4_gpu_tensor *lat = ds4_gpu_tensor_view(b->latent,
-                    (uint64_t)r * DS4_N_HEAD_DIM * sizeof(float),
-                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                /* A row completes a pair only at an odd absolute position, and
+                 * the pair it completes belongs at the output row for its PAIR
+                 * index, not for r. Indexing the output by r instead wrote the
+                 * carry to the wrong place and left this branch computing
+                 * something the batched call never would -- which is the whole
+                 * divergence between a verify-appended token and a
+                 * decode-appended one. tests/test_deepseek41_metal.c already
+                 * pins the correct shape: pairs = (n + (start & 1)) / 2, output
+                 * viewed at the pair offset, and NULL when a chunk completes
+                 * none. */
+                const uint32_t rstart = start + r;
+                const uint32_t pairs = (1u + (rstart & 1u)) / 2u;
+                ds4_gpu_tensor *lat = pairs ? ds4_gpu_tensor_view(b->latent,
+                    (uint64_t)(rstart / 2u - first) * DS4_N_HEAD_DIM * sizeof(float),
+                    (uint64_t)pairs * DS4_N_HEAD_DIM * sizeof(float)) : NULL;
                 ds4_gpu_tensor *pk = ds4_gpu_tensor_view(b->pool_kv,
                     (uint64_t)r * DS4_N_HEAD_DIM * sizeof(float),
                     (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
                 ds4_gpu_tensor *ps = ds4_gpu_tensor_view(b->pool_score,
                     (uint64_t)r * DS4_N_HEAD_DIM * sizeof(float),
                     (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-                bool rok = lat && pk && ps &&
+                bool rok = (!pairs || lat) && pk && ps &&
                     ds4_gpu_dsv41_pool2(lat, pk, ps, g->previous_kv[owner],
                                         g->previous_score[owner], DS4_N_HEAD_DIM,
-                                        1u, start + r) &&
+                                        1u, rstart) &&
                     ds41_verify_save_prev(vc, g, owner, r);
                 ds4_gpu_tensor_free(ps);
                 ds4_gpu_tensor_free(pk);
@@ -41640,10 +41652,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
         if (!hok) return false;
         vc->history[r] = hist;
     }
+    /* DS4_DS41_VERIFY_PLAIN_SWEEP=1: run the sweep exactly as an ordinary
+     * prefill append would -- vc withheld, head skipped -- so the differential
+     * probe can tell whether ds41_graph_verify_rows diverges from decode
+     * because of the sweep itself or because of what this function adds
+     * around it. Diagnostic: the row logits are left unfilled. */
+    const bool plain_sweep = getenv("DS4_DS41_VERIFY_PLAIN_SWEEP") != NULL;
     if (!ds41_graph_prefill_sweep(g, m, w, tokens, count, NULL, NULL, 0,
-                                  NULL, NULL, false, false, vc)) {
+                                  NULL, NULL, false, false,
+                                  plain_sweep ? NULL : vc)) {
         return false;
     }
+    if (plain_sweep) return true;
     /* Per-row logits: the V4.1 head is already row-parameterized, so the only
      * difference from the single-token path is the row count. */
     ds41_prefill_row *b = &g->batch;
@@ -75073,11 +75093,22 @@ static void ds41_verify_state_diff(ds4_session *s, int token) {
 
     if (ok) { g->history = h0; g->pos = pos0; ok = ds41_diff_restore(sl, n); }
 
-    if (ok) ok = ds41_verify_alloc(&vc, 1u);
-    if (ok) {
-        ok = ds41_graph_verify_rows(g, &e->model, &e->weights, &token, 1u, &vc) &&
-             ds41_verify_commit(g, &vc, 1u) &&
+    /* DS4_DS41_VERIFY_STATE_DIFF=2 runs the DECODE path a second time instead
+     * of the verify. A sound probe must then report zero differing arrays; if
+     * it does not, the restore above is incomplete and any diff this probe
+     * reports is its own artifact rather than a finding. */
+    const char *mode = getenv("DS4_DS41_VERIFY_STATE_DIFF");
+    const bool self_check = mode && mode[0] == '2';
+    if (ok && self_check) {
+        ok = ds41_graph_step(g, &e->model, &e->weights, token, logits) &&
              ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 2);
+    } else {
+        if (ok) ok = ds41_verify_alloc(&vc, 1u);
+        if (ok) {
+            ok = ds41_graph_verify_rows(g, &e->model, &e->weights, &token, 1u, &vc) &&
+                 ds41_verify_commit(g, &vc, 1u) &&
+                 ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 2);
+        }
     }
     const uint32_t pos_verify = g->pos;
 
