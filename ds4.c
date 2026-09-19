@@ -41210,6 +41210,7 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
 
 typedef struct ds41_verify_ctx {
     uint32_t rows, pos0;
+    uint32_t row_base;      /* first block row of the chunk being swept */
     ds4_gpu_tensor *win;    /* DS4_N_LAYER * rows * 512 floats */
     ds4_gpu_tensor *prev;   /* 4 owners * rows * 2 * 512 floats */
     ds4_gpu_tensor *comp;   /* 4 owners * (rows+1) * 512 floats */
@@ -41312,6 +41313,9 @@ static DS4_MAYBE_UNUSED bool ds41_verify_caches(ds41_verify_ctx *vc, ds41_gpu_gr
 }
 
 static DS4_MAYBE_UNUSED bool ds41_verify_save_window(ds41_verify_ctx *vc, ds41_gpu_graph *g, uint32_t il) {
+    /* Only the first chunk sees pre-block state; a later chunk would snapshot
+     * rows this block has already written and destroy the rollback. */
+    if (vc->row_base) return true;
     return ds41_verify_ring(vc, g->window[il], il, 0, true);
 }
 
@@ -41319,7 +41323,8 @@ static DS4_MAYBE_UNUSED bool ds41_verify_save_window(ds41_verify_ctx *vc, ds41_g
  * ratio-1 owner copies pool_kv straight through and reads neither. */
 static DS4_MAYBE_UNUSED bool ds41_verify_save_prev(ds41_verify_ctx *vc, ds41_gpu_graph *g,
                                   uint32_t owner, uint32_t row) {
-    const uint64_t at = ((uint64_t)owner * vc->rows + row) * 2u * DS41_VERIFY_KV_ROW;
+    const uint64_t at =
+        ((uint64_t)owner * vc->rows + vc->row_base + row) * 2u * DS41_VERIFY_KV_ROW;
     return ds4_gpu_tensor_copy(vc->prev, at, g->previous_kv[owner], 0, DS41_VERIFY_KV_ROW) &&
            ds4_gpu_tensor_copy(vc->prev, at + DS41_VERIFY_KV_ROW,
                                g->previous_score[owner], 0, DS41_VERIFY_KV_ROW);
@@ -41793,6 +41798,42 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
     if (!ds41_verify_caches(vc, g, 0, true)) { (void)ds4_gpu_end_commands(); return false; }
     if (!ds4_gpu_end_commands()) return false;
     const bool plain_sweep = getenv("DS4_DS41_VERIFY_PLAIN_SWEEP") != NULL;
+    /* DS4_DS41_SERIAL_VERIFY=1: sweep the block one row at a time.
+     * ds41_attention_batch is not batch-size invariant, so a row computed
+     * inside an N-row sweep does not match the same row computed by decode's
+     * one-row sweep. Running one row per chunk removes the difference at its
+     * source -- every row goes through the identical code path decode uses,
+     * batched core included -- and unlike the per-row attention fallback it
+     * keeps ds41_attention_publish_batch, which is where the ratio-2 carry
+     * snapshot is taken. Attention loses cross-row batching; MoE and HC do
+     * not, and they are the expensive part. */
+    const bool serial = getenv("DS4_DS41_SERIAL_VERIFY") != NULL;
+    vc->row_base = 0;
+    if (serial && !plain_sweep) {
+        ds41_prefill_row *b = &g->batch;
+        bool sok = true;
+        for (uint32_t r = 0; sok && r < count; r++) {
+            vc->row_base = r;
+            sok = ds41_graph_prefill_sweep(g, m, w, tokens + r, 1u, NULL, NULL, 0,
+                                           NULL, NULL, false, false, vc);
+            if (!sok) break;
+            ds4_gpu_tensor *lrow = ds4_gpu_tensor_view(
+                vc->logits, (uint64_t)r * DS4_N_VOCAB * sizeof(float),
+                (uint64_t)DS4_N_VOCAB * sizeof(float));
+            sok = lrow && ds4_gpu_begin_commands() != 0;
+            if (sok) sok = ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre,
+                                                          DS4_N_EMBD, DS4_N_HC) != 0;
+            if (sok) sok = ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, 1u, DS4_V41_BF16);
+            if (sok) sok = ds41_norm_batch(b->norm, b->x, m, w->output_norm, 1u);
+            if (sok) sok = ds41_output_projection(g, lrow, m, w, b->norm, 1u);
+            if (!ds4_gpu_end_commands()) sok = false;
+            ds4_gpu_tensor_free(lrow);
+        }
+        vc->row_base = 0;
+        if (!sok) { (void)ds4_gpu_synchronize(); return false; }
+        return ds4_gpu_tensor_read(vc->logits, 0, vc->row_logits,
+                                   (uint64_t)count * DS4_N_VOCAB * sizeof(float)) != 0;
+    }
     if (!ds41_graph_prefill_sweep(g, m, w, tokens, count, NULL, NULL, 0,
                                   NULL, NULL, false, false,
                                   plain_sweep ? NULL : vc)) {

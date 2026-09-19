@@ -1224,3 +1224,83 @@ They are -- but the scope is far smaller than that sounded. It is **one
 kernel**, it already has a per-row twin sitting next to it, and switching to it
 fixes every window. What remains is a single snapshot that is taken on one code
 path and not the other.
+
+---
+
+# PHASE 16: correct at last -- and the cost is exactly the thing that made it correct
+
+## Serial verify closes it
+
+`DS4_DS41_SERIAL_VERIFY=1` sweeps the block one row at a time. Every row then
+goes through the identical path decode uses -- batched core included -- so the
+batch-size dependence never arises, and unlike the per-row attention fallback
+it keeps `ds41_attention_publish_batch`, which is where the ratio-2 carry
+snapshot is taken. `vc->row_base` makes the per-chunk saves land in the right
+block slot, and the window snapshot is taken only on the first chunk so it
+still holds pre-block state.
+
+```
+UNIFY_DECODE=1 SERIAL_VERIFY=1 STATE_DIFF=3   arrays_differing=0 of 56
+```
+
+Zero, for a **5-row verify committing one row** -- rollback exercised, carry
+included.
+
+And end to end:
+
+```
+cycles=104  proposed=90  accepted_draft=4  full=17  partial=3
+draft_len_hist=1:28,2:9,3:1,4:1,5:2
+greedy output: BYTE-IDENTICAL to no-speculation
+```
+
+Draft tokens were accepted, partial commits fired, and the output matches
+exactly. **This is the first correct speculative decode on V4.1.**
+
+## The Phase 2 gate number was measured on the broken path
+
+Phase 2 recorded 1.80 tokens per target step and treated it as the economics.
+That run accepted tokens against logits computed from corrupted state, so its
+acceptance was not real. The honest number, measured now with byte-identical
+output:
+
+```
+128 tokens / 104 cycles = 1.23 tokens per target step
+```
+
+Still above 1, but well short of 1.80.
+
+## And the fix costs what it saves
+
+A serial verify of `N` rows is `N` one-row sweeps. Under unified decode a
+one-row sweep is 78 ms, so verifying a 5-row block costs ~390 ms -- against
+78 ms for simply decoding the next token. Stopping at the first rejection would
+cost `accepted + 1` sweeps, which is exactly what decoding those tokens
+serially costs, plus the propose.
+
+**So correctness and speedup are, on the current kernels, mutually exclusive.**
+The only verify that matches decode bit-for-bit is one that does the same
+per-row work, and then there is nothing left to win.
+
+## The one remaining lever, stated precisely
+
+Make **`ds41_attention_batch` batch-size invariant**: the result for a given row
+must not depend on how many rows share the dispatch. Everything else is now
+built and proven:
+
+* the drafter works and its artifact is clean
+* the capture fires on the sweep
+* decode and verify share a code path (`DS4_DS41_UNIFY_DECODE`)
+* the rollback restores all four persistent arrays
+* the TP protocol is wired and its lockstep is proven
+* and there is a differential harness that reports `arrays_differing` in one
+  run, single box, no drafter or second machine required
+
+With an invariant kernel, `SERIAL_VERIFY` can be dropped, the verify batches
+again, and the measured 1.23 tokens per target step turns into real throughput.
+Without it, V4.1 speculative decode is correct but pointless, and target-only
+at 21.55 tg/s remains the answer.
+
+That is a bounded CUDA question -- likely GEMM tiling or reduction order in the
+attention batch path -- and it is the only thing left between here and a
+working feature.
