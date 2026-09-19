@@ -184,7 +184,18 @@ ds4: DSpark speculative decode is not supported under network tensor
 | configuration | status |
 |---|---|
 | Q2 single box | drafter works -- confidence finite, drafts accepted |
-| Q2 TP2 resident | unsupported; declines cleanly, decodes target-only |
+| Q2 TP2 resident | unsupported; declines cleanly at load |
+
+The flagship configuration is untouched. Q2 TP2 resident, 16K prompt, 256
+tokens, target-only on this build:
+
+```
+16384,16384,422.28,256,21.44,53.675,255,21.47,0
+```
+
+**21.44 tg/s** (steady 21.47), against the 21.83 recorded in T19 -- the same
+number inside run-to-run variance, which is the point: nothing on the normal
+decode path changed.
 
 The honest summary for the pair is unchanged in effect but not in kind: the
 reason `--dspark` does nothing on TP2 was never the drafter. Two separate
