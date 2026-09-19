@@ -2875,9 +2875,11 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
         "deepseek4.dspark_num_experts_per_tok",
         "deepseek4.dspark_n_experts_used",
     };
+    bool nused_from_metadata = false;
     if (model_get_u32_any(m, nused_keys, sizeof(nused_keys) / sizeof(nused_keys[0]),
                           &s.n_experts_used)) {
         s.has_metadata = true;
+        nused_from_metadata = true;
     } else {
         /* V4.1's DSpark drafter routes top-3 (checkpoint config
          * dspark_num_experts_per_tok); a backbone-shaped drafter keeps the
@@ -2887,12 +2889,21 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
 
     uint32_t max_stage = 0;
     bool have_stage = false;
+    uint32_t inferred_n_experts = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         ds4_str name = m->tensors[i].name;
         uint32_t stage = 0;
         if (!ds4_tensor_mtp_stage(name, &stage)) continue;
         if (!have_stage || stage > max_stage) max_stage = stage;
         have_stage = true;
+        /* A routed drafter tensor carries the drafter's expert count in its
+         * last dimension. Recorded here so the count can be recovered from a
+         * checkpoint that stamps no drafter-specific metadata key. */
+        if (!inferred_n_experts && m->tensors[i].ndim == 3 &&
+            ds4_str_contains(name, ".ffn_gate_exps") &&
+            m->tensors[i].dim[2] > 0 && m->tensors[i].dim[2] <= DS4_MAX_EXPERT) {
+            inferred_n_experts = (uint32_t)m->tensors[i].dim[2];
+        }
 
         if (ds4_str_contains(name, ".main_proj.")) s.has_main_proj = true;
         if (ds4_str_contains(name, ".main_norm.")) s.has_main_norm = true;
@@ -2901,6 +2912,24 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
         if (ds4_str_contains(name, ".hc_head_") ||
             ds4_str_contains(name, ".norm.weight")) {
             s.has_final_head = true;
+        }
+    }
+    /* The drafter's routed-expert count is not the backbone's. V4.1 stamps
+     * dspark_n_routed_experts = 128 in its HF config against n_routed_experts
+     * = 384 for the main model, and dspark_num_experts_per_tok = 3 against 6.
+     * The GGUF writer emits no drafter expert-count key -- ds41f-dspark-q4
+     * carries only block_size, markov_rank, noise_token_id and
+     * target_layer_ids -- so the back-compat fallback above assumed the
+     * backbone's 384, every routed drafter tensor failed layout validation
+     * (invalid=15), and drafting was silently disabled: measured proposed=0
+     * over 247 cycles while the propose chain still burned 2.1 ms/token (T18).
+     * The count is already present in the file, so infer it rather than
+     * assuming. Metadata, where a writer does stamp it, still wins. */
+    if (!s.has_n_experts && inferred_n_experts) {
+        s.n_experts = inferred_n_experts;
+        if (!nused_from_metadata) {
+            s.n_experts_used =
+                inferred_n_experts == DS4_N_EXPERT ? DS4_N_EXPERT_USED : 3;
         }
     }
     if (have_stage) s.stages = max_stage + 1u;
