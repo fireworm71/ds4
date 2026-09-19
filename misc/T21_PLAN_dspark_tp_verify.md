@@ -452,3 +452,15 @@ accepted tokens through the decode path after committing**. That is exactly
 what the non-V4.1 TP worker already does for `ROLLBACK_REPLAY`. It costs one
 decode step per accepted token, which eats much of the speedup, but it would
 prove the diagnosis and give a correct baseline to optimise from.
+
+## One avenue that does not work, recorded so it is not retried
+
+`--decode-consistency N` with `--dspark` looks like the ideal probe -- decode
+through the speculative path, then compare against a fresh prefill -- but it
+does not exercise it. The run emits **no DSpark stats at all** and reports the
+same `live=3.53901505 fresh=3.53901505 max_abs=0` as the plain run, byte for
+byte: `--decode-consistency` drives its own decode loop, which never enters the
+speculative path.
+
+Confirming the state hypothesis therefore needs either a probe placed inside
+the speculative loop, or the replay experiment above.
