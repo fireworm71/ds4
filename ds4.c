@@ -75006,6 +75006,14 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
         g->pos != (uint32_t)s->checkpoint.len) {
         return n_accept;                      /* nothing mutated: stay serial */
     }
+    /* DS4_DS41_VERIFY_ROWS1=1 verifies a single row. ds41_verify_commit only
+     * restores the rings when keep < rows, so a one-row block that commits in
+     * full never rolls anything back -- which separates "the batch sweep does
+     * not reproduce a serial decode step" from "the rollback does not restore
+     * everything the sweep touched". Pair it with DS4_DS41_VERIFY_COMMIT1 to
+     * take the accept rule out of the picture as well. A diagnostic, not a
+     * mode. */
+    if (draft_n > 1 && getenv("DS4_DS41_VERIFY_ROWS1") != NULL) draft_n = 1;
     if (s->ds41_vc_ready && s->ds41_vc.rows != (uint32_t)draft_n) {
         ds41_verify_free(&s->ds41_vc);
         s->ds41_vc_ready = false;

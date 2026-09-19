@@ -378,3 +378,77 @@ Prime suspects, in order:
 
 That last check is the cheapest and should come first -- it splits "the batch
 is wrong" from "the rollback is incomplete" in one run.
+
+---
+
+# PHASE 5: the defect is state, not arithmetic
+
+Three more measurements narrow it to one statement.
+
+## The rollback is exonerated
+
+`DS4_DS41_VERIFY_ROWS1=1` (added here) clamps the verify to a single row.
+`ds41_verify_commit` only restores the rings when `keep < rows`, so a one-row
+block that commits in full **rolls nothing back**. Paired with
+`DS4_DS41_VERIFY_COMMIT1=1` the accept rule is out of the picture too.
+
+Result: **still diverges.** Nothing was rolled back and nothing beyond
+`drafts[0]` was accepted, so neither the rollback nor the accept rule can be
+the cause.
+
+## The sweep's arithmetic is exonerated
+
+```
+ds4 --decode-consistency 16
+ds4: decode-consistency compared prefix_tokens=71 vocab=129280
+     max_abs=0 at token=0 live=3.53901505 fresh=3.53901505 rms=0
+```
+
+**Bit-identical.** A fresh full prefill and incremental decode produce exactly
+the same logits, so the prefill sweep and the decode path compute the same
+thing. The verify is not doing bad arithmetic.
+
+## What is left
+
+Both paths are individually correct and produce identical logits, yet appending
+one token through the sweep and then continuing to decode diverges. The only
+thing that survives is that **the two paths leave different auxiliary state
+behind**, so a session that mixes them is corrupted from that point on.
+
+`--decode-consistency` cannot see this: it compares a fresh prefill of a whole
+prefix against decode of that prefix. It never decodes, appends via the sweep,
+and then decodes again -- which is precisely what the verify does.
+
+Candidate state, in order:
+
+1. **The ratio-2 carry.** `ds4_gpu_dsv41_pool2` threads
+   `previous_kv/previous_score` position to position. Decode calls it at
+   ds4.c:39996 with `count=1`; the sweep calls it batched. `n_head_dim` is 512
+   for FLASH41 so the literal `512` there is not a mismatch, but whether the
+   carry ends in the same place after a sweep append as after a decode append
+   is untested.
+2. **Engram history.** `ds41_graph_verify_rows` advances a *local* copy of
+   `g->history` per row and stores it in `vc->history[]`, then
+   `ds41_verify_commit` assigns `g->history = vc->history[keep-1]`. If the
+   sweep also advances `g->history` internally, the assignment either
+   double-advances or reverts it.
+3. **Window ring bookkeeping** for the non-ratio-2 layers, which
+   `ds41_verify_ctx` snapshots but which the sweep may index differently from
+   decode.
+
+## A note on the `vc`-armed publish
+
+`ds41_attention_publish_batch` changes its forward computation when `vc` is
+non-NULL: it pools **row by row** instead of in one batched call, so the
+verify's numerics differ from every other caller's by construction. At
+`count == 1` the two are equivalent, so this does not explain the one-row
+divergence -- but it is a second, independent correctness hazard for
+`count > 1` and should not be left standing once the state bug is fixed.
+
+## The cheap fix worth trying first
+
+Rather than making the sweep leave decode-identical state, **replay the
+accepted tokens through the decode path after committing**. That is exactly
+what the non-V4.1 TP worker already does for `ROLLBACK_REPLAY`. It costs one
+decode step per accepted token, which eats much of the speedup, but it would
+prove the diagnosis and give a correct baseline to optimise from.
