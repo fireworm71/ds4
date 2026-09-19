@@ -838,3 +838,78 @@ Layers 0-8 agreeing is the strongest clue left. Layer 8 is a `ds41_kv_source`
 and the first consumer of owner 1's caches is layer 9, so the next bisect
 should probe what layer 8 writes and layer 9 reads, rather than the append
 machinery that has now been cleared three times over.
+
+---
+
+# PHASE 11: it is rounding, not a bug -- which changes what can be built
+
+`DS4_DS41_VERIFY_STATE_DIFF_SKIP=N` probes a later block, which is how the
+harness reaches an odd `pos0`.
+
+```
+pos0=58 (even)   windows 9..39 differ, plus previous_kv[2], previous_score[2],
+                 compressed[3], index_cache[3]          -- 35 of 56
+pos0=61 (odd)    windows 27..39 differ, nothing else    -- 13 of 56
+```
+
+Both write the correct ring slot (`float 29696 / 512 = 58`,
+`float 31232 / 512 = 61`). What moves is the **depth at which the difference
+first becomes visible**: layer 9 at one position, layer 27 at another.
+
+And the differences are always one step of the stored precision --
+`0.0703125` vs `0.078125`, `0.046875` vs `0.0429688`, `-0.625` vs `-0.5625` --
+across 72-382 bytes of each 2048-byte row, never more.
+
+## The reading
+
+This is not a logic defect. A wrong index, a missing restore or a mis-shaped
+call would corrupt a fixed place every time; this moves with position and never
+exceeds one quantisation step. It is **the decode path and the batch path
+rounding differently** -- different kernels, different accumulation order --
+with a sub-quantum difference that compounds through depth until it crosses a
+rounding boundary, at layer 9 in one case and layer 27 in another.
+
+That is consistent with every earlier elimination: nothing was broken, which is
+why nothing I switched off changed anything.
+
+## Why this is worse news than a bug
+
+A speculative verify must leave *exactly* the state a decode would, because
+the accepted tokens' KV is what every later token reads. Two kernels that agree
+to within a ulp are not good enough. So:
+
+* **It cannot be fixed by bug-hunting.** There is no defect to remove.
+* **Replay does not rescue the speedup.** Re-running accepted tokens through
+  `ds41_graph_step` would make state decode-built by construction, but then
+  every emitted token costs a decode step *plus* the propose and the verify
+  batch -- strictly slower than not speculating. Correct, and pointless.
+
+## What could actually work
+
+**Unify the paths.** If `ds41_graph_step` were implemented as
+`ds41_graph_prefill_sweep(count = 1)`, decode and verify would use identical
+kernels and be bit-exact by construction, and the whole class of problem
+disappears. The cost is whatever the specialised decode path buys -- the CUDA
+graph island among it -- and that is a measurable number, not a guess:
+
+1. Time a 1-row sweep append against `ds41_graph_step` at the same position.
+2. If the sweep is within a few percent, unify and the Phase 2 economics
+   (1.80 tokens per target step, ~1.6x) come back into reach.
+3. If the sweep is much slower, V4.1 speculative decode does not pay on this
+   engine, and that is the answer -- worth knowing definitively rather than
+   paying for more attempts.
+
+That measurement is the next step, and it needs no drafter, no sidecar and no
+second box.
+
+## Standing defects, unaffected by the above
+
+These are real regardless of what happens to speculative decode:
+
+* `ds41_verify_ctx` never snapshots `compressed[]` or `index_cache[]`, though
+  `ds41_state_spans` names them as persistent (Phase 6).
+* `ds41_state_spans` carries the ratio-2 carry for `i < 3` while
+  `ds41_verify_commit` restores 4 owners (Phase 6).
+* The `vc` branch indexed the pooled output by row rather than by pair and
+  passed a live view where the golden test passes NULL -- fixed here, latent
+  for multi-row blocks at odd starts (Phase 9/10).

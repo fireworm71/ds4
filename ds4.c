@@ -75071,7 +75071,16 @@ static bool ds41_diff_restore(ds41_diff_slot *sl, uint32_t n) {
 
 static void ds41_verify_state_diff(ds4_session *s, int token) {
     static int done = 0;
+    static int seen = 0;
     if (done) return;
+    /* DS4_DS41_VERIFY_STATE_DIFF_SKIP=N probes the N+1'th block instead of the
+     * first, which is how the probe reaches an odd pos0. Parity matters here:
+     * a one-row block completes a ratio-2 pair only at an odd absolute
+     * position, so an even pos0 never exercises the compressed-cache write. */
+    {
+        const char *skip = getenv("DS4_DS41_VERIFY_STATE_DIFF_SKIP");
+        if (skip && seen < atoi(skip)) { seen++; return; }
+    }
     done = 1;
 
     ds4_engine *e = s->engine;
