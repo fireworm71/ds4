@@ -301,6 +301,42 @@ static cuda_stream_probe_ctrl *g_dev_probe_ctrl = NULL;
 static int32_t *g_dev_expert_to_slot = NULL;
 static std::vector<int32_t> g_host_expert_to_slot;
 static uint32_t g_layer_resident_count[DS4_CUDA_MAX_LAYERS];
+static uint64_t g_partition_fallbacks = 0;
+
+/* Per-layer slot partitioning (Lever 2).
+ *
+ * Decode walks layers 0..39 for every token, so the access pattern is cyclic
+ * over a working set larger than the cache. That is the one pattern a global
+ * LRU pool handles worst: by the time a token returns to layer 0, the other
+ * 39 layers' traffic has evicted its experts, and each layer keeps paying for
+ * the others. The engine's own hot-set report makes the size of the loss
+ * concrete -- a 61-expert working set per layer covers 86.8% of decode
+ * selections while global LRU achieves 63.5%.
+ *
+ * Bounding each layer to a share of the slots makes a layer's experts compete
+ * only with their own layer across tokens. Q4 TP2 has 3940 slots over 40
+ * layers = 98 each, comfortably above the 61 the hot set needs.
+ *
+ * Opt-in via DS4_CUDA_EXPERT_PARTITION while it is measured; returns 0 when
+ * disabled, which every call site reads as "no restriction". */
+static uint32_t cuda_expert_partition_quota(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_CUDA_EXPERT_PARTITION") != NULL;
+    if (!on || g_stream_expert_slots.empty()) return 0;
+    const uint32_t q = (uint32_t)(g_stream_expert_slots.size() / DS4_CUDA_MAX_LAYERS);
+    return q ? q : 1u;
+}
+
+/* A slot may be taken for `layer` when partitioning is off, when the slot is
+ * empty (refusing free capacity would be strictly worse), when the layer is
+ * still under quota, or when the slot already belongs to that layer. */
+static inline bool cuda_expert_partition_allows(const cuda_stream_expert_slot &c,
+                                                uint32_t layer, uint32_t quota) {
+    if (!quota || !c.used) return true;
+    if (layer >= DS4_CUDA_MAX_LAYERS) return true;
+    if (g_layer_resident_count[layer] < quota) return true;
+    return c.layer == layer;
+}
 static bool g_layer_all_resident[DS4_CUDA_MAX_LAYERS];
 static uint32_t g_probe_seq = 0;
 static uint64_t g_probe_hit_calls = 0;
@@ -30254,6 +30290,7 @@ static int cuda_stream_selected_cache_begin_load(
         for (size_t i = 0; i < unique.size(); i++) {
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
+            const uint32_t part_quota = cuda_expert_partition_quota();
             if (cuda_expert_evict_clock()) {
                 /*
                  * CLOCK second chance. `used == stamp` marks entries this very
@@ -30267,6 +30304,7 @@ static int cuda_stream_selected_cache_begin_load(
                     const uint32_t j = (uint32_t)((g_stream_expert_hand + scan) % n);
                     cuda_stream_expert_slot &c = g_stream_expert_slots[j];
                     if (c.used == stamp) continue;
+                    if (!cuda_expert_partition_allows(c, table->layer, part_quota)) continue;
                     if (!c.used) { victim = j; break; }
                     if (c.lives) { c.lives--; continue; }
                     victim = j;
@@ -30298,6 +30336,7 @@ static int cuda_stream_selected_cache_begin_load(
                 const uint64_t db = table->down_expert_bytes;
                 for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
                     const cuda_stream_expert_slot &c = g_stream_expert_slots[j];
+                    if (!cuda_expert_partition_allows(c, table->layer, part_quota)) continue;
                     if (c.used < oldest) {
                         oldest = c.used;
                         victim = j;
@@ -30313,6 +30352,19 @@ static int cuda_stream_selected_cache_begin_load(
                  * LRU when nothing resident is covered, so this can only ever
                  * change WHICH slot is taken, never whether one is found. */
                 if (cover && victim_cov != UINT32_MAX && oldest != 0) victim = victim_cov;
+            }
+            /* A policy must never be the reason a layer fails where plain LRU
+             * would have succeeded. If the partition left nothing takeable --
+             * every slot of this layer resolved as a hit this very call -- fall
+             * back to an unrestricted oldest-slot scan. */
+            if (victim == UINT32_MAX && part_quota) {
+                uint64_t oldest = stamp;
+                for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+                    const cuda_stream_expert_slot &c = g_stream_expert_slots[j];
+                    if (c.used == stamp) continue;
+                    if (c.used < oldest) { oldest = c.used; victim = j; if (!oldest) break; }
+                }
+                if (victim != UINT32_MAX) g_partition_fallbacks++;
             }
             if (victim == UINT32_MAX) return 0;
             auto &slot = g_stream_expert_slots[victim];
