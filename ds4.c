@@ -67280,6 +67280,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         e->dspark_weights.nonfinite_tensors);
                 e->dspark = false;
             }
+            /* The batched verify refuses tp_world == 2 by design (24f087d:
+             * "the ported design asserts the same restriction for the verify
+             * shape"). Discovering that at the first verify aborts the whole
+             * decode: ds41_graph_verify_rows cannot tell the caller whether it
+             * declined before or after mutating the graph, so the caller
+             * conservatively invalidates the frontier and the generation dies
+             * with "DSpark verify failed at position N". Decline up front. */
+            if (e->dspark && opt->tp.role != DS4_TP_NONE) {
+                fprintf(stderr,
+                        "ds4: DSpark speculative decode is not supported under "
+                        "network tensor parallelism; drafting disabled, "
+                        "decoding target-only.\n");
+                e->dspark = false;
+            }
             if (e->dspark && !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
                         "ds4: DSpark direct verifier-state commits enabled; "

@@ -125,3 +125,67 @@ copied across.
 T19 section 2's conclusion stands unchanged and separately: the drafter's
 expert count (128, not the backbone's 384) really was mis-inferred, and that
 fix is still required. It was necessary but not sufficient.
+
+---
+
+# ADDENDUM: with the NaN gone, TP2 hits a second, unrelated wall
+
+Re-running Q2 TP2 resident with the clean artifact on **both** boxes, the
+drafter proposes for the first time on the pair:
+
+```
+DSpark spec enter accepted=0 max=252 valid=1 len=5 pos=16388
+proposed=4  draft_len_hist=4:1
+ds4-bench: DSpark decode at frontier 16384 failed: V4.1 DSpark verify failed at position 16388
+```
+
+So the NaN really is fixed everywhere -- it was the artifact, not TP. What
+stops the pair now is a different and entirely deliberate restriction.
+
+## The batched verify refuses TP by design
+
+`ds41_graph_verify_rows` declines `tp_world == 2` in its entry guard, and the
+commit that introduced it (`24f087d`, 2026-09-15) says so plainly:
+
+> Refuses TP (tp_world == 2) for now -- the ported design asserts the same
+> restriction for the verify shape.
+
+**Speculative decode is therefore unavailable on the pair today.** Not broken,
+not misconfigured: unimplemented. Lifting it means giving the verify batch a TP
+shape, which is real work on the verify path, not a flag.
+
+## The handling was wrong, and that is fixed
+
+Hitting a documented "not supported" should not kill the generation, but it
+did. `ds41_graph_verify_rows` returns a bare `false` whether it declined at the
+entry guard (nothing mutated) or failed after the sweep (graph advanced), so
+the caller cannot tell the two apart and conservatively does the safe thing:
+
+```c
+g->valid = false;
+s->checkpoint_valid = false;
+... "V4.1 DSpark verify failed at position %d"
+```
+
+The frontier dies and the whole decode aborts. Before this change, `--dspark`
+on the pair did not merely fail to help -- it **terminated the run** after five
+cycles.
+
+The engine now declines at load, next to the corrupt-model bail-out, for the
+same reason: pay nothing for a drafter that cannot work.
+
+```
+ds4: DSpark speculative decode is not supported under network tensor
+     parallelism; drafting disabled, decoding target-only.
+```
+
+## Where this leaves speculative decode
+
+| configuration | status |
+|---|---|
+| Q2 single box | drafter works -- confidence finite, drafts accepted |
+| Q2 TP2 resident | unsupported; declines cleanly, decodes target-only |
+
+The honest summary for the pair is unchanged in effect but not in kind: the
+reason `--dspark` does nothing on TP2 was never the drafter. Two separate
+defects were stacked on top of each other, and only the first is now gone.
