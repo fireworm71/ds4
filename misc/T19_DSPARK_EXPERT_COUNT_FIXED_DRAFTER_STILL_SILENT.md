@@ -122,3 +122,71 @@ Two leads worth taking first, both cheap:
 
 Reproduction is one command with `DS4_DSPARK_SPEC_LOG=1 DS4_DSPARK_STATS=1`;
 the confidence value in the scheduler pause line is the signal to watch.
+
+
+---
+
+# ADDENDUM: the hidden-state capture is not the cause either
+
+Two further candidates tested and eliminated, which narrows the NaN to the
+drafter's own forward pass.
+
+## Every drafter parameter is now recovered correctly
+
+The checkpoint defines seven `dspark_*` parameters; the GGUF stamps four. The
+three it omits are all accounted for:
+
+| parameter | checkpoint | how it is recovered |
+|---|---|---|
+| `dspark_n_routed_experts` | 128 | inferred from tensor `dim[2]` (this commit) |
+| `dspark_num_experts_per_tok` | 3 | derived (`128 != 384` -> 3) |
+| `num_nextn_predict_layers` | 3 | tensor scan, `stages = max_stage + 1` |
+
+So no other drafter parameter silently defaults wrong. The lead that looked
+most promising after the expert-count bug is closed.
+
+## CUDA graphs do not bypass the capture
+
+Lever 5 (T15) enables graph capture for resident decode, so the obvious next
+suspicion was that `ds41_decode_island` skips the drafter's hidden-state
+capture. It does not: the capture sits *after* `ds41_graph_decode_layer` in the
+caller and reads `g->residual`, so it runs on the island and fallback paths
+alike.
+
+## The capture succeeds and completes
+
+`DS4_DSPARK_DEBUG=1`, Q2 single box, target layers 37/38/39:
+
+```
+dbg capture il=37 enabled=1 count=3 slot=0   ok=1 valid=0 mask=1
+dbg capture il=38 enabled=1 count=3 slot=1   ok=1 valid=0 mask=3
+dbg capture il=39 enabled=1 count=3 slot=2   ok=1 valid=1 mask=7
+```
+
+Target-layer mapping is right, the hc-mean reduction succeeds on all three, the
+mask completes, and `dspark_capture_valid = 1`. **The drafter receives its
+input.**
+
+This also bears on `b0cbc30`'s stale-ring defect. That defect concerns the ring
+going stale *after a batch commit* -- but here no draft is ever accepted, so no
+batch commit occurs, and the capture is valid from the first cycle. The stale
+ring cannot explain a NaN on cycle one.
+
+## What remains
+
+The drafter has valid, freshly captured input and still produces `confidence0 =
+nan` (TP2) or no value at all (single box). The fault is therefore inside the
+drafter's own forward pass -- the stage chain (`prop_chain`, 230 ms of real
+work) or the confidence head (`prop_conf0`, 122 ms) -- on CUDA.
+
+Candidates not yet tested, cheapest first:
+
+* Instrument the captured `dspark_target_hidden` for finiteness before the
+  drafter consumes it. The capture reporting `ok=1` means the reduction
+  executed, not that its output is finite.
+* Compare a drafter stage against a CPU reference for one token. The repo has
+  golden-fixture machinery (`ds4_test`, the DSpark verify-depth target) that
+  was built for exactly this.
+* Check the drafter's routed-MoE path specifically: it is the one part whose
+  shape was wrong until this commit, so it is the least-exercised code in the
+  drafter and a plausible place for an uninitialised or mis-strided buffer.
