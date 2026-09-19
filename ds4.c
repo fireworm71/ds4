@@ -66273,8 +66273,38 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
+    /* The DSpark/MTP support model is resident alongside the target and was
+     * not counted here, so a draft model's bytes were invisible to the budget.
+     * On the Spark pair that is 7.81 GiB -- more than the margin between this
+     * check and the point where the pair actually stops working. */
+    weights = ds4_add_sat_u64(weights, e->mtp_model.size);
+    /* Runtime reserve, above the accounted weights and graph: CUDA context,
+     * RDMA queue registrations, fetch-thread staging and page-cache pressure.
+     * The 2 GiB this used to allow is far short of what those cost in
+     * practice, which is why the check admitted configurations that then hung
+     * at the layer-0 gate with no error.
+     *
+     * Calibrated on GB10 (121.6 GiB host, budget host/8*7 = 106.48 GiB) against
+     * two measured points on a TP2 rank, both at ctx-alloc 262144, 4K chunk:
+     *
+     *   Q3 7L  weights 93.02 + graph 7.05 = 100.07 planned -> WORKS
+     *   Q3 8L  weights 94.80 + graph 7.05 = 101.86 planned -> hangs
+     *
+     * Any reserve in [4.63, 6.41) GiB separates them; 5 GiB sits in the middle.
+     * It admits the working flagship (105.07 of 106.48), refuses the hanging
+     * 8L (106.85), and correctly refuses Q3-plus-draft-model (112.88) which
+     * does not fit either. Override with DS4_MEMORY_RUNTIME_RESERVE_GIB when
+     * measuring on hardware whose overhead differs. */
+    uint64_t runtime_reserve = 5u * gib;
+    {
+        const char *rr = getenv("DS4_MEMORY_RUNTIME_RESERVE_GIB");
+        if (rr && rr[0]) {
+            const long v = strtol(rr, NULL, 10);
+            if (v >= 0 && v <= 64) runtime_reserve = (uint64_t)v * gib;
+        }
+    }
     const uint64_t fixed = ds4_add_sat_u64(weights,
-        ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
+        ds4_add_sat_u64(graph_bytes, runtime_reserve + e->ssd_streaming_prefill_headroom_bytes));
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
     if (fixed >= budget || (expert && budget - fixed < expert)) {
@@ -67045,6 +67075,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     e->dspark_weights.missing_tensors,
                     e->dspark_weights.invalid_tensors,
                     e->dspark_weights.metadata_errors);
+            /* An incompatible support model cannot draft: the drafter
+             * declines every cycle, but the propose chain still runs and
+             * charged 2.1 ms per token on the Spark pair -- a measured 5.6%
+             * decode loss for zero proposals (see T18). Fall back to
+             * target-only decode, which is what --dspark-strict already
+             * means, rather than paying for a drafter that cannot work. */
+            if (e->dspark && e->dspark_weights.invalid_tensors) {
+                fprintf(stderr,
+                        "ds4: DSpark support model is incompatible with this "
+                        "target (%u invalid tensors); drafting disabled, "
+                        "decoding target-only. Rebuild the support model to "
+                        "match the target's routed-expert shape.\n",
+                        e->dspark_weights.invalid_tensors);
+                e->dspark = false;
+            }
             if (e->dspark && !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
                         "ds4: DSpark direct verifier-state commits enabled; "
