@@ -1366,3 +1366,95 @@ The obvious first step is to force **both** row counts onto the online kernel
 and confirm that is actually what happens -- instrument the dispatch and print
 which arm each call takes -- rather than inferring it from the source, which is
 what went wrong above.
+
+---
+
+# PHASE 18: two hypotheses killed by measurement; the target narrows again
+
+## Instrumenting the dispatch settled what reading it could not
+
+`DS4_CUDA_ATTN_DISPATCH_LOG=1` prints which arm of
+`attention_decode_batch_launch` every call takes:
+
+```
+360  arm="attention exact score split batch launch"  n_tokens=1
+ 40  arm="attention decode batch launch"             n_tokens=5
+```
+
+So decode uses `attention_decode_score_split_launch` -- a kernel that takes no
+`n_tokens` argument at all and cannot be widened -- while a 5-row verify falls
+through to `attention_decode_mixed_kernel`. Phase 17 guessed the online kernel
+from reading the source; it was wrong, and the instrumentation is why we know.
+
+## Hypothesis 1: different arms. Disproven.
+
+`DS4_CUDA_ATTN_FORCE_GENERIC=1` skips the single-token-only specialisations so
+both row counts land on `attention_decode_mixed_kernel`. The log confirms it:
+
+```
+360  arm="attention decode batch launch"  n_tokens=1
+ 40  arm="attention decode batch launch"  n_tokens=5
+arrays_differing = 42 of 56
+```
+
+Same kernel, both counts, still divergent.
+
+## Hypothesis 2: block size. Disproven.
+
+The block size did depend on the row count:
+
+```c
+const uint32_t threads =
+    n_tokens == 1u && head_dim == 512u && score_lanes == 0u &&
+    !g_cuda_no_decode_value512 ? 512u : 256u;
+```
+
+512 threads for one row, 256 for a batch -- a different reduction tree, which
+looked decisive. `DS4_CUDA_ATTN_FIXED_THREADS=1` pins it to 256 for both.
+
+```
+arrays_differing = 42 of 56
+```
+
+Unchanged. Same kernel, same block size, same grid-per-token, still divergent.
+
+## The tell: the diff never moves
+
+Across the original run, `FORCE_GENERIC`, and `FORCE_GENERIC` +
+`FIXED_THREADS`, the reported values are **bit-for-bit identical** --
+`window[4]` decode `-0.00537109` vs verify `-0.00634766`, `diff_bytes=54`,
+every time. Nothing done to the attention launch has moved it at all.
+
+That argues the divergence is not in the attention kernel, and that
+`CORE_INVARIANT` worked for a different reason than assumed: the per-row
+fallback replaces the whole of `ds41_attention_batch`, not just its kernel
+launch.
+
+## Leading hypothesis, untested: the projections
+
+`ds41_attention_batch` passes `count` to more than the attention kernel:
+
+```c
+ds41_attention_project_batch(g, m, l, count)
+ds4_gpu_dsv41_quantize(b->heads, heads * DS4_N_HEAD_DIM, count, DS4_V41_BF16)
+ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, heads, count, start, ...)
+```
+
+A GEMM over N rows tiles differently than over one row, and that would be
+invisible to every switch tried above while being fixed by the per-row
+fallback -- which is exactly the pattern observed. `ds41_attention_project_batch`
+is the first thing to ablate per-row.
+
+## A bug introduced and caught here
+
+The first dispatch instrumentation attached its log statement to
+`if (rc == 1)` in the split-KV arm, leaving `return cuda_ok(...)`
+unconditional and swallowing the `rc != 1` fall-through. Repaired with braces
+before any measurement was taken from it. Noted because it is the kind of
+thing debug scaffolding does quietly.
+
+## Default behaviour
+
+Unchanged. `DS4_CUDA_ATTN_DISPATCH_LOG`, `DS4_CUDA_ATTN_FORCE_GENERIC` and
+`DS4_CUDA_ATTN_FIXED_THREADS` are all opt-in, and the repaired split-KV arm
+behaves as it did before instrumentation.

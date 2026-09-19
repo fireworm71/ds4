@@ -18776,7 +18776,7 @@ static int attention_decode_batch_launch(
                                                                    ratio,
                                                                    n_head,
                                                                    head_dim);
-        return cuda_ok(cudaGetLastError(), "attention decode window launch");
+        do { if (getenv("DS4_CUDA_ATTN_DISPATCH_LOG")) fprintf(stderr, "ds4: attn-dispatch arm=\"attention decode window launch\" n_tokens=%u n_comp=%u\n", n_tokens, n_comp); } while (0); return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
     if (!use_comp_mask && n_tokens == 1u && head_dim == 512 &&
         g_cuda_decode_heads8_online &&
@@ -18797,14 +18797,21 @@ static int attention_decode_batch_launch(
                                                                    ratio,
                                                                    n_head,
                                                                    head_dim);
-        return cuda_ok(cudaGetLastError(), "attention decode heads8 online batch launch");
+        do { if (getenv("DS4_CUDA_ATTN_DISPATCH_LOG")) fprintf(stderr, "ds4: attn-dispatch arm=\"attention decode heads8 online batch launch\" n_tokens=%u n_comp=%u\n", n_tokens, n_comp); } while (0); return cuda_ok(cudaGetLastError(), "attention decode heads8 online batch launch");
     }
     const uint32_t score_lanes =
         g_cuda_decode_score4 ? 4u : (g_cuda_decode_score8 ? 8u : 0u);
+    /* The block size decided the reduction tree, and it depended on n_tokens:
+     * 512 threads for a one-row launch, 256 for a batch. Same kernel, same
+     * grid.x-per-token, different accumulation order -- which is exactly why a
+     * row computed inside an N-row verify did not match the same row computed
+     * by a one-row decode. DS4_CUDA_ATTN_FIXED_THREADS pins it so the per-row
+     * result stops depending on how many rows share the launch. */
     const uint32_t threads =
-        n_tokens == 1u && head_dim == 512u && score_lanes == 0u &&
-        !g_cuda_no_decode_value512 ? 512u : 256u;
-    if (n_tokens == 1u) {
+        getenv("DS4_CUDA_ATTN_FIXED_THREADS") != NULL ? 256u :
+        (n_tokens == 1u && head_dim == 512u && score_lanes == 0u &&
+         !g_cuda_no_decode_value512 ? 512u : 256u);
+    if (n_tokens == 1u && getenv("DS4_CUDA_ATTN_FORCE_GENERIC") == NULL) {
         int score_split_rc = attention_decode_score_split_launch(
                 logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
                 (const float *)raw_kv->ptr,
@@ -18813,21 +18820,26 @@ static int attention_decode_batch_launch(
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
                 n_head, head_dim, threads, NULL);
         if (score_split_rc == 1) {
-            return cuda_ok(cudaGetLastError(), "attention exact score split batch launch");
+            do { if (getenv("DS4_CUDA_ATTN_DISPATCH_LOG")) fprintf(stderr, "ds4: attn-dispatch arm=\"attention exact score split batch launch\" n_tokens=%u n_comp=%u\n", n_tokens, n_comp); } while (0); return cuda_ok(cudaGetLastError(), "attention exact score split batch launch");
         }
         if (score_split_rc < 0) return 0;
     }
     /* perf-02 split-KV opt-in (default OFF). Single-token decode only; multi-
      * token batch shapes already fill the grid and fall through unchanged.
      * S==1 / disabled / unhandled -> rc 0, fall through to the old kernel. */
-    if (n_tokens == 1u && cuda_splitkv_decode_requested()) {
+    if (n_tokens == 1u && cuda_splitkv_decode_requested() &&
+        getenv("DS4_CUDA_ATTN_FORCE_GENERIC") == NULL) {
         int rc = attention_decode_splitkv_launch(
                 logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
                 (const float *)raw_kv->ptr,
                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                 use_comp_mask ? (const float *)comp_mask->ptr : NULL, use_comp_mask,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head, head_dim);
-        if (rc == 1) return cuda_ok(cudaGetLastError(), "attention decode splitkv batch launch");
+        if (rc == 1) {
+            if (getenv("DS4_CUDA_ATTN_DISPATCH_LOG"))
+                fprintf(stderr, "ds4: attn-dispatch arm=\"attention decode splitkv batch launch\" n_tokens=%u n_comp=%u\n", n_tokens, n_comp);
+            return cuda_ok(cudaGetLastError(), "attention decode splitkv batch launch");
+        }
         if (rc < 0) return 0;
     }
     dim3 grid(n_tokens, n_head, 1);
@@ -18840,7 +18852,7 @@ static int attention_decode_batch_launch(
                                                      use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                      raw_start, n_comp, window, ratio, n_head, head_dim,
                                                      score_lanes);
-    return cuda_ok(cudaGetLastError(), "attention decode batch launch");
+    do { if (getenv("DS4_CUDA_ATTN_DISPATCH_LOG")) fprintf(stderr, "ds4: attn-dispatch arm=\"attention decode batch launch\" n_tokens=%u n_comp=%u\n", n_tokens, n_comp); } while (0); return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
 extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
