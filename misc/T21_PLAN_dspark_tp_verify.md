@@ -600,3 +600,75 @@ then diff them. Whichever array differs is the bug, and the diff will say
 whether it is a wrong value or a wrong ring index. Everything above has
 narrowed the search to those four arrays and one token; this is now a bounded
 comparison rather than an investigation.
+
+---
+
+# PHASE 8: ROOT CAUSE -- the two append paths are not bit-reproducible
+
+`DS4_DS41_VERIFY_STATE_DIFF=1` (added here) appends the same token twice from
+identical state -- once through `ds41_graph_step` (decode), once through
+`ds41_graph_verify_rows` with `count = 1` -- restoring the full state in
+between, and diffs the four arrays `ds41_state_spans` names.
+
+```
+state-diff token=16 pos0=58 decode_pos=59 verify_pos=59 ok=1
+  window[9]  bytes=262144 first_diff_at=118814 (float 29703) decode=0.0703125  verify=0.078125   diff_bytes=86
+  window[10] bytes=262144 first_diff_at=118786 (float 29696) decode=-0.21875   verify=-0.234375  diff_bytes=157
+  window[11] ...                                             decode=-0.109375  verify=-0.125     diff_bytes=185
+  window[14] ...                                             decode=0.0703125  verify=0.0625     diff_bytes=382
+  window[16] ...                                             decode=-0.28125   verify=-0.21875   diff_bytes=378
+state-diff arrays_differing=35 of 56
+```
+
+Three things fall out of this immediately.
+
+**The position is right.** `float 29696 / 512 = slot 58`, and `pos0 = 58`. Both
+paths write exactly the row they should, and both leave `pos = 59`. Nothing is
+misindexed and nothing is written to the wrong slot.
+
+**The values are close, not wrong.** `0.0703125` vs `0.078125`, `-0.21875` vs
+`-0.234375`, `-0.109375` vs `-0.125` -- neighbouring values one quantisation
+step apart, not garbage. Only 86-382 bytes of each 2048-byte row differ; most
+of the row is bit-identical.
+
+**It accumulates with depth.** Layers 0-8 agree exactly; `window[9]` is the
+first to differ, and 35 of the 56 arrays differ in total.
+
+## What this means
+
+The defect is not missing state, a bad index, or a lost rollback. **The decode
+path and the batch/verify path do not produce bit-identical keys for the same
+token at the same position from the same prior state.** They agree to within a
+quantisation step, and the difference compounds through depth.
+
+That is enough to change an argmax, which is why greedy output diverges after
+~15 bytes, and why the verify's per-row logits so rarely match the drafter:
+they are computed from a KV state that decode would never have produced.
+
+This also dissolves the apparent contradiction with `--decode-consistency`.
+That check builds a prefix by *one* method and compares the result, so it never
+sees a cross-path append. Both paths are internally self-consistent -- which is
+exactly what it measured, bit-identically, and exactly why it could not find
+this.
+
+## Consequence for the design
+
+A verify that appends through the batch path can never leave the graph in the
+state serial decode would have, no matter how complete the snapshot is. So the
+snapshot-and-rollback design cannot be made correct by extending the snapshot;
+the Phase 6 gap in `compressed[]`/`index_cache[]` is real and still worth
+fixing, but fixing it would not have produced correct output.
+
+**Replay is now the clear design, not the fallback.** After the accept
+decision, roll back to `pos0` and re-run the accepted tokens through
+`ds41_graph_step`, so committed state is decode-built by construction. It costs
+one decode step per accepted token, which caps the speedup at roughly the ratio
+of a batched verify to N serial decodes -- much less than the 1.6x Phase 2
+projected, but correct. The non-V4.1 TP worker already does exactly this for
+`ROLLBACK_REPLAY`, so the pattern and its plumbing exist.
+
+The cheaper alternative worth measuring first: find out *why* the paths round
+differently. If it is a single kernel choosing a different accumulation order
+or intermediate precision at `count == 1`, making the verify use the decode
+kernel for its rows would preserve the full speedup. The diff above localises
+the search to whatever writes `window[]` between layers 8 and 9.

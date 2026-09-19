@@ -74985,6 +74985,141 @@ int ds4_sessions_eval_batch_with_prefill(
  * number of accepted tokens and s->logits holds the last accepted row, so the
  * next step continues as if those tokens had been decoded serially.
  */
+/* DS4_DS41_VERIFY_STATE_DIFF=1: append the same token twice from identical
+ * state -- once through the decode path, once through the one-row verify --
+ * and report which persistent array differs.
+ *
+ * Every component of the verify has been cleared individually (the sweep is
+ * bit-identical to decode at one row and at chunk sizes, the rollback is not
+ * involved at keep == rows, the accept rule is bypassed, the vc helpers are
+ * pure copy-out), yet a verify-appended token corrupts the stream. The one
+ * thing left is that the two append paths leave different state behind, and
+ * --decode-consistency cannot see it because it only ever builds a prefix by a
+ * single method. This diffs them directly.
+ *
+ * The four arrays are the ones ds41_state_spans names as persistent. Whole
+ * tensors are copied rather than pos-sized slices so save and restore cannot
+ * disagree about extent. Debug-only: this runs the token three times and moves
+ * tens of MiB through the host. */
+#define DS41_DIFF_SLOTS (DS4_N_LAYER + 16u)
+
+typedef struct {
+    ds4_gpu_tensor *t;
+    uint64_t        bytes;
+    void           *a;      /* after decode  */
+    void           *b;      /* after verify  */
+    void           *base;   /* starting state */
+    const char     *name;
+    uint32_t        index;
+} ds41_diff_slot;
+
+static uint32_t ds41_diff_collect(ds41_gpu_graph *g, ds41_diff_slot *sl) {
+    uint32_t n = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        sl[n].t = g->window[il]; sl[n].name = "window"; sl[n].index = il; n++;
+    }
+    for (uint32_t i = 0; i < 4u; i++) {
+        sl[n].t = g->compressed[i];     sl[n].name = "compressed";     sl[n].index = i; n++;
+        sl[n].t = g->index_cache[i];    sl[n].name = "index_cache";    sl[n].index = i; n++;
+        sl[n].t = g->previous_kv[i];    sl[n].name = "previous_kv";    sl[n].index = i; n++;
+        sl[n].t = g->previous_score[i]; sl[n].name = "previous_score"; sl[n].index = i; n++;
+    }
+    for (uint32_t i = 0; i < n; i++) sl[i].bytes = sl[i].t ? ds4_gpu_tensor_bytes(sl[i].t) : 0;
+    return n;
+}
+
+static bool ds41_diff_grab(ds41_diff_slot *sl, uint32_t n, int which) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (!sl[i].t || !sl[i].bytes) continue;
+        void *buf = malloc((size_t)sl[i].bytes);
+        if (!buf) return false;
+        if (!ds4_gpu_tensor_read(sl[i].t, 0, buf, sl[i].bytes)) { free(buf); return false; }
+        if (which == 0) sl[i].base = buf;
+        else if (which == 1) sl[i].a = buf;
+        else sl[i].b = buf;
+    }
+    return true;
+}
+
+static bool ds41_diff_restore(ds41_diff_slot *sl, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (!sl[i].t || !sl[i].bytes || !sl[i].base) continue;
+        if (!ds4_gpu_tensor_write(sl[i].t, 0, sl[i].base, sl[i].bytes)) return false;
+    }
+    return ds4_gpu_synchronize() != 0;
+}
+
+static void ds41_verify_state_diff(ds4_session *s, int token) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_diff_slot *sl = calloc(DS41_DIFF_SLOTS, sizeof(*sl));
+    float *logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    ds41_verify_ctx vc;
+    memset(&vc, 0, sizeof(vc));
+    if (!sl || !logits) { free(sl); free(logits); return; }
+
+    const uint32_t n = ds41_diff_collect(g, sl);
+    const ds4_engram_history h0 = g->history;
+    const uint32_t pos0 = g->pos;
+    bool ok = ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 0);
+
+    if (ok) ok = ds41_graph_step(g, &e->model, &e->weights, token, logits) &&
+                 ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 1);
+    const uint32_t pos_decode = g->pos;
+
+    if (ok) { g->history = h0; g->pos = pos0; ok = ds41_diff_restore(sl, n); }
+
+    if (ok) ok = ds41_verify_alloc(&vc, 1u);
+    if (ok) {
+        ok = ds41_graph_verify_rows(g, &e->model, &e->weights, &token, 1u, &vc) &&
+             ds41_verify_commit(g, &vc, 1u) &&
+             ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 2);
+    }
+    const uint32_t pos_verify = g->pos;
+
+    if (ok) { g->history = h0; g->pos = pos0; ok = ds41_diff_restore(sl, n); }
+
+    fprintf(stderr, "ds4: dbg state-diff token=%d pos0=%u decode_pos=%u verify_pos=%u ok=%d\n",
+            token, pos0, pos_decode, pos_verify, (int)ok);
+    if (ok) {
+        uint32_t differing = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!sl[i].a || !sl[i].b) continue;
+            if (memcmp(sl[i].a, sl[i].b, (size_t)sl[i].bytes) == 0) continue;
+            differing++;
+            uint64_t at = 0;
+            const unsigned char *pa = sl[i].a, *pb = sl[i].b;
+            while (at < sl[i].bytes && pa[at] == pb[at]) at++;
+            uint64_t ndiff = 0;
+            for (uint64_t k = 0; k < sl[i].bytes; k++) if (pa[k] != pb[k]) ndiff++;
+            const uint64_t fl = at / sizeof(float);
+            float va = 0.0f, vb = 0.0f;
+            if ((fl + 1u) * sizeof(float) <= sl[i].bytes) {
+                memcpy(&va, (const char *)sl[i].a + fl * sizeof(float), sizeof(float));
+                memcpy(&vb, (const char *)sl[i].b + fl * sizeof(float), sizeof(float));
+            }
+            if (differing <= 12)
+                fprintf(stderr,
+                        "ds4: dbg state-diff  %s[%u] bytes=%llu first_diff_at=%llu "
+                        "(float %llu) decode=%.6g verify=%.6g diff_bytes=%llu\n",
+                        sl[i].name, sl[i].index,
+                        (unsigned long long)sl[i].bytes, (unsigned long long)at,
+                        (unsigned long long)fl, (double)va, (double)vb,
+                        (unsigned long long)ndiff);
+        }
+        fprintf(stderr, "ds4: dbg state-diff arrays_differing=%u of %u\n", differing, n);
+    }
+
+    ds41_verify_free(&vc);
+    for (uint32_t i = 0; i < n; i++) { free(sl[i].a); free(sl[i].b); free(sl[i].base); }
+    free(sl);
+    free(logits);
+}
+
 static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
                                           const int *drafts, int draft_n,
                                           int eos_token, bool ignore_eos,
@@ -75014,6 +75149,9 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
      * take the accept rule out of the picture as well. A diagnostic, not a
      * mode. */
     if (draft_n > 1 && getenv("DS4_DS41_VERIFY_ROWS1") != NULL) draft_n = 1;
+    if (getenv("DS4_DS41_VERIFY_STATE_DIFF") != NULL) {
+        ds41_verify_state_diff(s, drafts[0]);
+    }
     if (s->ds41_vc_ready && s->ds41_vc.rows != (uint32_t)draft_n) {
         ds41_verify_free(&s->ds41_vc);
         s->ds41_vc_ready = false;
