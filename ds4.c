@@ -40364,6 +40364,44 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
                                          const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+    /* DS4_DS41_PROJECT_ROWS=1: run the projections one row at a time.
+     * These are GEMMs over `count` rows, and a GEMM tiles differently at 5
+     * rows than at 1, so a row projected inside a batch need not match the
+     * same row projected alone -- which is what a speculative verify requires.
+     * Nothing about the attention launch changes this, which is why forcing a
+     * common kernel arm and a fixed block size both left the diff untouched.
+     * Row strides come from DS41_PREFILL_STORAGE. */
+    if (count > 1u && getenv("DS4_DS41_PROJECT_ROWS") != NULL) {
+        const uint64_t f = sizeof(float);
+        bool ok = true;
+        for (uint32_t r = 0; ok && r < count; r++) {
+            ds4_gpu_tensor *nv = ds4_gpu_tensor_view(b->norm,
+                (uint64_t)r * DS4_N_EMBD * f, (uint64_t)DS4_N_EMBD * f);
+            ds4_gpu_tensor *qrv = ds4_gpu_tensor_view(b->qr,
+                (uint64_t)r * DS4_N_LORA_Q * f, (uint64_t)DS4_N_LORA_Q * f);
+            ds4_gpu_tensor *qv = ds4_gpu_tensor_view(b->q,
+                (uint64_t)r * DS4_N_HEAD * DS4_N_HEAD_DIM * f,
+                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * f);
+            ds4_gpu_tensor *kvv = ds4_gpu_tensor_view(b->kv,
+                (uint64_t)r * DS4_N_HEAD_DIM * f, (uint64_t)DS4_N_HEAD_DIM * f);
+            ok = nv && qrv && qv && kvv &&
+                ds41_matmul_batch(qrv, m, l->attn_q_a, nv, 1u, true) &&
+                ds4_gpu_rms_norm_weight_rows_tensor(qrv, qrv, m->map, m->size,
+                    l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, 1u, DS4_RMS_EPS) &&
+                ds4_gpu_dsv41_quantize(qrv, DS4_N_LORA_Q, 1u, DS4_V41_BF16) &&
+                ds41_matmul_rows_batch(qv, m, l->attn_q_b, qrv,
+                                       g->tp_rank * q_dim, q_dim, 1u) &&
+                ds41_matmul_batch(kvv, m, l->attn_kv, nv, 1u, true) &&
+                ds4_gpu_rms_norm_weight_rows_tensor(kvv, kvv, m->map, m->size,
+                    l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, 1u, DS4_RMS_EPS) &&
+                ds4_gpu_dsv41_quantize(kvv, DS4_N_HEAD_DIM, 1u, DS4_V41_BF16);
+            ds4_gpu_tensor_free(kvv);
+            ds4_gpu_tensor_free(qv);
+            ds4_gpu_tensor_free(qrv);
+            ds4_gpu_tensor_free(nv);
+        }
+        return ok;
+    }
     return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
             l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&

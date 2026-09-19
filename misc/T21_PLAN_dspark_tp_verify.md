@@ -1458,3 +1458,77 @@ thing debug scaffolding does quietly.
 Unchanged. `DS4_CUDA_ATTN_DISPATCH_LOG`, `DS4_CUDA_ATTN_FORCE_GENERIC` and
 `DS4_CUDA_ATTN_FIXED_THREADS` are all opt-in, and the repaired split-KV arm
 behaves as it did before instrumentation.
+
+---
+
+# PHASE 19: it is not one kernel -- it is every batched op, and that closes it
+
+## The projection hypothesis dies too, and then the diff finally moves
+
+`DS4_DS41_PROJECT_ROWS=1` runs `ds41_attention_project_batch`'s GEMMs one row
+at a time. `arrays_differing = 42 of 56`, values bit-identical to the three
+previous attempts. Four configurations, same bits.
+
+Then the MoE:
+
+```
+DS4_METAL_DISABLE_V41_BATCH_MOE=1     arrays_differing = 38 of 56
+                                      first divergence moves window[4] -> window[8]
+```
+
+**The diff moved.** So the MoE batch is a contributor as well -- and fixing one
+batched operation only pushes the first visible divergence deeper into the
+stack.
+
+That is the real answer, and it is broader than "one kernel": **every batched
+operation in the layer is batch-size dependent.** Attention and MoE both are,
+independently. This is ordinary GPU behaviour, not an anomaly -- tiling and
+reduction order vary with row count in essentially any batched kernel.
+
+## And batched verify does not merely differ, it degenerates
+
+With every state fix in place -- capture on the sweep, unified decode, complete
+four-array rollback -- a batched verify still produces:
+
+```
+"...each expert is a two-layer ML ML ML ML ML ML ML ML ..."   (x34)
+accepted_draft=3  full=13  partial=3
+```
+
+So tolerating the difference is not an option either. The reason it degenerates
+rather than drifting is that this is a feedback loop: each accepted token
+commits batch-rounded state, the next one-row decode reads it, and the error
+compounds instead of averaging out. A documented tolerance for "batched
+floating-point operation order" does not survive being fed back into itself.
+
+## Closing position
+
+| approach | correct | faster |
+|---|---|---|
+| batched verify | no -- degenerates | would be |
+| serial verify (`DS4_DS41_SERIAL_VERIFY`) | **yes** -- byte-identical | no -- N one-row sweeps |
+| per-row attention only (`CORE_INVARIANT`) | partial -- windows match, carry lost | -- |
+
+**Serial verify is not a stopgap; it is the only correct option this engine
+admits**, and its cost is inherent rather than incidental. Speculative decode on
+V4.1 is therefore correct and not faster, and closing that gap needs
+batch-invariance across the entire layer -- a pervasive property the engine does
+not have and that no single change confers.
+
+That is a legitimate place to stop. The feature is correct, reproducible, and
+off by default; the remaining work is a kernel-engineering programme, not a bug
+hunt, and it should be costed as one before anyone starts.
+
+## What was tried, so nobody repeats it
+
+| hypothesis | verdict |
+|---|---|
+| rollback incomplete | disproven -- one-row block rolls nothing back, still diverged |
+| accept rule | disproven -- `COMMIT1` diverges identically |
+| sweep arithmetic | disproven -- `max_abs=0` vs decode at one row and chunked |
+| `vc` context / pool indexing / head | disproven -- plain sweep still diverges |
+| dispatch arm | disproven -- forcing a common arm changes nothing |
+| attention block size | disproven -- pinning threads changes nothing |
+| attention projections | disproven -- per-row GEMMs change nothing |
+| MoE batch | **contributes** -- diff moves, does not vanish |
+| pervasive batch-size dependence | **this is it** |
