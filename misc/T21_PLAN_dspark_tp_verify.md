@@ -537,3 +537,66 @@ it is not implicated in either divergence above.
    and cannot be copied per cycle.
 2. Resolve the `i < 3` versus 4-owner disagreement.
 3. Only then chase the one-row divergence, with byte-identity as the test.
+
+---
+
+# PHASE 7: the sweep is fine at every row count; mixing paths is the problem
+
+Two more eliminations, both cheap.
+
+## The one-row sweep is bit-identical to decode
+
+`DS4_METAL_DISABLE_V41_LAYER_PREFILL=1` forces `ds41_prefill_count` to 1, so
+the whole prefix is built one row at a time through the same sweep the verify
+uses:
+
+```
+ds4: decode-consistency compared prefix_tokens=71 ... max_abs=0 rms=0
+```
+
+Identical to the chunked run. **The one-row sweep computes exactly what decode
+computes.** Combined with Phase 5, the sweep is now exonerated at every row
+count tested.
+
+## `ds41_hash_tokens` has no side effects on the graph
+
+`ds41_graph_verify_rows` hashes each row itself, before the sweep, to fill
+`vc->history[]` -- and the sweep hashes the same tokens again. That looked like
+a double-apply, but `ds4_engram_hash` takes the layout **`const`** and mutates
+only the `ds4_engram_history` it is handed, which here is a local copy.
+`g->pos` is saved and restored around the call. The loop is pure.
+
+## What that leaves
+
+Every component is individually correct:
+
+| candidate | verdict |
+|---|---|
+| accept rule | exonerated -- `DS4_DS41_VERIFY_COMMIT1` diverges identically |
+| rollback | exonerated -- `DS4_DS41_VERIFY_ROWS1` rolls nothing back, still diverges |
+| sweep arithmetic, chunked | exonerated -- `max_abs=0` vs decode |
+| sweep arithmetic, one row | exonerated -- `max_abs=0` vs decode |
+| `vc` save helpers | exonerated -- pure copy-out |
+| row-by-row vs batched pool2 | equivalent at `count == 1` |
+| `ds41_hash_tokens` side effects | exonerated -- const layout, local history |
+| `n_head_dim` literal `512` | matches FLASH41 |
+
+So the defect is not in any of these in isolation. It is in **appending
+through the sweep onto state that decode built** -- the one thing nothing else
+in the engine does, and the one thing `--decode-consistency` structurally
+cannot test, because it only ever builds a prefix by a single method and
+compares the result.
+
+## The next step needs instrumentation, not another flag
+
+Snapshot the four arrays `ds41_state_spans` names -- `window[]`,
+`compressed[]`, `index_cache[]`, `previous_kv/score[]` -- after appending one
+token two ways from the same starting state:
+
+1. through the decode path, and
+2. through `ds41_graph_verify_rows` with `count = 1`,
+
+then diff them. Whichever array differs is the bug, and the diff will say
+whether it is a wrong value or a wrong ring index. Everything above has
+narrowed the search to those four arrays and one token; this is now a bounded
+comparison rather than an investigation.
