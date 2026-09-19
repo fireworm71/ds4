@@ -75102,7 +75102,7 @@ static void ds41_verify_state_diff(ds4_session *s, int token) {
                 memcpy(&va, (const char *)sl[i].a + fl * sizeof(float), sizeof(float));
                 memcpy(&vb, (const char *)sl[i].b + fl * sizeof(float), sizeof(float));
             }
-            if (differing <= 12)
+            if (differing <= 60)
                 fprintf(stderr,
                         "ds4: dbg state-diff  %s[%u] bytes=%llu first_diff_at=%llu "
                         "(float %llu) decode=%.6g verify=%.6g diff_bytes=%llu\n",

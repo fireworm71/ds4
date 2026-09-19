@@ -672,3 +672,92 @@ differently. If it is a single kernel choosing a different accumulation order
 or intermediate precision at `count == 1`, making the verify use the decode
 kernel for its rows would preserve the full speedup. The diff above localises
 the search to whatever writes `window[]` between layers 8 and 9.
+
+---
+
+# PHASE 9: it is the `vc` branch, and the kernel is not at fault
+
+## The logical chain, all of it measured
+
+1. `sweep(count = 1, vc = NULL) == decode`, **bit-identical** --
+   `DS4_METAL_DISABLE_V41_LAYER_PREFILL=1` plus `--decode-consistency`,
+   `max_abs=0 rms=0` (Phase 7).
+2. `sweep(count = 1, vc armed) != decode` -- the state diff, 35 of 56 arrays
+   (Phase 8).
+3. Therefore **arming `vc` changes the computation.**
+
+The only place `vc` touches arithmetic is the `if (vc)` branch in
+`ds41_attention_publish_batch`, which pools row by row instead of batched.
+
+## The full diff, by array
+
+```
+window[9] .. window[39]      31 arrays, values one quantisation step apart
+previous_kv[2]               first_diff float 0   decode=0.0510495 verify=0.0562
+previous_score[2]            first_diff float 0   decode=0.46801   verify=0.482915
+compressed[3]                first_diff float 29702
+index_cache[3]               first_diff float 7433
+                             ---- 35 of 56
+```
+
+`previous_kv[2]`/`previous_score[2]` differ from their very first float, across
+1568 of 2048 bytes -- the ratio-2 carry for owner 2 (layers 14-19) is simply a
+different vector. Windows 0-8 are identical; 9 onward diverge, compounding with
+depth.
+
+## The kernel is exact; the caller indexes it wrong
+
+`tests/test_deepseek41_metal.c` already asserts `ds4_gpu_dsv41_pool2` is
+bit-exact across chunk sizes `{257, 1, 2, 3, 17, 127, 128, 129}` -- chunk size
+1 included -- with a plain `memcmp` against the batched reference. So
+row-by-row pooling is not inherently lossy and the kernel is not the bug.
+
+What the test does that the verify does **not**:
+
+```c
+uint32_t pairs = (n + (start & 1u)) / 2;
+ds4_gpu_tensor *o = pairs ? ds4_gpu_tensor_view(out, (uint64_t)(start / 2) * D * 4,
+                                                (uint64_t)pairs * D * 4) : NULL;
+```
+
+* Output is indexed **by pair** (`start / 2`), not by row.
+* Output is **NULL** when the chunk emits no pair.
+
+The verify's branch does neither:
+
+```c
+ds4_gpu_tensor *lat = ds4_gpu_tensor_view(b->latent,
+    (uint64_t)r * DS4_N_HEAD_DIM * sizeof(float),
+    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+...
+ds4_gpu_dsv41_pool2(lat, pk, ps, g->previous_kv[owner],
+                    g->previous_score[owner], DS4_N_HEAD_DIM, 1u, start + r);
+```
+
+It always passes a one-row output view at row `r`, whatever the parity of
+`start + r`. A pair completed at absolute position `p` belongs at output row
+`p / 2 - start / 2`, which equals `r` only by coincidence, and a row that
+completes no pair should pass NULL rather than a live view.
+
+**This is a caller-side indexing defect, stated against the repo's own golden
+test.** It is consistent with every measurement above: the carry vector for an
+owner comes out different, and everything downstream of the first affected
+layer drifts by a quantisation step.
+
+## Fix
+
+Give the `vc` branch the test's indexing: compute `pairs` per row, pass NULL
+when it is zero, and view `b->latent` at the pair offset rather than at `r`.
+The per-row `ds41_verify_save_prev` snapshots can stay -- they are pure
+copy-outs and are the reason the branch exists.
+
+Then re-run, in order:
+
+1. `DS4_DS41_VERIFY_STATE_DIFF=1` -- expect `arrays_differing=0`.
+2. `DS4_DS41_VERIFY_ROWS1=1` greedy -- expect byte-identical output.
+3. Full greedy, single box -- expect byte-identical.
+4. Only then TP2, and only then a speed number.
+
+If step 1 comes back clean, the Phase 6 `compressed[]`/`index_cache[]` snapshot
+gap becomes the next blocker, and it is real: it corrupts every partial accept
+regardless of this fix.
