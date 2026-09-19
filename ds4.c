@@ -41313,6 +41313,13 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
+    /* A one-row append with no verify context is a decode step by another
+     * name, and the drafter's target-layer capture has to happen on it or
+     * DSpark silently starves. ds41_graph_step invalidates the row first; so
+     * does this. The verify (vc != NULL) deliberately does not capture -- its
+     * rows are drafts, not committed frontier state. */
+    const bool sweep_capture = !vc && total_count == 1u && g->dspark_cap != NULL;
+    if (sweep_capture) metal_graph_dspark_capture_row_invalidate(g->dspark_cap);
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
@@ -41560,6 +41567,24 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             DS41_STAGE("hc expand");
 #undef DS41_STAGE
+            /* Mirrors the capture in ds41_graph_step: g->batch.residual is the
+             * hc-expanded [N_HC, N_EMBD] state for this row, and row 0 is the
+             * only row when total_count == 1. Commands are still open here,
+             * which is what capture_hc expects. */
+            if (ok && sweep_capture && count == 1u) {
+                const int slot = metal_graph_dspark_target_slot(g->dspark_cap, il);
+                if (slot >= 0) {
+                    ok = metal_graph_dspark_capture_hc(g->dspark_cap,
+                                                       g->batch.residual,
+                                                       (uint32_t)slot);
+                    if (getenv("DS4_DSPARK_DEBUG"))
+                        fprintf(stderr,
+                                "ds4: dbg sweep-capture il=%u slot=%d ok=%d valid=%d mask=%u\n",
+                                il, slot, (int)ok,
+                                g->dspark_cap->dspark_capture_valid,
+                                g->dspark_cap->dspark_capture_mask);
+                }
+            }
             if (ok && wide && il + 1u < DS4_N_LAYER) {
                 ok = ds41_carry_copy(g, off, count, true);
             }
@@ -75143,7 +75168,12 @@ static void ds41_verify_state_diff(ds4_session *s, int token) {
     const uint32_t pos0 = g->pos;
     bool ok = ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 0);
 
-    if (ok) ok = ds41_graph_step(g, &e->model, &e->weights, token, logits) &&
+    /* Must compare against whichever decode the session actually runs, or the
+     * probe measures a pair that nothing uses. */
+    const bool unified = getenv("DS4_DS41_UNIFY_DECODE") != NULL;
+    if (ok) ok = (unified
+                      ? ds41_graph_step_via_sweep(g, &e->model, &e->weights, token, logits)
+                      : ds41_graph_step(g, &e->model, &e->weights, token, logits)) &&
                  ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 1);
     const uint32_t pos_decode = g->pos;
 

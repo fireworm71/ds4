@@ -984,3 +984,88 @@ yet a speculative-decode result.** The default path is untouched.
    a formality.
 3. Then `DS4_DS41_VERIFY_STATE_DIFF` should report `arrays_differing=0`.
 4. Then TP2, then a speed number against the 21.55 tg/s control.
+
+---
+
+# PHASE 13: the one-row verify is now correct; the defect is multi-row only
+
+## The capture gap is closed
+
+`ds41_graph_prefill_sweep` now performs the drafter's target-layer capture when
+it is doing a decode-equivalent append -- one row, no verify context -- mirroring
+what `ds41_graph_step` does in its own layer loop. The verify deliberately does
+not capture: its rows are drafts, not committed frontier.
+
+With that, the drafter proposes under unified decode (`proposed=79`, then 90 and
+93 across runs), so the identity results below are no longer vacuous.
+
+## State is now bit-exact at one row
+
+```
+DS4_DS41_UNIFY_DECODE=1  DS4_DS41_VERIFY_STATE_DIFF=1
+state-diff token=10021 pos0=59 decode_pos=60 verify_pos=60 ok=1
+state-diff arrays_differing=0 of 56
+```
+
+**Zero.** Routing decode through the same sweep the verify uses makes the two
+appends identical, exactly as Phase 11 predicted. The state divergence that has
+blocked this since Phase 4 is fixed for `count == 1`.
+
+## And the output confirms it
+
+```
+DS4_DS41_UNIFY_DECODE=1  DS4_DS41_VERIFY_ROWS1=1
+cycles=106  proposed=90  accepted_draft=0
+greedy output: BYTE-IDENTICAL to no-speculation
+```
+
+The verify machinery ran 106 times against 90 proposals and corrupted nothing.
+`accepted_draft=0` because clamping to one row makes `commit == draft_n`, so no
+*extra* token is ever taken -- this proves the path is sound, not that it is
+useful.
+
+## Multi-row still corrupts, and now that is the whole remaining defect
+
+Unclamped, the same configuration degenerates:
+
+```
+"...each expert is a two-layer ML ML ML ML ML ML ML ML ML ML ML ..."   (x34)
+```
+
+That is not floating-point reordering. So the defect is now **specific to
+`count > 1`**, and there are exactly two candidates, both already identified:
+
+1. **The Phase 6 rollback gap.** `ds41_verify_ctx` never snapshots
+   `compressed[]` or `index_cache[]`, so every partial commit (`keep < rows`)
+   leaves them advanced past the accepted prefix. `partial=3` in the run above.
+   This only ever fires for multi-row blocks -- a one-row block always commits
+   in full, which is precisely why ROWS1 is clean.
+2. **N-row batch versus N successive one-row appends.** Even a full commit
+   leaves batch-rounded state where serial decode would have left
+   serially-rounded state. The engine's own warning already covers this
+   ("output may differ from one-token decode due to batched floating-point
+   operation order"), so it is tolerated by design -- but it is not tolerated
+   by the accept rule, which compares against serially-produced logits.
+
+## Why this matters for the Phase 6 fix
+
+That fix was previously **unvalidatable** -- output was wrong for other reasons,
+so byte-identity could not tell whether the snapshot change helped. It is
+validatable now: `ROWS1` gives a known-correct baseline, and a multi-row run
+can be compared against it directly.
+
+That makes the rollback snapshot the next concrete piece of work, with a test
+that can actually fail.
+
+## Status of the flags
+
+All off by default; the default decode path is untouched.
+
+| flag | effect |
+|---|---|
+| `DS4_DS41_UNIFY_DECODE` | decode via the sweep + head; makes verify state exact at one row |
+| `DS4_DS41_VERIFY_ROWS1` | clamp the verify to one row; correct, and no speculation gain |
+| `DS4_DS41_VERIFY_BATCHED_POOL` | force the batched pool with `vc` armed |
+| `DS4_DS41_VERIFY_PLAIN_SWEEP` | withhold `vc` and skip the head |
+| `DS4_DS41_VERIFY_STATE_DIFF` | 1 = decode vs verify, 2 = decode vs decode (self-check) |
+| `DS4_DS41_VERIFY_TIME` | per-token append cost, both paths |
