@@ -97,3 +97,65 @@ throughput optimisation on this pair and should not be described as one.
 **Do not spend further effort on the streaming expert cache.** Two measured
 nulls bracket it: machinery is 4 us on a hit (T13) and I/O is overlapped
 (T17).
+
+
+---
+
+# CORRECTION (same day): two claims in this note were wrong
+
+## 1. "Default it on" -- it is not, and it should not be
+
+The Disposition above says to default partitioning on. The code does not: the
+quota is opt-in via `getenv("DS4_CUDA_EXPERT_PARTITION")`. The commit message
+for this work described a disposition the code never implemented. Leaving it
+opt-in is now the *correct* answer for the reason below, so the code stays as
+written and this note is the correction.
+
+## 2. "Helps any configuration whose fetching is not overlapped" -- refuted
+
+That sentence was reasoning, not measurement. Tested on Q4 **single box**
+streaming, 16K/512, fetch threads 8 -- the most favourable case available,
+because decode I/O there is **43.4 s of an 88.9 s decode (49%)** against only
+20% under TP2:
+
+| metric | control | partitioned | change |
+|---|---|---|---|
+| decode hit rate | 84.5% | **84.1%** | **-0.4 pp** |
+| decode fetched | 353.73 GiB | **363.13 GiB** | **+2.7%** |
+| decode load time | 43.378 s | 43.445 s | +0.2% |
+| pp | 147.63 | 146.86 | -0.5% |
+| tg | 5.76 | 5.76 | 0.0% |
+
+Partitioning made the hit rate marginally **worse** and moved slightly **more**
+bytes. The claim does not hold.
+
+## Why, and the rule that actually governs it
+
+Partitioning pays only when the per-layer quota is at least the layer's hot-set
+size, and costs a little when it is not:
+
+| configuration | experts/layer owned | quota | selections/call | outcome |
+|---|---|---|---|---|
+| Q4 **TP2** | 192 | 98 | ~3 (rank owns half the 6) | 63.5% -> **95.9%** |
+| Q4 **single box** | 384 | 99 | 6 | 84.5% -> 84.1% |
+
+Under TP2 the ownership filter halves both the expert population and the
+per-call demand, so a 98-slot quota comfortably covers the layer's working set
+(the hot-set report put the top 61 at ~94% coverage). On a single box the same
+99 slots face 384 experts and twice the per-call demand, so the quota binds
+tighter than the hot set and simply removes the flexibility global LRU had to
+let a busy layer borrow slots from an idle one.
+
+So the honest scope is narrow: **partitioning is a large cache-behaviour win
+for network TP specifically, worth nothing for throughput anywhere measured,
+and mildly counterproductive single box.** Opt-in is right.
+
+## What this test does *not* show
+
+It does not confirm or deny the overlap explanation for T17's null. The two
+single-box arms had nearly identical hit rates (84.5 vs 84.1), so there was no
+I/O change for throughput to respond to. Whether decode fetching is overlapped
+with compute remains inferred from the TP2 result alone, and the direct
+measurement -- GPU kernel time via `DS4_METAL_DECODE_STAGE_PROFILE` -- is still
+owed. The compute-bound conclusion in T16/T17 rests on two negatives and should
+be treated as provisional until someone measures the positive.
