@@ -464,3 +464,76 @@ speculative path.
 
 Confirming the state hypothesis therefore needs either a probe placed inside
 the speculative loop, or the replay experiment above.
+
+---
+
+# PHASE 6: the verify snapshot is missing two of the four persistent arrays
+
+`ds41_state_spans` is the engine's own authority on what V4.1 graph state
+persists -- it is what session save/restore serialises, and its comment is
+explicit: "Only owner caches, windows and unfinished compression pairs
+persist."
+
+```c
+static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos, ...) {
+    for (uint32_t il = 0; il < 40; il++)
+        spans[n++] = {g->window[il],        raw * 512 * 4};
+    for (uint32_t i = 0; i < 4; i++) {
+        spans[n++] = {g->compressed[i],     live * 512 * 4};
+        spans[n++] = {g->index_cache[i],    live * 128 * 4};
+        if (i < 3 && (pos & 1u)) {
+            spans[n++] = {g->previous_kv[i],    512 * 4};
+            spans[n++] = {g->previous_score[i], 512 * 4};
+        }
+    }
+}
+```
+
+Against what the verify snapshots and restores:
+
+| persistent state | in `ds41_state_spans` | saved by `ds41_verify_ctx` | restored by `ds41_verify_commit` |
+|---|---|---|---|
+| `window[il]` x40 | yes | yes (`vc->win`) | yes |
+| `previous_kv[i]` / `previous_score[i]` | yes | yes (`vc->prev`) | yes |
+| **`compressed[i]` x4** | **yes** | **no** | **no** |
+| **`index_cache[i]` x4** | **yes** | **no** | **no** |
+
+**The compressed-KV rings and the index caches are never snapshotted and never
+restored.** On any partial accept -- `keep < rows` -- the verify rolls back the
+window and the ratio-2 carry, then leaves `compressed[]` and `index_cache[]`
+advanced past the accepted prefix, permanently out of step with `g->pos`.
+
+Partial accepts are not an edge case: the runs above recorded `partial=13`
+(single box), `partial=7` (TP2, scheduler off) and `partial=2` (TP2, scheduler
+on). Every one of those corrupted the session.
+
+This is a definite defect, independently of the one-row divergence. It is worth
+stating that the two are separate:
+
+* **Incomplete rollback** (this section) -- explains corruption on every
+  partial accept. Precisely identified.
+* **Sweep-append divergence** (Phase 5) -- `DS4_DS41_VERIFY_ROWS1` commits in
+  full and rolls nothing back, and still diverges. Not explained by this.
+
+Fixing only the first will not produce correct output, which is why it is left
+here as a described defect rather than a patch: the fix needs the second bug
+resolved alongside it so that greedy byte-identity can actually validate it.
+Shipping an unverifiable change into a distributed lockstep path is worse than
+naming it precisely.
+
+## A smaller discrepancy in the same area
+
+`ds41_state_spans` carries `previous_kv/previous_score` for **`i < 3`** only,
+while `ds41_verify_ctx` allocates and `ds41_verify_commit` restores **4**
+owners (layers 2/8/14/20, guarded by `ds4_layer_compress_ratio(il) == 2`). One
+of the two is wrong about owner 3. Worth resolving while in this code, though
+it is not implicated in either divergence above.
+
+## Where a fix should start
+
+1. Mirror `ds41_verify_ring` for `compressed[i]` and `index_cache[i]`, saving
+   only the rows the block touches (`pos0/ratio .. (pos0+rows)/ratio`) rather
+   than the whole ring -- the full rings are ~16 MiB per owner at 16K context
+   and cannot be copied per cycle.
+2. Resolve the `i < 3` versus 4-owner disagreement.
+3. Only then chase the one-row divergence, with byte-identity as the test.
