@@ -913,3 +913,74 @@ These are real regardless of what happens to speculative decode:
 * The `vc` branch indexed the pooled output by row rather than by pair and
   passed a live view where the golden test passes NULL -- fixed here, latent
   for multi-row blocks at odd starts (Phase 9/10).
+
+---
+
+# PHASE 12: the decision measurement, and a prototype that is not yet a result
+
+## Unification is not disqualified on cost -- the sweep is cheaper
+
+`DS4_DS41_VERIFY_TIME=N` appends the same token N times from the same state
+through each path, warmed, and reports the per-token cost:
+
+```
+append-time reps=32  decode=124.146 ms/token  sweep1=78.276 ms/token  ratio=0.631
+```
+
+The one-row sweep is **37% cheaper** than the specialised decode path. The
+Phase 11 worry that unifying would cost too much is not supported.
+
+Two caveats worth carrying:
+
+* Measured under SSD streaming on one box. Q2 does not fit a single box
+  resident, and the probe cannot run under TP without breaking lockstep, so
+  the resident ratio is unmeasured.
+* Much of the gap is probably not kernel efficiency. The engine's own comment
+  notes decode issues Engram reads "2 tables x DS4_ENGRAM_COLS rows at queue
+  depth 1 (ds4_engram.c:161) while prefill uses the threaded batch path", and
+  the startup log reports "Engram disk-only" in both streaming and resident
+  configurations. If that is the bulk of it, the advantage should carry.
+
+## The prototype runs, and its headline result is vacuous
+
+`DS4_DS41_UNIFY_DECODE=1` routes session decode through
+`ds41_graph_step_via_sweep` -- the same sweep the verify uses, plus the output
+head. It produces coherent, on-topic text, so the plumbing is right.
+
+Greedy output with `--dspark` then came back **byte-identical** to greedy
+output without it. That looked like the fix landing. It is not:
+
+```
+cycles=127  proposed=0  accepted_draft=0  draft_len_hist=none
+```
+
+**The drafter never proposed.** Identical output between "no speculation" and
+"speculation that never happened" says nothing at all. Recording this
+explicitly because it is exactly the shape of result that gets mistaken for
+success -- and because T19 already lost a session to a null result from a run
+that never reached the code under test.
+
+## Why it stopped drafting, and what is left
+
+The DSpark hidden-state capture lives inside `ds41_graph_step`'s **layer
+loop**: at each drafter target layer it calls
+`metal_graph_dspark_target_slot` and reduces that layer's output hidden into
+`dspark_target_hidden[slot]`. `ds41_graph_prefill_sweep` has its own layer
+loop and no such hook, so a unified decode silently starves the drafter.
+
+Finishing the unification therefore means adding the capture to the sweep's
+layer loop, for the frontier row only. That is more invasive than the rest of
+the prototype and easy to get quietly wrong, which is the whole failure mode
+this note keeps documenting.
+
+**Status: `DS4_DS41_UNIFY_DECODE` is a working plain-decode prototype and not
+yet a speculative-decode result.** The default path is untouched.
+
+## Next
+
+1. Add the target-layer capture to the sweep's layer loop, frontier row only.
+2. Re-run with `DS4_DSPARK_STATS=1` and require `proposed > 0` **before**
+   reading the byte-identity result. The stats check is the precondition, not
+   a formality.
+3. Then `DS4_DS41_VERIFY_STATE_DIFF` should report `arrays_differing=0`.
+4. Then TP2, then a speed number against the 21.55 tg/s control.

@@ -41627,6 +41627,49 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
  * The caller owns vc: allocate with ds41_verify_alloc(vc, count) once per
  * session and reuse it, since the undo log is sized by row count alone.
  */
+/* DS4_DS41_UNIFY_DECODE=1: advance one token through the same sweep the
+ * speculative verify uses, then apply the output head, instead of taking the
+ * specialised decode path.
+ *
+ * The two paths round differently -- they are different kernels -- and a
+ * speculative verify has to leave exactly the state decode would, so no amount
+ * of bug-fixing can reconcile them. Routing decode through the sweep makes them
+ * bit-exact by construction. Measured cost of the append itself on this box was
+ * 78.3 ms/token for the sweep against 124.1 ms/token for decode, so this is not
+ * obviously a sacrifice; the streaming-vs-resident question is open.
+ *
+ * The sweep already advances g->pos and g->history, so this only adds the head
+ * that ds41_graph_verify_rows applies to its rows. */
+static DS4_MAYBE_UNUSED bool ds41_graph_step_via_sweep(ds41_gpu_graph *g,
+                                                       const ds4_model *m,
+                                                       const ds4_weights *w,
+                                                       int token, float *logits) {
+    static ds4_gpu_tensor *head_logits = NULL;
+    if (!g || !g->valid || g->pos >= g->ctx ||
+        token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+
+    if (!ds41_graph_prefill_sweep(g, m, w, &token, 1u, NULL, NULL, 0,
+                                  NULL, NULL, false, false, NULL)) return false;
+    if (!logits) return true;
+
+    if (!head_logits) {
+        head_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_VOCAB * sizeof(float));
+        if (!head_logits) return false;
+    }
+    ds41_prefill_row *b = &g->batch;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre,
+                                                DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, 1u, DS4_V41_BF16);
+    if (ok) ok = ds41_norm_batch(b->norm, b->x, m, w->output_norm, 1u);
+    if (ok) ok = ds41_output_projection(g, head_logits, m, w, b->norm, 1u);
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok) ok = ds4_gpu_tensor_read(head_logits, 0, logits,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    if (!ok) (void)ds4_gpu_synchronize();
+    return ok;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                                                     const ds4_model *m,
                                                     const ds4_weights *w,
@@ -73099,7 +73142,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         if (!s->ds41_graph_ready ||
             (!s->checkpoint_valid && s->checkpoint.len != 0) ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len ||
-            !ds41_graph_step(&s->ds41_graph, &e->model, &e->weights, token, s->logits)) {
+            !(getenv("DS4_DS41_UNIFY_DECODE") != NULL
+                  ? ds41_graph_step_via_sweep(&s->ds41_graph, &e->model,
+                                              &e->weights, token, s->logits)
+                  : ds41_graph_step(&s->ds41_graph, &e->model, &e->weights,
+                                    token, s->logits))) {
             s->checkpoint_valid = false;
             if (errlen) snprintf(err, errlen, "V4.1 decode failed at position %d", s->checkpoint.len);
             return 1;
@@ -75125,6 +75172,53 @@ static void ds41_verify_state_diff(ds4_session *s, int token) {
 
     fprintf(stderr, "ds4: dbg state-diff token=%d pos0=%u decode_pos=%u verify_pos=%u ok=%d\n",
             token, pos0, pos_decode, pos_verify, (int)ok);
+
+    /* DS4_DS41_VERIFY_TIME=N: the decision measurement for unifying the two
+     * append paths. They round differently because they are different kernels,
+     * and the only way to make a speculative verify bit-exact against decode is
+     * to have decode use the sweep. Whether that is affordable is exactly the
+     * ratio below: cost of appending one token through ds41_graph_prefill_sweep
+     * versus through ds41_graph_step, same token, same starting state, warmed.
+     *
+     * Note this says nothing about batched verify throughput -- it is the cost
+     * of giving up the specialised decode path, measured on its own. */
+    if (ok) {
+        const char *tenv = getenv("DS4_DS41_VERIFY_TIME");
+        const int reps = tenv ? (atoi(tenv) > 0 ? atoi(tenv) : 16) : 0;
+        if (reps > 0 && (uint32_t)(reps + 8) < g->ctx - pos0) {
+            double decode_ms = 0.0, sweep_ms = 0.0;
+            for (int pass = 0; pass < 2 && ok; pass++) {
+                const int n_it = pass == 0 ? 4 : reps;   /* pass 0 warms */
+
+                ok = ds41_diff_restore(sl, n);
+                g->history = h0; g->pos = pos0;
+                double t0 = now_sec();
+                for (int i = 0; ok && i < n_it; i++)
+                    ok = ds41_graph_step(g, &e->model, &e->weights, token, logits);
+                ok = ok && ds4_gpu_synchronize() != 0;
+                if (pass) decode_ms = (now_sec() - t0) * 1000.0 / (double)n_it;
+
+                ok = ok && ds41_diff_restore(sl, n);
+                g->history = h0; g->pos = pos0;
+                t0 = now_sec();
+                for (int i = 0; ok && i < n_it; i++)
+                    ok = ds41_graph_prefill_sweep(g, &e->model, &e->weights, &token, 1u,
+                                                  NULL, NULL, 0, NULL, NULL,
+                                                  false, false, NULL);
+                ok = ok && ds4_gpu_synchronize() != 0;
+                if (pass) sweep_ms = (now_sec() - t0) * 1000.0 / (double)n_it;
+            }
+            if (ok) {
+                ok = ds41_diff_restore(sl, n);
+                g->history = h0; g->pos = pos0;
+            }
+            fprintf(stderr,
+                    "ds4: dbg append-time reps=%d decode=%.3f ms/token "
+                    "sweep1=%.3f ms/token ratio=%.3f ok=%d\n",
+                    reps, decode_ms, sweep_ms,
+                    decode_ms > 0.0 ? sweep_ms / decode_ms : 0.0, (int)ok);
+        }
+    }
     if (ok) {
         uint32_t differing = 0;
         for (uint32_t i = 0; i < n; i++) {
