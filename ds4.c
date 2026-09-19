@@ -41212,6 +41212,8 @@ typedef struct ds41_verify_ctx {
     uint32_t rows, pos0;
     ds4_gpu_tensor *win;    /* DS4_N_LAYER * rows * 512 floats */
     ds4_gpu_tensor *prev;   /* 4 owners * rows * 2 * 512 floats */
+    ds4_gpu_tensor *comp;   /* 4 owners * (rows+1) * 512 floats */
+    ds4_gpu_tensor *idx;    /* 4 owners * (rows+1) * 128 floats */
     ds4_gpu_tensor *logits; /* rows * DS4_N_VOCAB, device */
     ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
     float *row_logits;      /* rows * DS4_N_VOCAB, host */
@@ -41221,6 +41223,8 @@ static DS4_MAYBE_UNUSED void ds41_verify_free(ds41_verify_ctx *vc) {
     if (!vc) return;
     ds4_gpu_tensor_free(vc->win);
     ds4_gpu_tensor_free(vc->prev);
+    ds4_gpu_tensor_free(vc->comp);
+    ds4_gpu_tensor_free(vc->idx);
     ds4_gpu_tensor_free(vc->logits);
     free(vc->row_logits);
     memset(vc, 0, sizeof(*vc));
@@ -41232,9 +41236,12 @@ static DS4_MAYBE_UNUSED bool ds41_verify_alloc(ds41_verify_ctx *vc, uint32_t row
     vc->rows = rows;
     vc->win = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * rows * DS41_VERIFY_KV_ROW);
     vc->prev = ds4_gpu_tensor_alloc((uint64_t)4u * rows * 2u * DS41_VERIFY_KV_ROW);
+    vc->comp = ds4_gpu_tensor_alloc((uint64_t)4u * (rows + 1u) * 512u * sizeof(float));
+    vc->idx  = ds4_gpu_tensor_alloc((uint64_t)4u * (rows + 1u) * 128u * sizeof(float));
     vc->logits = ds4_gpu_tensor_alloc((uint64_t)rows * DS4_N_VOCAB * sizeof(float));
     vc->row_logits = malloc((size_t)rows * DS4_N_VOCAB * sizeof(float));
-    if (!vc->win || !vc->prev || !vc->logits || !vc->row_logits) {
+    if (!vc->win || !vc->prev || !vc->comp || !vc->idx ||
+        !vc->logits || !vc->row_logits) {
         ds41_verify_free(vc);
         return false;
     }
@@ -41262,6 +41269,48 @@ static DS4_MAYBE_UNUSED bool ds41_verify_ring(ds41_verify_ctx *vc, ds4_gpu_tenso
                                (uint64_t)(n - head) * DS41_VERIFY_KV_ROW));
 }
 
+/* ds41_state_spans names four persistent arrays; the snapshot above covers
+ * only window[] and the ratio-2 carry. compressed[] and index_cache[] were
+ * left advanced past the accepted prefix on every partial commit, which is why
+ * a one-row block (which always commits in full, so never rolls back) is clean
+ * while a multi-row block corrupts.
+ *
+ * Unlike window[], these are linear in the compressed row index rather than a
+ * 128-slot ring, so a block touches one contiguous run per owner: rows
+ * [ (pos0 + from) / ratio, (pos0 + rows) / ratio ). Saving the whole run and
+ * restoring only its tail from `keep` leaves the accepted prefix's rows in
+ * place. A row straddling the accept boundary completed on a rejected
+ * position, so reverting it is correct -- its accepted half lives in the
+ * previous_kv/previous_score carry, which ds41_verify_commit restores. */
+static DS4_MAYBE_UNUSED bool ds41_verify_caches(ds41_verify_ctx *vc, ds41_gpu_graph *g,
+                                                uint32_t from, bool save) {
+    const uint64_t crow = 512u * sizeof(float);
+    const uint64_t irow = 128u * sizeof(float);
+    const uint32_t cap = vc->rows + 1u;
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < 4u; i++) {
+        const uint32_t ratio = i < 3u ? 2u : 1u;
+        const uint32_t base = vc->pos0 / ratio;
+        const uint32_t a = (vc->pos0 + from) / ratio;
+        const uint32_t b = (vc->pos0 + vc->rows) / ratio;
+        if (b <= a || !g->compressed[i] || !g->index_cache[i]) continue;
+        const uint32_t n = b - a;
+        if (a < base || (a - base) + n > cap) continue;   /* never overrun the snapshot */
+        const uint64_t cs = ((uint64_t)i * cap + (a - base)) * crow;
+        const uint64_t is = ((uint64_t)i * cap + (a - base)) * irow;
+        const uint64_t ca = (uint64_t)a * crow;
+        const uint64_t ia = (uint64_t)a * irow;
+        if (save) {
+            ok = ds4_gpu_tensor_copy(vc->comp, cs, g->compressed[i], ca, (uint64_t)n * crow) &&
+                 ds4_gpu_tensor_copy(vc->idx, is, g->index_cache[i], ia, (uint64_t)n * irow);
+        } else {
+            ok = ds4_gpu_tensor_copy(g->compressed[i], ca, vc->comp, cs, (uint64_t)n * crow) &&
+                 ds4_gpu_tensor_copy(g->index_cache[i], ia, vc->idx, is, (uint64_t)n * irow);
+        }
+    }
+    return ok;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_verify_save_window(ds41_verify_ctx *vc, ds41_gpu_graph *g, uint32_t il) {
     return ds41_verify_ring(vc, g->window[il], il, 0, true);
 }
@@ -41286,6 +41335,7 @@ static DS4_MAYBE_UNUSED bool ds41_verify_commit(ds41_gpu_graph *g,
         if (!ds4_gpu_begin_commands()) return false;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++)
             ok = ds41_verify_ring(vc, g->window[il], il, keep, false);
+        if (ok) ok = ds41_verify_caches(vc, g, keep, false);
         for (uint32_t owner = 0; ok && owner < 4u; owner++) {
             const uint32_t il = owner == 0 ? 2u : owner == 1 ? 8u : owner == 2 ? 14u : 20u;
             if (ds4_layer_compress_ratio(il) != 2u) continue;
@@ -41725,6 +41775,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
      * probe can tell whether ds41_graph_verify_rows diverges from decode
      * because of the sweep itself or because of what this function adds
      * around it. Diagnostic: the row logits are left unfilled. */
+    /* Before the sweep touches them. The window snapshot is taken per layer
+     * inside the sweep because the ring is rewritten layer by layer; these two
+     * are written only at the kv/index source layers, so one save up front
+     * covers the block. */
+    if (!ds4_gpu_begin_commands()) return false;
+    if (!ds41_verify_caches(vc, g, 0, true)) { (void)ds4_gpu_end_commands(); return false; }
+    if (!ds4_gpu_end_commands()) return false;
     const bool plain_sweep = getenv("DS4_DS41_VERIFY_PLAIN_SWEEP") != NULL;
     if (!ds41_graph_prefill_sweep(g, m, w, tokens, count, NULL, NULL, 0,
                                   NULL, NULL, false, false,
@@ -75189,9 +75246,17 @@ static void ds41_verify_state_diff(ds4_session *s, int token) {
         ok = ds41_graph_step(g, &e->model, &e->weights, token, logits) &&
              ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 2);
     } else {
-        if (ok) ok = ds41_verify_alloc(&vc, 1u);
+        /* mode 3: verify R rows and commit only the first, so the rollback has
+         * to put everything back. Compared against a single decode step, any
+         * difference is state the rollback failed to restore -- which a
+         * one-row block can never expose, because it always commits in full. */
+        const bool multi = mode && mode[0] == '3';
+        const uint32_t rows = multi ? 5u : 1u;
+        int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
+        for (uint32_t i = 0; i < rows; i++) drafts[i] = token;
+        if (ok) ok = ds41_verify_alloc(&vc, rows);
         if (ok) {
-            ok = ds41_graph_verify_rows(g, &e->model, &e->weights, &token, 1u, &vc) &&
+            ok = ds41_graph_verify_rows(g, &e->model, &e->weights, drafts, rows, &vc) &&
                  ds41_verify_commit(g, &vc, 1u) &&
                  ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 2);
         }

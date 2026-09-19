@@ -1069,3 +1069,84 @@ All off by default; the default decode path is untouched.
 | `DS4_DS41_VERIFY_PLAIN_SWEEP` | withhold `vc` and skip the head |
 | `DS4_DS41_VERIFY_STATE_DIFF` | 1 = decode vs verify, 2 = decode vs decode (self-check) |
 | `DS4_DS41_VERIFY_TIME` | per-token append cost, both paths |
+
+---
+
+# PHASE 14: the blocker is batch-size-dependent rounding, and it is fundamental
+
+## The rollback is not the problem
+
+`DS4_DS41_VERIFY_STATE_DIFF=3` verifies **5 rows and commits only the first**,
+so the rollback has to put everything back, then compares against a single
+decode step:
+
+```
+state-diff token=10021 pos0=59 decode_pos=60 verify_pos=60 ok=1
+  window[4]  first_diff float 30215  decode=-0.00537109 verify=-0.00634766
+  window[8]  first_diff float 30208  decode=-0.015625   verify=-0.00219727
+  window[9]  first_diff float 30210  decode=-0.40625    verify=-0.4375
+  ...
+```
+
+`30208 / 512 = slot 59`, and `pos0 = 59`. **The differing slot is the accepted
+row itself**, not one of the four that were rolled back.
+
+So the rollback restores correctly. What differs is the *kept* row: a 5-row
+sweep computes row 0's keys differently from a 1-row sweep computing the same
+row from the same state.
+
+Set beside the mode-1 result under unified decode -- `arrays_differing=0` at
+`rows = 1` -- this is a controlled demonstration: **same input, same position,
+same kernels, different batch size, different result.**
+
+## Consequence
+
+The accepted tokens' state depends on the batch shape they were computed in,
+and every subsequent decode step is one row. So a batched verify can never
+leave the state serial decode would, for any accept rule, any rollback, and any
+snapshot. Concretely:
+
+* **Fixing the rollback cannot help.** The snapshot gap was real and is now
+  implemented (below), but it was never what corrupted the output.
+* **Replay does not pay.** Under unified decode a one-row append is 78 ms
+  against a 124 ms specialised decode, so replaying `k` accepted tokens costs
+  what emitting them serially costs -- and the propose and verify batch are
+  then pure overhead.
+* **Tolerating the difference is not available.** The engine documents that
+  speculative decode "may differ from one-token decode due to batched
+  floating-point operation order", but the observed divergence degenerates into
+  `"ML ML ML ML ..."`, which is not a tolerable difference.
+
+**Speculative decode on this engine needs batch-size-invariant kernels.** The
+per-row result must not depend on how many rows share the dispatch -- most
+likely a GEMM tiling or reduction-order property. That is a CUDA kernel change,
+not an orchestration one, and it is the single remaining prerequisite.
+
+## What is now fixed, and what it is worth
+
+| piece | state |
+|---|---|
+| corrupt sidecars | deleted; `q4v3` verified byte-identical on both boxes |
+| load-time finiteness guard | in |
+| TP declines instead of aborting | in |
+| V4.1 verify wired to the TP protocol, lockstep proven | in, off by default |
+| drafter capture on the sweep | in -- without it a unified decode starves the drafter |
+| unified decode (`DS4_DS41_UNIFY_DECODE`) | makes verify state exact at one row |
+| `compressed[]`/`index_cache[]` snapshot | implemented; a real gap named by `ds41_state_spans`, but **it changed no observed behaviour**, because the dominant fault is the rounding above. Kept on correctness grounds, not on evidence of effect. |
+| one-row verify | **byte-identical output** across 106 verify cycles, 90 proposals |
+| multi-row verify | corrupts, for the reason above |
+
+## If someone picks this up
+
+The harness is the durable asset. `DS4_DS41_VERIFY_STATE_DIFF` has three modes
+(1 = decode vs verify, 2 = decode vs decode self-check, 3 = multi-row verify
+with a one-row commit), `DS4_DS41_VERIFY_TIME` measures per-token append cost
+on both paths, and four more flags isolate the pool, the verify context, the
+head and the row count. All are off by default and single-box; none needs a
+drafter, a sidecar or a second machine to reproduce the core result.
+
+The question to answer first is narrow: **does a one-row and a five-row sweep
+produce bit-identical output for the shared row?** If a kernel can be made
+batch-invariant cheaply, everything above becomes useful at once. If not, V4.1
+speculative decode should be closed out, and the 21.55 tg/s target-only path is
+the answer.
