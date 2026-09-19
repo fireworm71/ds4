@@ -280,3 +280,101 @@ a low bar for a batched path that already exists.
 **Verdict: proceed to Phase 3.** The residual risk is concentrated in one
 measurable quantity -- the cost of a 5-row verify batch under TP2 -- and not in
 whether the drafter works.
+
+---
+
+# PHASE 3/4 RESULT: TP lockstep works; the batched verify does not
+
+## Phase 3 is implemented and the protocol is sound
+
+The V4.1 verify is now wired to the existing TP frames: the leader announces
+the block with `DS4_TP_FRAME_VERIFY` before touching anything, both ranks run
+`ds41_graph_verify_rows` and meet inside the MoE exchange, the leader sends
+FULL or PREFIX with the keep count, and both apply `ds41_verify_commit`.
+
+On the pair this **runs to completion with no divergence, no aborts and no
+errors** -- 256 tokens at 16K context, `full=32 partial=7`, worker log clean.
+The `tp_world == 2` guard really was liftable: `ds41_graph_prefill_sweep`
+handles the rows and `ds41_verify_commit` is rank-local, exactly as section 2
+predicted.
+
+## Phase 4 failed, and found something bigger
+
+Greedy output (`--temp 0`, 128 tokens, identical prompt) is **not** preserved:
+
+```
+TP2      common prefix 14 bytes, then: "...CYP? Need detailed technical
+         explanation of how tensor parallelism split MoE layer<|begin_of"
+single   common prefix 16 bytes, then: "...mixture-of-exper MoE layer across
+         two machines."
+```
+
+Stray tokens and spliced word fragments -- well outside the "batched
+floating-point operation order" tolerance the engine warns about.
+
+**Single box diverges too.** This is not a TP bug.
+
+### The engine's own diagnostic localises it exactly
+
+`DS4_DS41_VERIFY_COMMIT1=1` accepts only `drafts[0]`, which the caller has
+already matched against the target's own logits. Its comment states the
+contract:
+
+> Any divergence from serial output under that setting is the batch's effect
+> on state, not the accept rule -- a diagnostic separation, not a mode.
+
+Run with it, single box: **diverges at the same 16-byte prefix, into the same
+"mixture-of-exper MoE" corruption** as the full speculative run.
+
+**So the fault is the verify batch's effect on graph state, not the accept
+rule, not the row logits, and not anything added for TP.** Running `count` rows
+through `ds41_graph_prefill_sweep` with the verify context armed and then
+rolling back does not leave the graph where serial decode would have left it.
+
+This is what 24f087d set out to avoid -- "the rows go through the real sweep
+rather than a narrowed copy, because the verifier has to agree with what
+prefill/decode would compute" -- and it does not agree.
+
+### Why this explains every earlier number
+
+* Low acceptance: the per-row logits come from a batch whose state is already
+  wrong, so later rows rarely match the drafter.
+* Worse acceptance under TP (max 1 accepted vs 4 single box) and a shorter
+  draft-length profile: the batch path diverges further under TP, and the
+  drafter's captured hidden comes from that same state.
+* 14.81 tg/s against the 21.44 control: paying propose + verify for almost
+  nothing.
+
+## Current state
+
+`--dspark` is **disabled under network TP by default**; `DS4_DSPARK_TP_VERIFY=1`
+re-enables the new path for debugging and produces wrong output. The Phase 3
+code is kept because the lockstep half of it is correct and worth preserving.
+
+**Single-box `--dspark` on V4.1 also corrupts output** and is left as-is: it is
+double opt-in (`DS4_V41_DSPARK_ENABLE=1` plus `--dspark`) and labelled
+experimental, and disabling it is a policy call rather than part of this work.
+It should not be used until the batch-state defect is fixed.
+
+## What to do next
+
+The target is now one specific, single-box-reproducible question: **why does
+`ds41_graph_verify_rows` leave the graph in a different state than serial
+decode?** No TP, no drafter, no artifacts involved -- it reproduces with
+`DS4_DS41_VERIFY_COMMIT1=1` on one box, which makes it cheap to bisect.
+
+Prime suspects, in order:
+
+1. **What the verify snapshot does not save.** `ds41_verify_ctx` captures
+   `window[il]` and four `previous_kv/score` owners. If the sweep mutates any
+   other rolled-forward state -- Engram, carry buffers, the compressed-KV
+   ring's own bookkeeping -- the rollback silently leaves it advanced.
+2. **The `previous_kv/score` owner set.** `ds41_verify_commit` only restores
+   owners whose `ds4_layer_compress_ratio(il) == 2`, hard-coded to layers
+   2/8/14/20. If any other layer carries that state, it is never restored.
+3. **Batch vs single-row arithmetic in the sweep.** Compare a 1-row verify
+   against a plain decode step first: if even `count == 1` diverges, the
+   problem is the sweep, not the rollback.
+
+That last check is the cheapest and should come first -- it splits "the batch
+is wrong" from "the rollback is incomplete" in one run.

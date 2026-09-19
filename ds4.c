@@ -41622,7 +41622,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                                                     uint32_t count,
                                                     ds41_verify_ctx *vc) {
     if (!g || !g->valid || !tokens || !vc || count == 0 || count != vc->rows ||
-        count > DS4_TP_BATCH_MAX_ROWS || g->tp_world == 2 ||
+        count > DS4_TP_BATCH_MAX_ROWS ||
         count > g->ctx - g->pos || !vc->logits || !vc->row_logits) {
         return false;
     }
@@ -67280,18 +67280,23 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         e->dspark_weights.nonfinite_tensors);
                 e->dspark = false;
             }
-            /* The batched verify refuses tp_world == 2 by design (24f087d:
-             * "the ported design asserts the same restriction for the verify
-             * shape"). Discovering that at the first verify aborts the whole
-             * decode: ds41_graph_verify_rows cannot tell the caller whether it
-             * declined before or after mutating the graph, so the caller
-             * conservatively invalidates the frontier and the generation dies
-             * with "DSpark verify failed at position N". Decline up front. */
-            if (e->dspark && opt->tp.role != DS4_TP_NONE) {
+            /* The V4.1 TP verify is wired end to end -- the ranks stay in
+             * lockstep, no divergence is reported, and blocks commit -- but it
+             * is NOT numerically correct yet: greedy output under TP2 diverges
+             * from target-only decode after a handful of tokens and degrades
+             * into stray tokens, while acceptance collapses to at most one
+             * draft token per block against four on a single box. Something in
+             * the TP path feeds the drafter and/or the per-row verify head
+             * different values than the serial path does. Off by default until
+             * that is found; DS4_DSPARK_TP_VERIFY=1 re-enables it for
+             * debugging, and produces wrong output. */
+            if (e->dspark && opt->tp.role != DS4_TP_NONE &&
+                getenv("DS4_DSPARK_TP_VERIFY") == NULL) {
                 fprintf(stderr,
-                        "ds4: DSpark speculative decode is not supported under "
-                        "network tensor parallelism; drafting disabled, "
-                        "decoding target-only.\n");
+                        "ds4: DSpark speculative decode is disabled under "
+                        "network tensor parallelism: the verify path is "
+                        "implemented but not yet numerically correct. "
+                        "Decoding target-only.\n");
                 e->dspark = false;
             }
             if (e->dspark && !e->quality && !e->dspark_strict) {
@@ -74989,7 +74994,15 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
     ds4_engine *e = s->engine;
     ds41_gpu_graph *g = &s->ds41_graph;
     const bool stats_enabled = ds4_dspark_stats_enabled();
+    /* Under TP the block is verified on both ranks in lockstep, which only the
+     * leader may drive. Anything else declines here, where nothing has been
+     * mutated and returning n_accept simply keeps the decode serial -- rather
+     * than inside ds41_graph_verify_rows, whose bare false cannot tell the
+     * caller whether it declined early or failed after advancing the graph,
+     * forcing it to invalidate the frontier and kill the generation. */
+    const bool tp_verify = g->tp_world == 2;
     if (!s->ds41_graph_ready || !g->valid || draft_n <= 0 ||
+        (tp_verify && !ds4_session_tp_leader(s)) ||
         g->pos != (uint32_t)s->checkpoint.len) {
         return n_accept;                      /* nothing mutated: stay serial */
     }
@@ -75001,12 +75014,27 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
         if (!ds41_verify_alloc(&s->ds41_vc, (uint32_t)draft_n)) return n_accept;
         s->ds41_vc_ready = true;
     }
+    /* Announce the block before touching anything: the worker runs its half of
+     * the sweep and the two ranks meet inside the MoE exchange, so the frame
+     * has to be on the wire before we enter it. From here on the worker is
+     * blocked on a commit frame and every exit path below owes it one. */
+    if (tp_verify &&
+        !ds4_tp_send_verify(e->tp.ctx, s->tp_session_id,
+                            drafts, (uint32_t)draft_n)) {
+        if (errlen) snprintf(err, errlen, "tp: V4.1 verify send failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
     const double verify_t0 = stats_enabled ? now_sec() : 0.0;
     /* Up to here nothing has been mutated, so a failure is drained and the
      * caller may finish serially. Past the batch the graph has advanced and
      * only ds41_verify_commit puts the frontier back. */
     if (!ds41_graph_verify_rows(g, &e->model, &e->weights, drafts,
                                 (uint32_t)draft_n, &s->ds41_vc)) {
+        if (tp_verify) {
+            (void)ds4_tp_send_verify_commit(
+                    e->tp.ctx, DS4_TP_VERIFY_ROLLBACK_REPLAY, 0);
+        }
         g->valid = false;
         s->checkpoint_valid = false;
         if (errlen) snprintf(err, errlen,
@@ -75037,9 +75065,27 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
         }
     }
     if (!ds41_verify_commit(g, &s->ds41_vc, (uint32_t)commit)) {
+        if (tp_verify) {
+            (void)ds4_tp_send_verify_commit(
+                    e->tp.ctx, DS4_TP_VERIFY_ROLLBACK_REPLAY, 0);
+        }
         g->valid = false;
         s->checkpoint_valid = false;
         if (errlen) snprintf(err, errlen, "V4.1 DSpark verify commit failed");
+        return -1;
+    }
+    /* Local state is settled; tell the worker how much of the block to keep.
+     * commit is never zero -- drafts[0] was matched against the target's own
+     * logits before the block was announced -- so the worker only ever sees
+     * FULL or PREFIX here. */
+    if (tp_verify &&
+        !ds4_tp_send_verify_commit(
+                e->tp.ctx,
+                commit == draft_n ? DS4_TP_VERIFY_COMMIT_FULL
+                                  : DS4_TP_VERIFY_COMMIT_PREFIX,
+                commit)) {
+        if (errlen) snprintf(err, errlen, "tp: V4.1 verify commit send failed");
+        s->checkpoint_valid = false;
         return -1;
     }
     for (int i = 0; i < commit; i++) token_vec_push(&s->checkpoint, drafts[i]);
@@ -76022,6 +76068,96 @@ static int ds4_session_eval_dspark_speculative_stochastic(
  * for KV, compressor, and indexer side effects; then it obeys the commit
  * frame: keep the pushed rows, or roll back and replay the accepted prefix
  * through the gated single-token decode in lockstep with the leader. */
+/* V4.1 verifies on its own graph, so the worker's half of a speculative block
+ * cannot go through metal_graph_verify_suffix_tops like every other model's.
+ *
+ * The rendezvous matters as much as the arithmetic. The leader announces the
+ * block and then blocks inside the MoE expert exchange, so this function must
+ * reach ds41_graph_verify_rows or the pair deadlocks. That is why every early
+ * exit here is fatal rather than a graceful decline: there is no state in which
+ * declining quietly leaves the leader able to make progress. */
+static int ds4_session_tp_spec_cycle_ds41(ds4_session *s, const int *drafts,
+                                          int draft_n, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+
+    if (!s->ds41_graph_ready || !g->valid ||
+        g->pos != (uint32_t)s->checkpoint.len) {
+        snprintf(err, errlen, "tp: V4.1 worker graph is not at the frontier");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    if (s->ds41_vc_ready && s->ds41_vc.rows != (uint32_t)draft_n) {
+        ds41_verify_free(&s->ds41_vc);
+        s->ds41_vc_ready = false;
+    }
+    if (!s->ds41_vc_ready) {
+        if (!ds41_verify_alloc(&s->ds41_vc, (uint32_t)draft_n)) {
+            snprintf(err, errlen, "tp: V4.1 worker verify alloc failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        s->ds41_vc_ready = true;
+    }
+
+    /* Runs the same rows the leader is running; the expert halves meet inside
+     * this call. Its logits are discarded -- the leader owns the accept
+     * decision -- but the KV window and Engram history it advances are this
+     * rank's own and must match. */
+    const bool ok = ds41_graph_verify_rows(g, &e->model, &e->weights, drafts,
+                                           (uint32_t)draft_n, &s->ds41_vc);
+
+    int32_t commit_mode = DS4_TP_VERIFY_ROLLBACK_REPLAY;
+    int32_t token_count = 0;
+    if (!ds4_tp_recv_verify_commit(e->tp.ctx, &commit_mode, &token_count)) {
+        snprintf(err, errlen, "tp: verify commit frame missing");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    if (!ok) {
+        snprintf(err, errlen, "tp: V4.1 worker verify failed on announced block");
+        g->valid = false;
+        s->checkpoint_valid = false;
+        return 1;
+    }
+
+    uint32_t keep = 0;
+    if (commit_mode == DS4_TP_VERIFY_COMMIT_FULL) {
+        keep = (uint32_t)draft_n;
+    } else if (commit_mode == DS4_TP_VERIFY_COMMIT_PREFIX) {
+        if (token_count <= 0 || token_count >= draft_n) {
+            snprintf(err, errlen, "tp: invalid V4.1 prefix commit %d/%d",
+                     token_count, draft_n);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        keep = (uint32_t)token_count;
+    } else {
+        /* ds41_verify_commit cannot keep zero rows, and the V4.1 leader never
+         * asks it to: drafts[0] is matched against the target's own argmax
+         * before the block is announced, so every commit keeps at least one
+         * token. A rollback reaching here means the leader's own verify failed,
+         * which ends the session on both ranks regardless. */
+        snprintf(err, errlen,
+                 "tp: V4.1 worker cannot replay a rolled-back block");
+        g->valid = false;
+        s->checkpoint_valid = false;
+        return 1;
+    }
+
+    if (!ds41_verify_commit(g, &s->ds41_vc, keep)) {
+        snprintf(err, errlen, "tp: V4.1 worker verify commit failed");
+        g->valid = false;
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    for (uint32_t i = 0; i < keep; i++) {
+        token_vec_push(&s->checkpoint, drafts[i]);
+    }
+    s->checkpoint_valid = true;
+    return 0;
+}
+
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               char *err, size_t errlen) {
 #ifdef DS4_NO_GPU
@@ -76047,6 +76183,9 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
     if (draft_n > s->ctx_size - s->checkpoint.len) {
         snprintf(err, errlen, "tp: verify block beyond context");
         return 1;
+    }
+    if (ds4_session_is_ds41(s)) {
+        return ds4_session_tp_spec_cycle_ds41(s, drafts, draft_n, err, errlen);
     }
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
