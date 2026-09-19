@@ -1150,3 +1150,77 @@ produce bit-identical output for the shared row?** If a kernel can be made
 batch-invariant cheaply, everything above becomes useful at once. If not, V4.1
 speculative decode should be closed out, and the 21.55 tg/s target-only path is
 the answer.
+
+---
+
+# PHASE 15: the batch-dependent kernel is named, and the fix works
+
+## Bisecting the sweep's batch paths
+
+The sweep has four ablation flags that fall back to per-row loops. Running the
+multi-row rollback probe (`STATE_DIFF=3`: verify 5 rows, commit 1) against each:
+
+| configuration | arrays differing |
+|---|---|
+| default | windows 4..39 + carry + caches |
+| `DS4_METAL_DISABLE_V41_BATCH_ATTN=1` | **6** -- all window divergence gone |
+| `DS4_METAL_DISABLE_V41_BATCH_CORE=1` | **6** -- same |
+
+`BATCH_CORE` alone reproduces the whole improvement, so the batch-size-dependent
+kernel is **`ds41_attention_batch`**. Nothing else in the sweep varies with row
+count in a way that reaches the output.
+
+## The targeted fix
+
+`DS4_DS41_CORE_INVARIANT=1` uses the per-row attention fallback -- which sits
+right beside the batched call and does not vary with row count -- for the two
+cases that must agree: the decode-equivalent append (`total_count == 1`) and the
+verify (`vc != NULL`). MoE and HC stay batched, and they are the expensive part.
+
+```
+DS4_DS41_UNIFY_DECODE=1 DS4_DS41_CORE_INVARIANT=1 DS4_DS41_VERIFY_STATE_DIFF=3
+  arrays_differing=6 of 56      (all 40 windows match)
+```
+
+**Every window array now agrees** between a 5-row verify committing one row and
+a single decode step. That was the fault that has blocked this since Phase 4.
+
+## The residual six are plumbing, not numerics
+
+```
+previous_kv[0..2], previous_score[0..2]   decode=0.019715  verify=0
+```
+
+The verify's carry comes back **zero**, across 2038 of 2048 bytes. The cause is
+structural: `ds41_verify_save_prev` is called from inside
+`ds41_attention_publish_batch`, which is reached only through
+`ds41_attention_batch`. Take the per-row path and the batched publish never
+runs, so `vc->prev` is never written -- and `ds41_verify_commit` then restores
+that zeroed buffer into the live carry.
+
+Note this is also a standing hazard for `DS4_DS41_VERIFY_BATCHED_POOL`, and it
+explains why that switch never improved output: it skipped the same per-row
+save.
+
+Three ways out, cheapest first:
+
+1. Give `ds41_verify_ctx` a `prev_saved` flag and skip the carry restore when
+   it was never taken. Correct only if the carry is then right by other means;
+   it is not for a partial commit, so this is a stopgap.
+2. Save the carry from the per-row path too. It needs `vc` threaded into the
+   per-row publish, which the `ds41_gpu_graph row = *g` copy currently does not
+   carry.
+3. Run the verify as `rows` successive one-row sweeps with the batched core
+   left on. Each row is then computed exactly as decode computes it, and the
+   batched publish still runs. Costs the batching benefit on attention only.
+
+Option 3 is the most likely to be both correct and cheap, and it subsumes
+`CORE_INVARIANT`.
+
+## Where this leaves the effort
+
+Phase 14 concluded that batch-size-invariant kernels were the prerequisite.
+They are -- but the scope is far smaller than that sounded. It is **one
+kernel**, it already has a per-row twin sitting next to it, and switching to it
+fixes every window. What remains is a single snapshot that is taken on one code
+path and not the other.

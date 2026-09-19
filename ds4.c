@@ -41374,7 +41374,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
     const bool batch_attention = !getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN");
-    const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
+    /* DS4_DS41_CORE_INVARIANT=1: ds41_attention_batch is not batch-size
+     * invariant -- a 5-row sweep computes row 0's keys differently from a
+     * 1-row sweep computing the same row from the same state, which is what
+     * stops a speculative verify from leaving decode-identical state. The
+     * per-row fallback beside it does not vary with row count, so using it for
+     * both the decode-equivalent append (total_count == 1) and the verify
+     * (vc != NULL) makes the two agree. MoE and HC stay batched. */
+    const bool core_invariant = getenv("DS4_DS41_CORE_INVARIANT") != NULL;
+    const bool batch_core = batch_attention &&
+        !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE") &&
+        !(core_invariant && (vc != NULL || total_count == 1u));
     const bool batch_hc = batch_attention && batch_moe &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
     const bool decoder_suffix = wide && total_count >= 8192u &&
