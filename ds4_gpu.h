@@ -280,6 +280,7 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    down_offset;
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
+    uint32_t    expert_base;
 } ds4_gpu_stream_expert_table;
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
