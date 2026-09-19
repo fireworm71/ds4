@@ -4573,6 +4573,7 @@ typedef struct {
     uint32_t present_tensors;
     uint32_t missing_tensors;
     uint32_t invalid_tensors;
+    uint32_t nonfinite_tensors;
     uint32_t metadata_errors;
     bool has_block_size;
     bool has_markov_rank;
@@ -5891,6 +5892,59 @@ static void dspark_weights_validate_block_layout(
     dspark_validate_tensor_layout(dw, l->ffn_down_shexp, "ffn_down_shexp",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
                                   DS4_N_FF_EXP, DS4_N_EMBD, 0);
+}
+
+/* Shape validation accepts a structurally correct file whose weights are
+ * garbage. A truncated or half-written conversion leaves NaN in the data, and
+ * the only downstream symptom is a drafter that silently proposes nothing --
+ * which is expensive to diagnose and indistinguishable from "speculation does
+ * not help here". Scanning the float tensors at load turns that into a clear
+ * message. F32 and F16 only: together they are a few hundred MiB at most and
+ * every corrupt tensor observed so far had non-finite values in them, whereas
+ * covering the Q8_0 bulk would mean reading the whole file. */
+static void dspark_weights_validate_finite(ds4_dspark_weights *dw,
+                                           const ds4_model    *m) {
+    if (!dw || !m || !m->map) return;
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        uint32_t stage = 0;
+        if (!ds4_tensor_mtp_stage(t->name, &stage)) continue;
+        if (t->type != DS4_TENSOR_F32 && t->type != DS4_TENSOR_F16) continue;
+        if (t->elements == 0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) continue;
+
+        const uint8_t *base = m->map + t->abs_offset;
+        uint64_t bad = 0;
+        if (t->type == DS4_TENSOR_F32) {
+            const float *v = (const float *)base;
+            for (uint64_t k = 0; k < t->elements; k++) {
+                const float x = v[k];
+                if (x != x || x > 3.0e38f || x < -3.0e38f) bad++;
+            }
+        } else {
+            const uint16_t *v = (const uint16_t *)base;
+            for (uint64_t k = 0; k < t->elements; k++) {
+                const float x = f16_to_f32(v[k]);
+                if (x != x || x > 3.0e38f || x < -3.0e38f) bad++;
+            }
+        }
+        if (bad == 0) continue;
+
+        dw->nonfinite_tensors++;
+        if (dw->nonfinite_tensors <= 8) {
+            fprintf(stderr,
+                    "ds4: DSpark tensor %.*s holds %" PRIu64 " non-finite of %"
+                    PRIu64 " values; the support GGUF is corrupt\n",
+                    (int)t->name.len, t->name.ptr, bad, t->elements);
+        }
+    }
+    if (dw->nonfinite_tensors > 8) {
+        fprintf(stderr,
+                "ds4: DSpark: %u tensors hold non-finite values (only the first"
+                " 8 listed)\n",
+                dw->nonfinite_tensors);
+    }
 }
 
 static void dspark_weights_validate_layout(ds4_dspark_weights *dw) {
@@ -7947,6 +8001,7 @@ static void dspark_weights_bind_optional(
     }
 
     dspark_weights_validate_layout(dw);
+    dspark_weights_validate_finite(dw, m);
 }
 
 static void weights_free(ds4_weights *w) {
@@ -28839,6 +28894,37 @@ static bool metal_graph_dspark_capture_hc(
                                                    g->dspark_hc_mean_weights,
                                                    DS4_N_EMBD,
                                                    DS4_N_HC) != 0;
+    /* The drafter reports confidence=nan while this capture reports ok=1, so
+     * the question is whether the reduction produced finite values or merely
+     * executed. Reads the slot back and summarises it. Debug-only: this is a
+     * blocking D2H of N_EMBD floats inside an open command buffer and will
+     * perturb timing. */
+    if (ok && getenv("DS4_DSPARK_DEBUG_FINITE")) {
+        float *probe = (float *)malloc((size_t)DS4_N_EMBD * sizeof(float));
+        if (probe) {
+            if (ds4_gpu_end_commands() != 0 &&
+                ds4_gpu_tensor_read(dst, 0, probe,
+                                    (uint64_t)DS4_N_EMBD * sizeof(float)) != 0) {
+                uint32_t nan_count = 0, inf_count = 0, zero_count = 0;
+                float lo = probe[0], hi = probe[0];
+                for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+                    const float v = probe[i];
+                    if (v != v) { nan_count++; continue; }
+                    if (v > 3.0e38f || v < -3.0e38f) { inf_count++; continue; }
+                    if (v == 0.0f) zero_count++;
+                    if (!(lo <= v)) lo = v;
+                    if (!(hi >= v)) hi = v;
+                }
+                fprintf(stderr,
+                        "ds4: dbg capture-finite slot=%u nan=%u inf=%u zero=%u "
+                        "min=%.6g max=%.6g\n",
+                        slot, nan_count, inf_count, zero_count,
+                        (double)lo, (double)hi);
+            }
+            free(probe);
+            (void)ds4_gpu_begin_commands();
+        }
+    }
     ds4_gpu_tensor_free(dst);
     if (ok) metal_graph_dspark_capture_note_slot(g, slot);
     return ok;
@@ -34303,6 +34389,40 @@ static bool metal_graph_eval_dspark_stage_block(
                 for (int i = 0; i < 8; i++) mx += fabsf(v[i]);
             if (g->dspark_target_hidden && ds4_gpu_tensor_read(g->dspark_target_hidden, 0, v, sizeof(v)) != 0)
                 for (int i = 0; i < 8; i++) th += fabsf(v[i]);
+            /* Splits the main_x NaN between the stage-0 projection matmul and
+             * the rms_norm that follows it: scans the whole projection output
+             * and the whole concatenated target hidden, not just 8 floats. */
+            double pj = 0;
+            uint32_t pj_nan = 0, th_nan = 0;
+            if (g->dspark_stage0_proj) {
+                float *buf = (float *)malloc((size_t)DS4_N_EMBD * sizeof(float));
+                if (buf) {
+                    if (ds4_gpu_tensor_read(g->dspark_stage0_proj, 0, buf,
+                                            (uint64_t)DS4_N_EMBD * sizeof(float)) != 0) {
+                        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+                            if (buf[i] != buf[i]) pj_nan++; else pj += fabsf(buf[i]);
+                        }
+                    }
+                    free(buf);
+                }
+            }
+            if (g->dspark_target_hidden && dw->target_layer_count) {
+                const uint64_t n = (uint64_t)dw->target_layer_count * DS4_N_EMBD;
+                float *buf = (float *)malloc((size_t)n * sizeof(float));
+                if (buf) {
+                    if (ds4_gpu_tensor_read(g->dspark_target_hidden, 0, buf,
+                                            n * sizeof(float)) != 0) {
+                        for (uint64_t i = 0; i < n; i++)
+                            if (buf[i] != buf[i]) th_nan++;
+                    }
+                    free(buf);
+                }
+            }
+            fprintf(stderr,
+                    "ds4: dbg stagein stage0_proj |.|=%.4f nan=%u/%u  "
+                    "target_hidden nan=%u/%llu\n",
+                    pj, pj_nan, DS4_N_EMBD, th_nan,
+                    (unsigned long long)((uint64_t)dw->target_layer_count * DS4_N_EMBD));
             fprintf(stderr, "ds4: dbg stagein main_x=%.4f target_hidden=%.4f\n", mx, th);
             ok = ds4_gpu_begin_commands() != 0;
         } else ok = false;
@@ -35644,10 +35764,39 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
                                      features,
                                      hidden_bytes) != 0;
             if (!ok) break;
+            if (getenv("DS4_DSPARK_DEBUG_FINITE")) {
+                /* Splits the confidence NaN between its two inputs: the
+                 * drafter's own forward output (features[0..N_EMBD), read back
+                 * from batch_ffn_norm) and the markov row
+                 * (features[N_EMBD..+markov_rank), a dense row lookup). */
+                uint32_t h_nan = 0, m_nan = 0;
+                float h_lo = 0.0f, h_hi = 0.0f, m_lo = 0.0f, m_hi = 0.0f;
+                for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+                    const float v = features[i];
+                    if (v != v) { h_nan++; continue; }
+                    if (h_lo == 0.0f || v < h_lo) h_lo = v;
+                    if (h_hi == 0.0f || v > h_hi) h_hi = v;
+                }
+                for (uint32_t i = 0; i < dw->markov_rank; i++) {
+                    const float v = markov_state[i];
+                    if (v != v) { m_nan++; continue; }
+                    if (m_lo == 0.0f || v < m_lo) m_lo = v;
+                    if (m_hi == 0.0f || v > m_hi) m_hi = v;
+                }
+                fprintf(stderr,
+                        "ds4: dbg conf-input draft=%u hidden_nan=%u/%u [%.4g,%.4g] "
+                        "markov_nan=%u/%u [%.4g,%.4g]\n",
+                        draft, h_nan, DS4_N_EMBD, (double)h_lo, (double)h_hi,
+                        m_nan, dw->markov_rank, (double)m_lo, (double)m_hi);
+            }
             matvec_any(&confidence_logit,
                        dspark_model,
                        final->confidence_proj,
                        features);
+            if (getenv("DS4_DSPARK_DEBUG_FINITE")) {
+                fprintf(stderr, "ds4: dbg conf-logit draft=%u logit=%.6g\n",
+                        draft, (double)confidence_logit);
+            }
         }
         if (draft == 0 && confidence0) *confidence0 = confidence_logit;
         if (confidence_len) *confidence_len = draft + 1u;
@@ -67094,7 +67243,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             fprintf(stderr,
                     "ds4: DSpark support model detected: %s "
                     "(stages=%u block=%u markov_rank=%u tensors=%u missing=%u "
-                    "invalid=%u metadata_errors=%u); "
+                    "invalid=%u nonfinite=%u metadata_errors=%u); "
                     "use --dspark to enable experimental runtime decode\n",
                     opt->mtp_path,
                     e->support_stages,
@@ -67103,6 +67252,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     e->dspark_weights.present_tensors,
                     e->dspark_weights.missing_tensors,
                     e->dspark_weights.invalid_tensors,
+                    e->dspark_weights.nonfinite_tensors,
                     e->dspark_weights.metadata_errors);
             /* An incompatible support model cannot draft: the drafter
              * declines every cycle, but the propose chain still runs and
@@ -67117,6 +67267,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         "decoding target-only. Rebuild the support model to "
                         "match the target's routed-expert shape.\n",
                         e->dspark_weights.invalid_tensors);
+                e->dspark = false;
+            }
+            /* Same reasoning for a structurally valid but corrupt file: the
+             * drafter's own forward pass produces NaN, every confidence
+             * comparison fails, and the propose chain is paid for nothing. */
+            if (e->dspark && e->dspark_weights.nonfinite_tensors) {
+                fprintf(stderr,
+                        "ds4: DSpark support model is corrupt (%u tensors hold "
+                        "non-finite weights); drafting disabled, decoding "
+                        "target-only. Re-convert the support GGUF.\n",
+                        e->dspark_weights.nonfinite_tensors);
                 e->dspark = false;
             }
             if (e->dspark && !e->quality && !e->dspark_strict) {
