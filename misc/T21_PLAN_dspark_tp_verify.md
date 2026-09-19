@@ -1304,3 +1304,65 @@ at 21.55 tg/s remains the answer.
 That is a bounded CUDA question -- likely GEMM tiling or reduction order in the
 attention batch path -- and it is the only thing left between here and a
 working feature.
+
+---
+
+# PHASE 17: where the batch dependence lives, and one failed attempt at it
+
+## The dispatch, not the tiling
+
+`attention_decode_batch_launch` (ds4_cuda.cu:18605) chooses among several
+kernels, and the choice depends on `n_tokens`:
+
+```c
+if (!use_comp_mask && n_tokens > 1 && head_dim == 512 && !g_cuda_no_window_attention &&
+    (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+    dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+    attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>(...);
+}
+if (!use_comp_mask && n_tokens == 1u && head_dim == 512 &&
+    g_cuda_decode_heads8_online && !g_cuda_no_window_attention) {
+    dim3 grid(1, (n_head + 7u) / 8u, 1);
+    attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>(...);
+}
+```
+
+Both launch the *same* kernel with the same block shape, differing only in
+`grid.x`. But the `n_tokens > 1` arm is gated behind an env var or
+`n_tokens >= 128`, so at the block sizes speculation uses -- 2 to 5 -- a batch
+**falls through to a different kernel entirely**, while a one-row append takes
+the online one. That is the batch-size dependence: a dispatch difference, not a
+tiling subtlety.
+
+## Forcing the same kernel does not fix it
+
+`DS4_CUDA_WINDOW_ATTENTION=1` enables the `n_tokens > 1` arm at any block size,
+which should put both row counts on the same kernel. It does not converge:
+
+```
+UNIFY_DECODE=1 CUDA_WINDOW_ATTENTION=1 STATE_DIFF=3   arrays_differing=41 of 56
+```
+
+**Worse than the 35 it started at.** Either the one-row path is not actually
+taking the online kernel here (`g_cuda_decode_heads8_online` may be false), or
+the online kernel's per-row result genuinely varies with `grid.x`. Both are
+worth checking, and neither is settled by this run.
+
+So the escape hatch that looked like a one-line fix is not one. Recorded so the
+next person does not spend the same hour on it.
+
+## What a real fix has to establish
+
+A single, precise property:
+
+> for a given row, `attention_decode_batch_launch` must produce bit-identical
+> output whether that row is launched alone or as part of an N-row batch.
+
+Verifying a candidate takes one run: `DS4_DS41_UNIFY_DECODE=1
+DS4_DS41_VERIFY_STATE_DIFF=3` must report `arrays_differing=0` *without*
+`DS4_DS41_SERIAL_VERIFY`. Today only the serial path reaches zero.
+
+The obvious first step is to force **both** row counts onto the online kernel
+and confirm that is actually what happens -- instrument the dispatch and print
+which arm each call takes -- rather than inferring it from the source, which is
+what went wrong above.
