@@ -502,3 +502,69 @@ single CUDA-graph project worth ~35-40 ms against a 141 ms break-even budget
 that currently sits at ~174 ms. Even landed in full it reaches parity, not the
 28-34 t/s originally targeted. **The case for stopping here and keeping
 target-only decode at 23.14 t/s is now stronger than the case for continuing.**
+
+---
+
+# FINAL: the sweep is already GPU-bound, so CUDA graphs would gain little
+
+The earlier per-gate means mixed prefill and verify gates. The debug line
+carries the byte count, which encodes rows (`bytes / 20480`), so the two can be
+separated from the same log. For a **6-row verify sweep, 80 gates**:
+
+| component | per gate | per sweep | share |
+|---|---|---|---|
+| release (this rank's GPU compute + drain) | 1.900 ms | **152.0 ms** | 73% |
+| handshake | 0.334 ms | 26.8 ms | 13% |
+| transfer | 0.358 ms | 28.6 ms | 14% |
+| | | **207 ms** | |
+
+## The number that closes the CUDA-graph question
+
+```
+sweep   152.0 ms / 80 gates / 6 rows = 0.317 ms per gate-row   (un-graphed)
+decode   32.0 ms / 75 gates / 1 row  = 0.426 ms per gate-row   (CUDA-graphed)
+```
+
+**The un-graphed sweep is already 25% more efficient per row than the graphed
+decode.** Batching amortises kernel launches across rows far better than a graph
+amortises them across calls, so there is no launch-overhead slack left to
+recover. Piecewise CUDA graphs -- the last substantial item on the ranking --
+would gain little. Item 1 is closed.
+
+## Which closes the engine side entirely
+
+What remains in a verify sweep is 152 ms of this rank's own GPU work for 6 rows
+and ~55 ms of gate overhead, of which Stage 1 already recovers ~16 ms. The
+first is the model; the second is bounded by peer wait.
+
+And the per-block economics are, in fact, good:
+
+```
+6-draft block: sweep ~190 ms  ->  7 tokens
+decoding 7 tokens: 7 x 44     =  308 ms
+                                 saves 118 ms when fully accepted
+```
+
+**The engine is not the problem.** A fully accepted block is a large win
+already. The limiter is that only ~17% of proposes produce a usable block, and
+the confidence sweep (section 3) shows 0.7 is the drafter's own optimum -- the
+signal is well calibrated, and relaxing it buys blocks that get rejected.
+
+## Conclusion
+
+Every engine-side lever is now measured and closed:
+
+| lever | verdict |
+|---|---|
+| confidence / min-verify tuning | swept; 0.7 and 2 are optimal |
+| gate handshake | Stage 1, -16 ms, bounded by peer wait |
+| verify-window port | slab collision, two gates per layer |
+| collapse the two gates | sequentially dependent |
+| overlap propose with decode | no GPU bubble (77% busy) |
+| drafter tensor parallelism | contradicted by SGLang guidance |
+| **piecewise CUDA graphs** | **sweep already beats graphed decode per row** |
+
+Speculative decode on this pair is limited by **drafter hit rate**, not engine
+overhead, and the drafter is a fixed sidecar at its own optimal threshold.
+Engine work is done. Further gains need a better drafter -- more usable blocks
+per propose -- which is a model question, not a kernel or transport one.
