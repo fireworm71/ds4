@@ -250,3 +250,64 @@ reproducing quoted text, structured output that echoes the prompt -- and should
 stay off for open-ended prose until the gate is tightened. It is also the only
 thing in T22-T25 that beat the baseline at all, which is a reasonable argument
 for tightening the gate rather than shelving it.
+
+---
+
+# FINAL: the gate is a workload tradeoff, and it should be adaptive
+
+Raising the caps to 32 (`DS4_DSPARK_MAX_BLOCK_SIZE`, `DS4_TP_BATCH_MAX_ROWS`)
+took the copy-heavy case to **27.50 t/s, +22.5%** over its 22.45 baseline. Both
+gate settings then measured on both workloads, matched prompts:
+
+| min match | copy-heavy (base 22.45) | prose (base 23.14) |
+|---|---|---|
+| **8** | **27.50 (+22.5%)** | 21.61 (-6.6%) |
+| **12** | 23.55 (+4.9%) | 22.61 (-2.3%, no drafts fired) |
+
+A stricter gate trades almost all the gain for safety: at min=12 the copy task
+fires 4 blocks instead of 11, and prose fires none at all.
+
+## Why a fixed gate cannot be right
+
+The cost of a wrong draft scales with its length -- a rejected 16-row block is
+~390 ms, a rejected 4-row block ~130 ms -- while the *benefit* of a right one
+also scales with length. A single threshold cannot express that. The gate
+should require a longer match for a longer draft, e.g. draft at most
+`match_len` tokens, or back off after consecutive misses the way
+`ds4_session_dspark_scheduler_note` already does for DSpark.
+
+That is the obvious next increment and it is small: the match length is already
+known at draft time (`ng` in `ds4_session_ngram_draft`), and it is currently
+discarded.
+
+## Recommended settings today
+
+```
+# copy-heavy: regenerating files, quoted text, structured echo of the prompt
+DS4_DSPARK_NGRAM_DRAFT=1 DS4_DSPARK_NGRAM_MIN=8  DS4_DSPARK_NGRAM_MAX=16 \
+DS4_DSPARK_NGRAM_DRAFT_MAX=30 DS4_DSPARK_MIN_VERIFY_DRAFTS=4
+
+# mixed or unknown workloads
+DS4_DSPARK_NGRAM_MIN=12
+```
+
+Off by default either way.
+
+## Still unexplained
+
+Drafts top out at **16** even with `DS4_DSPARK_NGRAM_DRAFT_MAX=30` and both
+caps at 32, and blocks keep accepting the full 16. Something beyond the two
+constants raised here is truncating, and since every previous cap lift produced
+a further gain, finding it is the most promising single lead left.
+
+## Where this leaves the session
+
+| workload | before | after |
+|---|---|---|
+| copy-heavy decode | 22.45 | **27.50 t/s** |
+| prose decode | 23.14 | 22.61 (neutral at min=12) |
+| short-prompt prefill (192 tok) | 23.56 | **37.16 t/s** |
+
+After T22-T24 closed every engine-side lever at parity-or-worse, the drafter
+turned out to be the tractable half after all -- not by improving DSpark, but by
+not paying for it when a free predictor already knows the answer.
