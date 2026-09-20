@@ -41538,35 +41538,37 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 if (!selection) ok = false;
                 else memset(selection, 0xff, (size_t)count * DS4_N_INDEXER_TOP_K * sizeof(int32_t));
             }
-            if (ok) ok = ds4_gpu_begin_commands() != 0;
-            if (!il) {
+            if (ok && (!il || wide)) {
+                ok = ds4_gpu_begin_commands() != 0;
+                if (!il) {
 #ifndef __APPLE__
-                if (ok && !g->image_count) {
-                    float *pre = calloc((size_t)count * DS4_N_HC, sizeof(float));
-                    if (!pre) ok = false;
-                    else {
-                        for (uint32_t t = 0; t < count; t++) pre[t * DS4_N_HC] = 1;
-                        ok = ds4_gpu_tensor_write(g->batch.pre, 0, pre,
-                            (uint64_t)count * DS4_N_HC * sizeof(float)) &&
-                            ds4_gpu_embed_tokens_hc_tensor(g->batch.residual, g->prefill_tokens,
-                                m->map, m->size, w->token_embd->abs_offset,
-                                DS4_N_VOCAB, count, DS4_N_EMBD, DS4_N_HC);
-                        free(pre);
-                    }
-                } else
+                    if (ok && !g->image_count) {
+                        float *pre = calloc((size_t)count * DS4_N_HC, sizeof(float));
+                        if (!pre) ok = false;
+                        else {
+                            for (uint32_t t = 0; t < count; t++) pre[t * DS4_N_HC] = 1;
+                            ok = ds4_gpu_tensor_write(g->batch.pre, 0, pre,
+                                (uint64_t)count * DS4_N_HC * sizeof(float)) &&
+                                ds4_gpu_embed_tokens_hc_tensor(g->batch.residual, g->prefill_tokens,
+                                    m->map, m->size, w->token_embd->abs_offset,
+                                    DS4_N_VOCAB, count, DS4_N_EMBD, DS4_N_HC);
+                            free(pre);
+                        }
+                    } else
 #endif
-                {
-                    const float initial_pre[] = {1, 0, 0, 0};
-                    for (uint32_t t = 0; ok && t < count; t++) {
-                        ok = ds4_gpu_tensor_write(g->rows_view[t].pre, 0, initial_pre, sizeof(initial_pre)) &&
-                            ds41_embed(g, m, w, g->rows_view[t].residual, g->rows_view[t].x,
-                                        tokens[off + t], start + t);
+                    {
+                        const float initial_pre[] = {1, 0, 0, 0};
+                        for (uint32_t t = 0; ok && t < count; t++) {
+                            ok = ds4_gpu_tensor_write(g->rows_view[t].pre, 0, initial_pre, sizeof(initial_pre)) &&
+                                ds41_embed(g, m, w, g->rows_view[t].residual, g->rows_view[t].x,
+                                            tokens[off + t], start + t);
+                        }
                     }
+                } else if (wide) {
+                    if (ok) ok = ds41_carry_copy(g, off, count, false);
                 }
-            } else if (wide) {
-                if (ok) ok = ds41_carry_copy(g, off, count, false);
+                if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             }
-            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             const double t_ready = profile ? now_sec() : 0;
             if (ok && ds41_engram_layer(il)) {
                 const uint32_t engram = il == 1 ? 0 : 1;
@@ -41701,7 +41703,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_carry_copy(g, off, count, true);
             }
             const double t_encoded = profile ? now_sec() : 0;
-            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+            const bool queue_layers = g->tp_world == 2 && !g->imatrix && !wide && !profile &&
+                !stage_profile && !getenv("DS4_METAL_DISABLE_V41_TP_PREFILL_QUEUE");
+            const bool drain = !queue_layers || il == 0 || il == 13 || il + 1u == DS4_N_LAYER;
+            if (drain && ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
             const double t_done = profile ? now_sec() : 0;
             if (ok && !encoder_only && off + count == total_count)
