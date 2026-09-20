@@ -2307,27 +2307,46 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     /* A cold prefill kernel can make one rank arrive much later than the
      * other. Match the bulk RDMA window's bounded grace, without relaxing
      * the decode timeout or any subsequent payload exchange. */
-    if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms + 2000u)) return 0;
-    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
-    ds4_tp_gate_header ph;
-    const bool header_ok = tp_write_full(tp->data_fd, &h, sizeof(h)) &&
-        tp_read_full(tp->data_fd, &ph, sizeof(ph));
-    if (!header_ok)
-        fprintf(stderr, "ds4-tp: big gate header exchange failed or peer closed (layer %u seq %llu): %s\n",
-                layer, (unsigned long long)seq, strerror(errno));
-    const bool timeout_restored = tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms);
-    if (!header_ok || !timeout_restored) return 0;
+    /* DS4_TP_GATE_HANDSHAKE_EVERY=N performs the TCP rendezvous only on layers
+     * where layer % N == 0. Both ranks evaluate the same predicate from the
+     * same layer index, so they always agree on which gates carry it.
+     *
+     * Measured at 0.426 ms per gate over 560 samples, this round trip is 17 ms
+     * of a ~153 ms verify sweep -- half the gap between speculative decode and
+     * break-even. It is a rendezvous and a desync check on top of an RC queue
+     * pair that already delivers in order, so the question is whether the
+     * per-layer rendezvous is load-bearing or belt-and-braces. N=1 keeps the
+     * shipped behaviour. */
+    static int hs_every = -1;
+    if (hs_every < 0) {
+        const char *e = getenv("DS4_TP_GATE_HANDSHAKE_EVERY");
+        hs_every = e ? atoi(e) : 1;
+        if (hs_every < 1) hs_every = 1;
+    }
+    const bool do_handshake = (hs_every == 1) || (layer % (uint32_t)hs_every) == 0u;
+    if (do_handshake) {
+        if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms + 2000u)) return 0;
+        ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
+        ds4_tp_gate_header ph;
+        const bool header_ok = tp_write_full(tp->data_fd, &h, sizeof(h)) &&
+            tp_read_full(tp->data_fd, &ph, sizeof(ph));
+        if (!header_ok)
+            fprintf(stderr, "ds4-tp: big gate header exchange failed or peer closed (layer %u seq %llu): %s\n",
+                    layer, (unsigned long long)seq, strerror(errno));
+        const bool timeout_restored = tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms);
+        if (!header_ok || !timeout_restored) return 0;
+        if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+            ph.gate != 0xB16u || ph.seq != seq) {
+            fprintf(stderr,
+                    "ds4-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
+                    ph.layer, ph.gate, (unsigned long long)ph.seq,
+                    layer, (unsigned long long)seq);
+            return 0;
+        }
+    }
 #ifdef DS4_TP_HAVE_VERBS
     const double t_hs = dbg ? tp_now_sec() : 0.0;
 #endif
-    if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-        ph.gate != 0xB16u || ph.seq != seq) {
-        fprintf(stderr,
-                "ds4-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
-                ph.layer, ph.gate, (unsigned long long)ph.seq,
-                layer, (unsigned long long)seq);
-        return 0;
-    }
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
         if (!tp_rdma_drain_decode_window(tp)) return 0;
