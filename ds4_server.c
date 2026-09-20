@@ -13120,7 +13120,7 @@ decode_again:
             break;
         }
 
-        int toks[49];
+        int toks[65];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
         if (!s->batched_mode &&

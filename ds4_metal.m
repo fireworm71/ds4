@@ -10302,6 +10302,10 @@ void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
     g_tp_big_exchange_fn = fn;
 }
 
+void ds4_gpu_tp_set_big_staging(void *send, void *recv, uint64_t capacity) {
+    (void)send; (void)recv; (void)capacity;
+}
+
 static void *g_tp_exchange_ud;
 static pthread_t g_tp_thread;
 static int g_tp_thread_running;

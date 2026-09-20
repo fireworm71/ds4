@@ -36611,6 +36611,8 @@ static struct {
     ds4_gpu_tp_batch_exchange_fn batch;
     ds4_gpu_tp_big_exchange_fn big;
     void *ud, *staging;
+    void *slab_send, *slab_recv;
+    uint64_t slab_capacity;
     uint64_t vec_bytes, staging_bytes, row_seq, batch_seq;
     bool failed;
 } g_cuda_tp;
@@ -36639,6 +36641,12 @@ extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
 
 extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
     g_cuda_tp.big = fn;
+}
+
+extern "C" void ds4_gpu_tp_set_big_staging(void *send, void *recv, uint64_t capacity) {
+    g_cuda_tp.slab_send = send;
+    g_cuda_tp.slab_recv = recv;
+    g_cuda_tp.slab_capacity = capacity;
 }
 
 extern "C" void ds4_gpu_tp_set_session_batch_mode(int enabled) { (void)enabled; }
@@ -36686,7 +36694,7 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
 /* Must match DS4_TP_BATCH_MAX_ROWS in ds4_tp.h, which this file does not
  * include. Kept as a named constant so the two cannot drift silently the way
  * the previous hardcoded 8 did. */
-#define DS4_TP_BATCH_MAX_ROWS_GPU 48u
+#define DS4_TP_BATCH_MAX_ROWS_GPU 64u
 
 extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     /* Was a hardcoded 8 while the constant it shadowed lived in ds4_tp.h. */
@@ -36703,23 +36711,31 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
     if (!g_cuda_tp.row || !g_cuda_tp.big || g_cuda_tp.failed || !out_t || !in_t ||
         !rows || bytes != (uint64_t)rows * g_cuda_tp.vec_bytes ||
         bytes > SIZE_MAX / 2 || bytes > out_t->bytes || bytes > in_t->bytes) return 0;
-    if (bytes > g_cuda_tp.staging_bytes) {
-        if (g_cuda_tp.staging) (void)cudaFreeHost(g_cuda_tp.staging);
-        g_cuda_tp.staging = NULL;
-        g_cuda_tp.staging_bytes = 0;
-        if (!cuda_ok(cudaHostAlloc(&g_cuda_tp.staging, (size_t)bytes * 2,
-                                   cudaHostAllocDefault), "TP bulk staging")) {
-            g_cuda_tp.failed = true;
-            return 0;
+    void *send_buf = NULL;
+    void *recv_buf = NULL;
+    if (g_cuda_tp.slab_send && g_cuda_tp.slab_recv && bytes <= g_cuda_tp.slab_capacity) {
+        send_buf = g_cuda_tp.slab_send;
+        recv_buf = g_cuda_tp.slab_recv;
+    } else {
+        if (bytes > g_cuda_tp.staging_bytes) {
+            if (g_cuda_tp.staging) (void)cudaFreeHost(g_cuda_tp.staging);
+            g_cuda_tp.staging = NULL;
+            g_cuda_tp.staging_bytes = 0;
+            if (!cuda_ok(cudaHostAlloc(&g_cuda_tp.staging, (size_t)bytes * 2,
+                                       cudaHostAllocDefault), "TP bulk staging")) {
+                g_cuda_tp.failed = true;
+                return 0;
+            }
+            g_cuda_tp.staging_bytes = bytes;
         }
-        g_cuda_tp.staging_bytes = bytes;
+        send_buf = g_cuda_tp.staging;
+        recv_buf = (char *)g_cuda_tp.staging + g_cuda_tp.staging_bytes;
     }
-    void *peer = (char *)g_cuda_tp.staging + g_cuda_tp.staging_bytes;
     const int ok = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "TP bulk arrival") &&
-        ds4_gpu_tensor_read(out_t, 0, g_cuda_tp.staging, bytes) &&
+        ds4_gpu_tensor_read(out_t, 0, send_buf, bytes) &&
         g_cuda_tp.big(g_cuda_tp.ud, layer, ++g_cuda_tp.batch_seq,
-                      g_cuda_tp.staging, peer, bytes) &&
-        ds4_gpu_tensor_write(in_t, 0, peer, bytes);
+                      send_buf, recv_buf, bytes) &&
+        ds4_gpu_tensor_write(in_t, 0, recv_buf, bytes);
     if (!ok) g_cuda_tp.failed = true;
     return ok;
 }

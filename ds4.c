@@ -2704,7 +2704,7 @@ static void print_size(uint64_t bytes) {
  * verify(K) ~= 60 + 17K means a 31-token block is 587 ms for 32 tokens, 18 ms
  * each against 44 for decode. Sizes several small stack arrays and one
  * block_size x shard_vocab buffer (16 MiB at 32). */
-#define DS4_DSPARK_MAX_BLOCK_SIZE 48
+#define DS4_DSPARK_MAX_BLOCK_SIZE 64
 #if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
 /* Seed plus five drafts needs five intermediate compressor frontiers. */
 #define DS4_SPEC_PREFIX_SLOTS 5
@@ -41697,10 +41697,14 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             if (ok && batch_moe) {
-                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
+                const bool shared_owner = g->tp_world == 2 &&
+                    !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, shared_owner);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
-                    ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
+                    ok = (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
+                            (uint64_t)count * DS4_N_EMBD * sizeof(float)) :
+                          ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD)) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
                         ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                             active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
@@ -41710,7 +41714,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
                     DS41_PREFILL_ROWS(DS41_USE_MOE_ROW)
 #undef DS41_USE_MOE_ROW
-                    ok = ds4_gpu_add_tensor(row.block, row.routed, row.shared, DS4_N_EMBD) &&
+                    ok = (shared_owner ? ds4_gpu_tensor_copy(row.block, 0, row.routed, 0,
+                            (uint64_t)DS4_N_EMBD * sizeof(float)) :
+                          ds4_gpu_add_tensor(row.block, row.routed, row.shared, DS4_N_EMBD)) &&
                         ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row);
                 }
             }
@@ -58102,6 +58108,8 @@ struct ds4_session {
     bool dspark_sched_long_accept_seen;
     bool dspark_sched_bypass;
     bool dspark_last_confidence0_valid;
+    uint32_t dspark_streak_full_accepts;
+    uint32_t dspark_streak_misses;
     ds4_dspark_spec_stats dspark_stats;
 #endif
     uint64_t mtp_probe_total;
@@ -58296,6 +58304,8 @@ static void ds4_session_dspark_scheduler_begin_request(ds4_session *s) {
     s->dspark_sched_skipped_cycle = false;
     s->dspark_sched_long_accept_seen = false;
     s->dspark_sched_bypass = false;
+    s->dspark_streak_full_accepts = 0;
+    s->dspark_streak_misses = 0;
 }
 
 static bool ds4_session_dspark_scheduler_should_skip(ds4_session *s) {
@@ -69017,6 +69027,12 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     g_tp_block_ctx = tp;
 #endif
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
+    if (e->backend == DS4_BACKEND_CUDA && e->tp.host_slab) {
+        const uint64_t bulk_cap = (uint64_t)DS4_N_LAYER * DS4_TP_BATCH_MAX_ROWS * vec_bytes;
+        ds4_gpu_tp_set_big_staging((char *)e->tp.host_slab + ds4_tp_slab_batch_out_offset(tp, 0),
+                                   (char *)e->tp.host_slab + ds4_tp_slab_batch_in_offset(tp, 0),
+                                   bulk_cap);
+    }
     /* Reuse the existing half-logit frames for V4.1 on CUDA as well. */
     e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend == DS4_BACKEND_CUDA);
@@ -69037,6 +69053,7 @@ fail:
 void ds4_engine_tp_unbind(ds4_engine *e) {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (!e || !e->tp.ctx) return;
+    ds4_gpu_tp_set_big_staging(NULL, NULL, 0);
     ds4_gpu_tp_shutdown();
     ds4_tp_detach_slab(e->tp.ctx);
 #ifdef __APPLE__
@@ -73438,6 +73455,7 @@ static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
 
     uint32_t best_k = 0;
     int best_depth = 0;
+    int best_score = 0;
     int best_src = -1;
 
     for (int i = n - 2; i >= 0; i--) {
@@ -73456,19 +73474,32 @@ static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
 
         /* Adaptive draft sizing: shallow matches draft fewer tokens to limit
          * verification cost on mispredictions, while deep matches draft up to
-         * max_draft. */
+         * max_draft.
+         * AIMD streak modulation:
+         * - On a full-accept streak, expand allowed aggressively up to max_draft.
+         * - On a miss streak, clamp allowed to a cautious 12 drafts. */
         uint32_t allowed = max_draft;
         if (adaptive) {
-            if (depth < 10) allowed = 12u;
-            else if (depth < 14) allowed = 20u;
-            else if (depth < 18) allowed = 32u;
-            else allowed = max_draft;
+            if (s->dspark_streak_full_accepts >= 1u) {
+                if (depth < 8) allowed = 16u;
+                else if (depth < 12) allowed = 32u;
+                else allowed = max_draft;
+            } else if (s->dspark_streak_misses >= 1u) {
+                allowed = 12u;
+            } else {
+                if (depth < 10) allowed = 12u;
+                else if (depth < 14) allowed = 20u;
+                else if (depth < 18) allowed = 32u;
+                else allowed = max_draft;
+            }
             if (allowed > max_draft) allowed = max_draft;
         }
 
         const uint32_t k = avail < allowed ? avail : allowed;
-        /* Prefer deeper prefix matches; if equal depth, prefer longer continuation */
-        if (depth > best_depth || (depth == best_depth && k > best_k)) {
+        const int score = depth * 2 + (int)k;
+        /* Prefer higher combined score (prefix depth and yield continuation) */
+        if (score > best_score || (score == best_score && depth > best_depth)) {
+            best_score = score;
             best_depth = depth;
             best_k = k;
             best_src = i + 1;
@@ -73487,6 +73518,17 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
                                              uint32_t pos) {
     /* Try the free drafter first: a hit skips the model entirely. */
     if (getenv("DS4_DSPARK_NGRAM_DRAFT") != NULL) {
+        /* When multiple consecutive mispredictions or divergences occur
+         * (e.g. creative writing, thinking trace), pause speculative proposals
+         * for 1 cycle so ordinary single-token decode advances at ~44 ms/token
+         * rather than paying ~300-600 ms verification penalty. */
+        if (s->dspark_streak_misses >= 3u) {
+            s->dspark_streak_misses--;
+            if (getenv("DS4_DSPARK_SPEC_LOG") != NULL)
+                fprintf(stderr, "ds4: ngram draft paused due to miss streak (%u remaining)\n",
+                        s->dspark_streak_misses);
+            return false;
+        }
         uint32_t cap = DS4_DSPARK_MAX_BLOCK_SIZE - 1u;
         if (cap > (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1)) cap = (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1);
         {
@@ -75881,6 +75923,16 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
     s->mtp_draft_valid = false;
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
+    if (commit == draft_n) {
+        s->dspark_streak_full_accepts++;
+        s->dspark_streak_misses = 0;
+    } else if (commit <= 2 || commit < (draft_n / 3)) {
+        s->dspark_streak_full_accepts = 0;
+        s->dspark_streak_misses++;
+    } else {
+        s->dspark_streak_full_accepts = 0;
+        if (s->dspark_streak_misses > 0) s->dspark_streak_misses--;
+    }
     if (stats_enabled) {
         s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
         s->dspark_stats.accepted_draft_tokens += (uint64_t)(commit - 1);
@@ -76035,6 +76087,8 @@ static int ds4_session_eval_dspark_speculative_argmax(
 
     const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
     if (target_top != drafts[0]) {
+        s->dspark_streak_full_accepts = 0;
+        s->dspark_streak_misses++;
         if (stats_enabled) {
             s->dspark_stats.first_misses++;
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);

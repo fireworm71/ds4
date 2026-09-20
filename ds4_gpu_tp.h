@@ -30,6 +30,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
 void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn);
 int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows);
 void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn);
+void ds4_gpu_tp_set_big_staging(void *send, void *recv, uint64_t capacity);
 int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                               const ds4_gpu_tensor *out_t,
                               ds4_gpu_tensor *in_t, uint64_t bytes);

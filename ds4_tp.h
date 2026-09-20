@@ -35,8 +35,8 @@ enum {
      * verify(K) cost scales with block length, but lookup needs long runs when
      * it predicts well, and verify(K=15) is ~315 ms for 16 tokens against
      * 704 ms of decode. It only sizes the registered slab
-     * (n_layer x rows x vec x 2 = 78 MiB at 48 rows), so raising it is cheap. */
-    DS4_TP_BATCH_MAX_ROWS = 48,
+     * (n_layer x rows x vec x 2 = 104 MiB at 64 rows), so raising it is cheap. */
+    DS4_TP_BATCH_MAX_ROWS = 64,
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before

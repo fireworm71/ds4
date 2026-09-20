@@ -207,6 +207,10 @@ extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
     (void)fn;
 }
 
+extern "C" void ds4_gpu_tp_set_big_staging(void *send, void *recv, uint64_t capacity) {
+    (void)send; (void)recv; (void)capacity;
+}
+
 extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                                           const ds4_gpu_tensor *out_t,
                                           ds4_gpu_tensor *in_t,
