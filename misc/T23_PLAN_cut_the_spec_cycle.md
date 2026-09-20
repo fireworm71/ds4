@@ -440,3 +440,65 @@ Ranked by remaining expected value:
    Stage 1.
 4. ~~Collapse the two gates~~ -- ruled out here.
 5. ~~Drafter TP~~ -- ruled out in T24 by SGLang's guidance.
+
+---
+
+# OVERLAPPING PROPOSE WITH DECODE IS DEAD: there is no bubble
+
+`DS4_TP_ROW_GATE_DEBUG=1` (added here) splits a decode gate into the stream
+drain -- this rank waiting on GPU work it already queued -- and the exchange,
+which is peer wait plus transport. Over 4800 gates of plain decode:
+
+```
+row-gate over 4800 gates: drain 0.426 ms/gate, exchange 0.067 ms/gate
+generation: 22.71 t/s   (44.0 ms/token)
+```
+
+At 80 gates per token that is **34.1 ms of drain and 5.4 ms of exchange** out of
+44.0 ms. Decode is **~77% busy on its own GPU work** and spends only ~5 ms per
+token waiting on the peer.
+
+**So there is no idle window to hide a drafter in.** Issuing propose
+concurrently with decode would contend for the same GPU, and its ~40 ms of work
+would add ~40 ms whatever stream it is on. The SwiftSpec-style overlap that
+works where drafting runs on spare capacity does not apply here, because there
+is no spare capacity: this pair is compute-bound, not latency-bound.
+
+That removes the last lever that needed no kernel work.
+
+## A useful contrast the same measurement gives
+
+The decode row gate exchanges in **0.067 ms** and does no TCP handshake. The
+verify big gate costs **0.814 ms** (0.426 handshake + 0.388 transfer) for the
+same logical operation on a larger payload. An exchange on this link is
+therefore ~12x cheaper than what the verify path pays, and almost all of the
+difference is the handshake and host staging -- which is what Stage 1 and the
+window port were circling.
+
+## What remains, and its size
+
+Decode is graphed (`ds41_decode_island`) and costs **0.426 ms per gate-row**.
+The verify sweep is not graphed and costs **~0.6 ms per gate-row**
+(3.005 ms/gate at 5 rows). The ~40% difference is launch overhead the graph
+removes.
+
+So **piecewise CUDA-graphing the sweep is worth roughly 0.17 ms x 80 gates x
+rows**, about **35-40 ms on a 5-row sweep** -- comparable to Stage 1, and the
+largest remaining item. It is also exactly vLLM's GB10 workaround: graph the
+compute, leave the host-staged collective eager.
+
+## Final ranking
+
+1. **Piecewise CUDA graphs around the eager gates** -- ~35-40 ms/sweep, the only
+   substantial item left.
+2. Slab-layout window port -- correctness, speed par with Stage 1.
+3. ~~Overlap propose with decode~~ -- no bubble exists (this section).
+4. ~~Collapse the two gates~~ -- sequentially dependent.
+5. ~~Drafter TP~~ -- contradicted by SGLang guidance.
+6. ~~Confidence / min-verify tuning~~ -- swept, 0.7 and min-verify 2 are optimal.
+
+With every cheap lever now measured and closed, the remaining upside is a
+single CUDA-graph project worth ~35-40 ms against a 141 ms break-even budget
+that currently sits at ~174 ms. Even landed in full it reaches parity, not the
+28-34 t/s originally targeted. **The case for stopping here and keeping
+target-only decode at 23.14 t/s is now stronger than the case for continuing.**

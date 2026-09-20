@@ -36644,11 +36644,41 @@ extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
 extern "C" void ds4_gpu_tp_set_session_batch_mode(int enabled) { (void)enabled; }
 extern "C" int ds4_gpu_tp_decode_split_flush_safe(void) { return 1; }
 
+static double ds4_now_sec_cuda(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     if (!g_cuda_tp.row || g_cuda_tp.failed) return 0;
-    /* Do not leave a GPU polling kernel waiting for a remote process. */
-    const int ok = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "TP row arrival") &&
-        g_cuda_tp.row(g_cuda_tp.ud, layer, gate, ++g_cuda_tp.row_seq);
+    /* DS4_TP_ROW_GATE_DEBUG=1 splits a decode gate into the stream drain (GPU
+     * work this rank still owed) and the exchange (peer wait plus transport).
+     * The exchange half is time the GPU spends idle, and therefore an upper
+     * bound on what a concurrently issued drafter could hide inside decode --
+     * the feasibility question for overlapping propose with the target step. */
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("DS4_TP_ROW_GATE_DEBUG") != NULL;
+    if (!dbg) {
+        /* Do not leave a GPU polling kernel waiting for a remote process. */
+        const int ok = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "TP row arrival") &&
+            g_cuda_tp.row(g_cuda_tp.ud, layer, gate, ++g_cuda_tp.row_seq);
+        if (!ok) g_cuda_tp.failed = true;
+        return ok;
+    }
+    static double drain_acc, xchg_acc;
+    static unsigned long n_acc;
+    const double t0 = ds4_now_sec_cuda();
+    int ok = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "TP row arrival");
+    const double t1 = ds4_now_sec_cuda();
+    ok = ok && g_cuda_tp.row(g_cuda_tp.ud, layer, gate, ++g_cuda_tp.row_seq);
+    const double t2 = ds4_now_sec_cuda();
+    drain_acc += t1 - t0;
+    xchg_acc += t2 - t1;
+    if (++n_acc % 400u == 0u)
+        fprintf(stderr,
+                "ds4: row-gate over %lu gates: drain %.3f ms/gate, exchange %.3f ms/gate\n",
+                n_acc, drain_acc * 1e3 / (double)n_acc, xchg_acc * 1e3 / (double)n_acc);
     if (!ok) g_cuda_tp.failed = true;
     return ok;
 }
