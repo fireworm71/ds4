@@ -305,3 +305,82 @@ single-token decode) goes straight to `tp_rdma_gate_exchange` under RDMA and
 **never does a TCP handshake**. Only the big gate did, so only the verify path
 ever paid it -- which matches the measurement that decode tg was unchanged by
 Stage 1.
+
+---
+
+# STAGE 1 PORT ATTEMPTED AND REVERTED: the window assumes one gate per layer
+
+I tried the "real Stage 1" above -- routing V4.1's MoE reduction through the
+windowed batch gate and arming `ds4_tp_batch_block_begin/_end` around the verify
+sweep. It does not work, for a reason worth recording.
+
+## What was built
+
+1. `ds41_gpu_graph` gained `tp_batch_out/tp_batch_in`, wired from
+   `e->tp.batch_out_views` exactly as `s->graph` already was.
+2. `ds41_sum_partial_batch` staged through the registered slab and called
+   `ds4_gpu_tp_batch_gate_encode` instead of the arbitrary-pointer big gate.
+3. `g_tp_block_ctx` and its assignments were widened out of
+   `#if defined(__APPLE__)`, and the window was armed around the sweep.
+
+## Step 2 alone is slower
+
+With the batch gate but no window armed:
+
+```
+rows=4  sweep 176.8 ms   (big gate 143.7, Stage 1 128.8)
+tg at confidence 0.3: 16.32 t/s  (big gate 14.78, Stage 1 17.78)
+```
+
+Expected: the batch gate still performs its *own* TCP rendezvous when no window
+is active, so nothing is saved, and the extra slab staging copy is added on top.
+The batch path is only worth taking with the window.
+
+## Step 3 fails outright
+
+```
+ds4-tp: verify-block gate out of order (layer 0 rows 5, posted 2/40 rows 5)
+ds4: V4.1 layer-major prefill failed at layer 0
+ds4-tp: verify-block end: 5/200 rows received, 0 sends pending
+```
+
+The window advances one layer per gate and expects them strictly in order.
+**V4.1 issues two batch gates per layer**, from two call sites that both fire in
+a sweep layer:
+
+```
+ds4.c:40805   ds41_sum_partial_batch(g, b->routed,      il, count)   /* MoE reduction */
+ds4.c:41680   ds41_sum_partial_batch(g, g->batch.block, il, count)   /* sweep body    */
+```
+
+so after layer 0 the window has consumed two layers' worth of posted receives.
+Its own comment states the assumption plainly: "a speculative verify block whose
+every layer ends in **one** batch gate of `rows` rows."
+
+## Why this is not a small fix
+
+Arming the window with `n_layers = 2 * DS4_N_LAYER` does not work either,
+because the slab offsets are indexed by layer --
+`ds4_tp_slab_batch_out_offset(tp, layer)` -- so two gates in the same layer
+would write the same slab slot. Making V4.1 use the window needs **two slab
+slots per layer**, which is a change to the slab layout shared by every batch
+gate user, not a wiring change.
+
+Reverted. `DS4_TP_GATE_HANDSHAKE_EVERY` (Stage 1, `8bf79a1`) remains the
+measured -16 ms, and it works precisely because it does not care how many gates
+a layer issues.
+
+## The corrected task, for whoever takes it
+
+Either
+
+* give the batch slab two slots per layer and index gates by a running gate
+  counter rather than the layer id, then arm the window with the true gate
+  count; or
+* collapse V4.1's two per-layer reductions into one, which would halve the
+  gate count as well as making the window applicable -- worth checking whether
+  the attention and MoE partials can be summed in a single exchange.
+
+The second is more attractive: it removes 40 gates per sweep outright, which at
+the measured 0.814 ms of host-visible gate time is ~32 ms, on top of making the
+window usable.
