@@ -129,3 +129,86 @@ already scales.
 Any flag that changes batch shape -- `DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL`
 among them -- must be set on **both** ranks. Setting it on one side only
 desynchronises the pair and fails with `tp: prefill synchronization failed`.
+
+---
+
+# ADDENDUM: the full per-cycle budget, and a correction
+
+## The scheduler is already working
+
+Section 5 said 110 cycles pay propose. **Wrong.** The stats break down as:
+
+```
+cycles=110  no_draft=106  scheduler_skips=86  tail_skips=8
+propose=638.95 ms
+  prop_chain   488.76      prop_logits  52.71      prop_markov  42.40
+  prop_setup     9.73      prop_conf0    1.52
+```
+
+`scheduler_skips=86` -- the scheduler suppresses drafting on 86 of 110 cycles
+by itself. Propose actually runs about 16 times, so the 639 ms is **~40 ms per
+propose, not 5.7 ms**. Plan Components 2 and 3 are aimed at a waste that is
+largely already prevented; what is left is that each propose that *does* run is
+expensive.
+
+## Sweep cost, fitted over 8 samples
+
+```
+rows=4  mean sweep 143.7   rows=5  159.9   rows=6  177.4
+fit: sweep ~= 76.3 ms fixed + 16.8 ms per row
+graphed decode              43.5 ms per token
+```
+
+Per row the batched sweep is **2.6x cheaper** than decoding -- batching does
+work. The fixed 76.3 ms is the problem, and it is ~1.9 ms per layer, which is
+larger than decode's entire per-layer cost (1.09 ms).
+
+Per-layer profiling with queuing left intact
+(`DS4_METAL_V41_PROFILE_KEEP_QUEUE=1`, added here, since the profile flag
+otherwise disables the very queuing being measured) shows `drain=0.000`
+everywhere -- antigravity's layer queuing works -- and all the cost in
+`encode`, 2.7-4.5 ms per layer. That is not host CPU: every layer calls
+`ds4_gpu_tp_big_gate_encode`, which opens with
+
+```c
+cudaStreamSynchronize(cuda_decode_stream())
+```
+
+so each layer drains its queued GPU work and then waits on an RDMA round trip.
+40 layers x ~1.9 ms accounts for the whole fixed cost.
+
+## The actual per-cycle economics
+
+At default confidence with `MIN_VERIFY_DRAFTS=2` (4 blocks, near-full
+acceptance, 13 tokens from 4 cycles):
+
+```
+propose   ~40 ms   (prop_chain ~30 ms of it)
+verify   ~134 ms
+yield     ~3.25 tokens
+         = 53 ms/token   vs   43.5 ms/token baseline
+```
+
+**Speculation loses even on its good blocks.** That is why every knob tried --
+confidence 0.3/0.5/0.7, min-verify 2/3/4 -- lands between 14.8 and 20.0 t/s and
+none reaches 23.14.
+
+## The target, stated as a number
+
+To break even at 3.25 tokens per block, `propose + verify` must fall under
+`3.25 x 43.5 = 141 ms`. It is 174 ms. **Cut ~35 ms per speculative cycle to
+break even, ~76 ms to win meaningfully.**
+
+Two candidates, both now measured rather than guessed:
+
+1. **The verify's 76 ms fixed cost** -- 40 per-layer stream syncs inside the TP
+   gate. Overlapping the gate wait with the rest of the layer's compute, or
+   batching gates across layers, attacks it directly. Halving it clears the
+   break-even on its own.
+2. **`prop_chain` at ~30 ms** -- the drafter's 3 stages run un-graphed with TP
+   suspended, so they pay the same eager per-layer overhead. Three layers
+   costing 30 ms against the target's 40 layers costing 155 ms at the same row
+   count is disproportionate and worth a look.
+
+`prop_logits` (52.7 ms total) and `prop_markov` (42.4 ms) are third-tier: ~3.3
+and ~2.7 ms per propose, over a 256,960-entry vocabulary.

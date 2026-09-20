@@ -41733,7 +41733,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_carry_copy(g, off, count, true);
             }
             const double t_encoded = profile ? now_sec() : 0;
-            const bool queue_layers = g->tp_world == 2 && !g->imatrix && !wide && !profile &&
+            /* Profiling normally forces a drain per layer so its timings are
+             * attributable, but that removes the very queuing whose cost we
+             * are trying to account for. KEEP_QUEUE profiles the shipped
+             * shape: encode stays async, drains stay at the 3 boundaries. */
+            const bool queue_layers = g->tp_world == 2 && !g->imatrix && !wide &&
+                (!profile || getenv("DS4_METAL_V41_PROFILE_KEEP_QUEUE") != NULL) &&
                 !stage_profile && !getenv("DS4_METAL_DISABLE_V41_TP_PREFILL_QUEUE");
             const bool drain = !queue_layers || il == 0 || il == 13 || il + 1u == DS4_N_LAYER;
             if (drain && ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
