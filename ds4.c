@@ -58201,15 +58201,20 @@ static void ds4_static_ngram_init_once(void) {
     pthread_mutex_lock(&g_static_ngram_lock);
     if (!g_static_ngram_ready) {
         const char *path = getenv("DS4_NGRAM_STATIC_PATH");
+        if (!path || !path[0]) {
+            if (access("/home/jason/models/ds4_static_ngram.bin", R_OK) == 0) {
+                path = "/home/jason/models/ds4_static_ngram.bin";
+            } else if (access("models/ds4_static_ngram.bin", R_OK) == 0) {
+                path = "models/ds4_static_ngram.bin";
+            }
+        }
         if (path && path[0]) {
             if (ds4_ngram_table_init(&g_static_ngram, 65536, 2)) {
                 if (ds4_ngram_table_load(&g_static_ngram, path)) {
                     g_static_ngram_ready = true;
                     atexit(ds4_static_ngram_free);
-                    if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
-                        fprintf(stderr, "ds4: loaded %u static n-gram entries from %s\n",
-                                g_static_ngram.total_entries, path);
-                    }
+                    fprintf(stderr, "ds4: loaded %u static n-gram entries from %s\n",
+                            g_static_ngram.total_entries, path);
                 } else {
                     ds4_ngram_table_free(&g_static_ngram);
                 }
@@ -61654,6 +61659,77 @@ int ds4_dump_chat_tokenization(const char *model_path,
     vocab_free(&vocab);
     model_close(&model);
     return 0;
+}
+
+int ds4_build_ngram_corpus(const char *model_path, const char *input_path, const char *out_path) {
+    if (!model_path || !input_path || !out_path) return 1;
+
+    FILE *f = fopen(input_path, "rb");
+    if (!f) {
+        fprintf(stderr, "ds4: cannot open input text file: %s\n", input_path);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        fprintf(stderr, "ds4: input file is empty: %s\n", input_path);
+        return 1;
+    }
+    char *text = malloc((size_t)sz + 1);
+    if (!text) { fclose(f); return 1; }
+    size_t rd = fread(text, 1, (size_t)sz, f);
+    fclose(f);
+    text[rd] = '\0';
+
+    ds4_model model;
+    ds4_vocab vocab;
+    token_vec tokens = {0};
+
+    fprintf(stderr, "ds4: loading vocabulary from %s...\n", model_path);
+    model_open(&model, model_path, false, false);
+    config_validate_model(&model);
+    vocab_load(&vocab, &model);
+
+    fprintf(stderr, "ds4: tokenizing corpus (%zu bytes)...\n", rd);
+    tokenize_rendered_chat_vocab(&vocab, text, &tokens);
+    free(text);
+    fprintf(stderr, "ds4: tokenized into %d tokens.\n", tokens.len);
+
+    if (tokens.len < 4) {
+        token_vec_free(&tokens);
+        vocab_free(&vocab);
+        model_close(&model);
+        fprintf(stderr, "ds4: not enough tokens in corpus.\n");
+        return 1;
+    }
+
+    ds4_ngram_table table;
+    if (!ds4_ngram_table_init(&table, 65536, 2)) {
+        token_vec_free(&tokens);
+        vocab_free(&vocab);
+        model_close(&model);
+        return 1;
+    }
+
+    fprintf(stderr, "ds4: indexing n-grams into static table...\n");
+    ds4_ngram_table_update(&table, tokens.v, tokens.len, tokens.len);
+    fprintf(stderr, "ds4: indexed %u entries.\n", table.total_entries);
+
+    int ok = ds4_ngram_table_save(&table, out_path);
+    if (ok) {
+        fprintf(stderr, "ds4: successfully saved static n-gram corpus to %s (%u entries).\n",
+                out_path, table.total_entries);
+    } else {
+        fprintf(stderr, "ds4: failed to save static n-gram corpus to %s\n", out_path);
+    }
+
+    ds4_ngram_table_free(&table);
+    token_vec_free(&tokens);
+    vocab_free(&vocab);
+    model_close(&model);
+    return ok ? 0 : 1;
 }
 
 #ifndef DS4_NO_GPU

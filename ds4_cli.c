@@ -84,6 +84,8 @@ typedef struct {
     int imatrix_max_prompts;
     int imatrix_max_tokens;
     int imatrix_min_expert_samples;
+    const char *build_ngram_corpus_in;
+    const char *build_ngram_corpus_out;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -2171,6 +2173,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.decode_consistency_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--perplexity-file")) {
             c.gen.perplexity_file_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--build-ngram-corpus")) {
+            c.gen.build_ngram_corpus_in = need_arg(&i, argc, argv, arg);
+            c.gen.build_ngram_corpus_out = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-dataset")) {
             c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-out")) {
@@ -2285,6 +2290,15 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    if (cfg.gen.build_ngram_corpus_in && cfg.gen.build_ngram_corpus_out) {
+        int rc = ds4_build_ngram_corpus(cfg.engine.model_path,
+                                        cfg.gen.build_ngram_corpus_in,
+                                        cfg.gen.build_ngram_corpus_out);
+        ds4_dist_options_free(cfg.dist);
+        ds4_prompt_prefix_free(&cfg.gen.prefix);
+        free(cfg.prompt_owned);
+        return rc;
+    }
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prefix.count != 0) {
             fprintf(stderr, "ds4: --dump-tokens does not support --prefix-file\n");
