@@ -36686,7 +36686,7 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
 /* Must match DS4_TP_BATCH_MAX_ROWS in ds4_tp.h, which this file does not
  * include. Kept as a named constant so the two cannot drift silently the way
  * the previous hardcoded 8 did. */
-#define DS4_TP_BATCH_MAX_ROWS_GPU 16u
+#define DS4_TP_BATCH_MAX_ROWS_GPU 32u
 
 extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     /* Was a hardcoded 8 while the constant it shadowed lived in ds4_tp.h. */

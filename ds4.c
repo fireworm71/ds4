@@ -2699,7 +2699,12 @@ static void print_size(uint64_t bytes) {
 
 #define DS4_DSPARK_MAX_TARGET_LAYERS 8
 #define DS4_DSPARK_MAX_STAGES 8
-#define DS4_DSPARK_MAX_BLOCK_SIZE 16
+/* Also the longest speculative block. 16 truncated lookup drafts that the
+ * target was accepting in full (accepted_len_hist 14:6 at a 14-token cap), and
+ * verify(K) ~= 60 + 17K means a 31-token block is 587 ms for 32 tokens, 18 ms
+ * each against 44 for decode. Sizes several small stack arrays and one
+ * block_size x shard_vocab buffer (16 MiB at 32). */
+#define DS4_DSPARK_MAX_BLOCK_SIZE 32
 #if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
 /* Seed plus five drafts needs five intermediate compressor frontiers. */
 #define DS4_SPEC_PREFIX_SLOTS 5

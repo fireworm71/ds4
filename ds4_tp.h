@@ -37,7 +37,7 @@ enum {
      * it predicts well, and verify(K=15) is ~315 ms for 16 tokens against
      * 704 ms of decode. It only sizes the registered slab
      * (n_layer x rows x vec x 2 = 52 MiB at 32 rows), so raising it is cheap. */
-    DS4_TP_BATCH_MAX_ROWS = 16,
+    DS4_TP_BATCH_MAX_ROWS = 32,
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
