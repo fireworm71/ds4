@@ -41249,6 +41249,10 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
 typedef struct ds41_verify_ctx {
     uint32_t rows, pos0;
     uint32_t row_base;      /* first block row of the chunk being swept */
+    uint32_t evaluated;     /* number of rows actually swept */
+    bool serial_capture;    /* capture dspark target hidden during 1-row sweeps */
+    struct ds4_tp *tp;
+    bool tp_leader;
     ds4_gpu_tensor *win;    /* DS4_N_LAYER * rows * 512 floats */
     ds4_gpu_tensor *prev;   /* 4 owners * rows * 2 * 512 floats */
     ds4_gpu_tensor *comp;   /* 4 owners * (rows+1) * 512 floats */
@@ -41273,6 +41277,8 @@ static DS4_MAYBE_UNUSED bool ds41_verify_alloc(ds41_verify_ctx *vc, uint32_t row
     memset(vc, 0, sizeof(*vc));
     if (rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return false;
     vc->rows = rows;
+    vc->evaluated = rows;
+    vc->serial_capture = true;
     vc->win = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * rows * DS41_VERIFY_KV_ROW);
     vc->prev = ds4_gpu_tensor_alloc((uint64_t)4u * rows * 2u * DS41_VERIFY_KV_ROW);
     vc->comp = ds4_gpu_tensor_alloc((uint64_t)4u * (rows + 1u) * 512u * sizeof(float));
@@ -41373,8 +41379,10 @@ static DS4_MAYBE_UNUSED bool ds41_verify_commit(ds41_gpu_graph *g,
                                                 ds41_verify_ctx *vc,
                                                 uint32_t keep) {
     if (!g || !vc || keep == 0 || keep > vc->rows) return false;
+    const uint32_t evaluated = vc->evaluated ? vc->evaluated : vc->rows;
+    if (keep > evaluated) return false;
     bool ok = true;
-    if (keep < vc->rows) {
+    if (keep < evaluated) {
         if (!ds4_gpu_begin_commands()) return false;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++)
             ok = ds41_verify_ring(vc, g->window[il], il, keep, false);
@@ -41409,9 +41417,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     /* A one-row append with no verify context is a decode step by another
      * name, and the drafter's target-layer capture has to happen on it or
      * DSpark silently starves. ds41_graph_step invalidates the row first; so
-     * does this. The verify (vc != NULL) deliberately does not capture -- its
-     * rows are drafts, not committed frontier state. */
-    const bool sweep_capture = !vc && total_count == 1u && g->dspark_cap != NULL;
+     * does this. Serial verify (vc && vc->serial_capture) also captures each row
+     * because every swept row is an accepted token, leaving the frontier token's
+     * hidden state live for the next draft cycle. */
+    const bool sweep_capture = (!vc || vc->serial_capture) && total_count == 1u && g->dspark_cap != NULL;
     if (sweep_capture) metal_graph_dspark_capture_row_invalidate(g->dspark_cap);
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
@@ -41845,19 +41854,31 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
      * keeps ds41_attention_publish_batch, which is where the ratio-2 carry
      * snapshot is taken. Attention loses cross-row batching; MoE and HC do
      * not, and they are the expensive part. */
+    const bool in_state_diff = getenv("DS4_DS41_VERIFY_STATE_DIFF") != NULL;
     const bool serial = getenv("DS4_DS41_SERIAL_VERIFY") != NULL;
+    const bool early_exit = serial && !in_state_diff &&
+        getenv("DS4_DS41_NO_EARLY_EXIT") == NULL;
     vc->row_base = 0;
+    vc->evaluated = count;
+    vc->serial_capture = serial;
     if (serial && !plain_sweep) {
         ds41_prefill_row *b = &g->batch;
         bool sok = true;
+        uint32_t evaluated = 0;
+        const bool commit1_only = getenv("DS4_DS41_VERIFY_COMMIT1") != NULL;
+        const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+        const bool tp_split = (g->tp_world == 2) && (g->tp_logits_half != NULL) && (vc->tp != NULL);
         for (uint32_t r = 0; sok && r < count; r++) {
             vc->row_base = r;
             sok = ds41_graph_prefill_sweep(g, m, w, tokens + r, 1u, NULL, NULL, 0,
                                            NULL, NULL, false, false, vc);
             if (!sok) break;
+
+            const uint64_t rank_offset = tp_split ? (uint64_t)g->tp_rank * vhalf * sizeof(float) : 0;
+            const uint64_t proj_bytes = tp_split ? (uint64_t)vhalf * sizeof(float) : (uint64_t)DS4_N_VOCAB * sizeof(float);
             ds4_gpu_tensor *lrow = ds4_gpu_tensor_view(
-                vc->logits, (uint64_t)r * DS4_N_VOCAB * sizeof(float),
-                (uint64_t)DS4_N_VOCAB * sizeof(float));
+                vc->logits, (uint64_t)r * DS4_N_VOCAB * sizeof(float) + rank_offset,
+                proj_bytes);
             sok = lrow && ds4_gpu_begin_commands() != 0;
             if (sok) sok = ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre,
                                                           DS4_N_EMBD, DS4_N_HC) != 0;
@@ -41866,11 +41887,69 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
             if (sok) sok = ds41_output_projection(g, lrow, m, w, b->norm, 1u);
             if (!ds4_gpu_end_commands()) sok = false;
             ds4_gpu_tensor_free(lrow);
+            if (!sok) break;
+
+            float *row_dest = vc->row_logits + (size_t)r * DS4_N_VOCAB;
+            if (tp_split) {
+                if (g->tp_rank == 0) {
+                    sok = ds4_gpu_tensor_read(vc->logits, (uint64_t)r * DS4_N_VOCAB * sizeof(float),
+                                              row_dest, (uint64_t)vhalf * sizeof(float)) != 0;
+                    if (!sok) break;
+                    if (!ds4_tp_recv_logits_half(vc->tp, row_dest + vhalf, vhalf)) {
+                        sok = false;
+                        break;
+                    }
+                } else {
+                    sok = ds4_gpu_tensor_read(vc->logits,
+                                              (uint64_t)r * DS4_N_VOCAB * sizeof(float) + (uint64_t)vhalf * sizeof(float),
+                                              row_dest + vhalf, (uint64_t)vhalf * sizeof(float)) != 0;
+                    if (!sok) break;
+                    if (!ds4_tp_send_logits_half(vc->tp, row_dest + vhalf, vhalf)) {
+                        sok = false;
+                        break;
+                    }
+                }
+            } else {
+                sok = ds4_gpu_tensor_read(vc->logits, (uint64_t)r * DS4_N_VOCAB * sizeof(float),
+                                          row_dest, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+                if (!sok) break;
+            }
+            evaluated = r + 1;
+
+            if (early_exit) {
+                if (tp_split) {
+                    if (g->tp_rank == 0) {
+                        bool cont = !commit1_only;
+                        if (cont && r + 1 < count) {
+                            const int next_pred = sample_argmax(row_dest, DS4_N_VOCAB);
+                            if (next_pred != tokens[r + 1]) cont = false;
+                        } else {
+                            cont = false;
+                        }
+                        if (r + 1 < count) {
+                            (void)ds4_tp_send_verify_step(vc->tp, cont ? 1 : 0);
+                        }
+                        if (!cont) break;
+                    } else {
+                        if (commit1_only) break;
+                        if (r + 1 < count) {
+                            int32_t cont = 0;
+                            if (!ds4_tp_recv_verify_step(vc->tp, &cont) || !cont) break;
+                        }
+                    }
+                } else {
+                    if (commit1_only) break;
+                    if (r + 1 < count) {
+                        const int next_pred = sample_argmax(row_dest, DS4_N_VOCAB);
+                        if (next_pred != tokens[r + 1]) break;
+                    }
+                }
+            }
         }
         vc->row_base = 0;
+        vc->evaluated = evaluated ? evaluated : count;
         if (!sok) { (void)ds4_gpu_synchronize(); return false; }
-        return ds4_gpu_tensor_read(vc->logits, 0, vc->row_logits,
-                                   (uint64_t)count * DS4_N_VOCAB * sizeof(float)) != 0;
+        return true;
     }
     if (!ds41_graph_prefill_sweep(g, m, w, tokens, count, NULL, NULL, 0,
                                   NULL, NULL, false, false,
@@ -75478,6 +75557,8 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
         if (!ds41_verify_alloc(&s->ds41_vc, (uint32_t)draft_n)) return n_accept;
         s->ds41_vc_ready = true;
     }
+    s->ds41_vc.tp = e->tp.active ? e->tp.ctx : NULL;
+    s->ds41_vc.tp_leader = true;
     /* Announce the block before touching anything: the worker runs its half of
      * the sweep and the two ranks meet inside the MoE exchange, so the frame
      * has to be on the wire before we enter it. From here on the worker is
@@ -75489,7 +75570,11 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
         s->checkpoint_valid = false;
         return -1;
     }
-    const double verify_t0 = stats_enabled ? now_sec() : 0.0;
+    const bool scheduler_enabled = s && ds4_dspark_scheduler_enabled(s);
+    const double verify_t0 =
+        (stats_enabled ||
+         (scheduler_enabled && ds4_dspark_scheduler_timing_enabled()))
+            ? now_sec() : 0.0;
     /* Up to here nothing has been mutated, so a failure is drained and the
      * caller may finish serially. Past the batch the graph has advanced and
      * only ds41_verify_commit puts the frontier back. */
@@ -75515,7 +75600,8 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
      * serial output under that setting is the batch's effect on state, not the
      * accept rule -- a diagnostic separation, not a mode. */
     const bool commit1_only = getenv("DS4_DS41_VERIFY_COMMIT1") != NULL;
-    for (int i = 1; !commit1_only && i < draft_n; i++) {
+    const uint32_t active_rows = s->ds41_vc.evaluated ? s->ds41_vc.evaluated : (uint32_t)draft_n;
+    for (int i = 1; !commit1_only && i < (int)active_rows; i++) {
         const float *row = s->ds41_vc.row_logits + (size_t)(i - 1) * DS4_N_VOCAB;
         if (sample_argmax(row, DS4_N_VOCAB) != drafts[i]) break;
         commit++;
@@ -75527,6 +75613,16 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
             commit = i + 1;
             break;
         }
+    }
+    if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+        fprintf(stderr, "ds4: DSpark verify pos0=%u draft_n=%d evaluated=%u commit=%d: ",
+                s->ds41_vc.pos0, draft_n, active_rows, commit);
+        for (int i = 0; i < draft_n; i++) fprintf(stderr, "d[%d]=%d ", i, drafts[i]);
+        for (int i = 1; i < (int)active_rows; i++) {
+            const float *row = s->ds41_vc.row_logits + (size_t)(i - 1) * DS4_N_VOCAB;
+            fprintf(stderr, "pred[%d]=%d ", i - 1, sample_argmax(row, DS4_N_VOCAB));
+        }
+        fprintf(stderr, "\n");
     }
     if (!ds41_verify_commit(g, &s->ds41_vc, (uint32_t)commit)) {
         if (tp_verify) {
@@ -75554,6 +75650,13 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
     }
     for (int i = 0; i < commit; i++) token_vec_push(&s->checkpoint, drafts[i]);
     s->checkpoint_valid = true;
+    ds4_session_dspark_capture_note_checkpoint(s);
+    const double sched_extra_ms =
+        (scheduler_enabled && verify_t0 != 0.0)
+            ? s->dspark_last_propose_ms + (now_sec() - verify_t0) * 1000.0
+            : 0.0;
+    ds4_session_dspark_scheduler_note(
+        s, (uint32_t)(commit - 1), false, sched_extra_ms);
     /* The last accepted row's logits are the state the next step reads. */
     memcpy(s->logits, s->ds41_vc.row_logits + (size_t)(commit - 1) * DS4_N_VOCAB,
            (size_t)DS4_N_VOCAB * sizeof(float));
@@ -76563,6 +76666,8 @@ static int ds4_session_tp_spec_cycle_ds41(ds4_session *s, const int *drafts,
         }
         s->ds41_vc_ready = true;
     }
+    s->ds41_vc.tp = e->tp.active ? e->tp.ctx : NULL;
+    s->ds41_vc.tp_leader = false;
 
     /* Runs the same rows the leader is running; the expert halves meet inside
      * this call. Its logits are discarded -- the leader owns the accept
@@ -76619,6 +76724,12 @@ static int ds4_session_tp_spec_cycle_ds41(ds4_session *s, const int *drafts,
         token_vec_push(&s->checkpoint, drafts[i]);
     }
     s->checkpoint_valid = true;
+    if (s->logits && e->tp.vocab_split && keep > 0) {
+        const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+        memcpy(s->logits + vhalf,
+               s->ds41_vc.row_logits + (size_t)(keep - 1) * DS4_N_VOCAB + vhalf,
+               (size_t)vhalf * sizeof(float));
+    }
     return 0;
 }
 

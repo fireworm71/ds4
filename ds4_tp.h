@@ -215,6 +215,7 @@ typedef enum {
     DS4_TP_FRAME_RDMA_POSTED = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
     DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
+    DS4_TP_FRAME_VERIFY_STEP = 23,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -262,6 +263,8 @@ int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n);
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count);
 int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count);
+int ds4_tp_send_verify_step(ds4_tp *tp, int32_t continue_flag);
+int ds4_tp_recv_verify_step(ds4_tp *tp, int32_t *continue_flag);
 
 /* Standalone worker mode entry. Loads nothing itself: the engine is already
  * open. */

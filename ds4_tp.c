@@ -2931,6 +2931,26 @@ int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
     return 1;
 }
 
+int ds4_tp_send_verify_step(ds4_tp *tp, int32_t continue_flag) {
+    int32_t flag = continue_flag;
+    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_STEP,
+                         &flag, sizeof(flag));
+}
+
+int ds4_tp_recv_verify_step(ds4_tp *tp, int32_t *continue_flag) {
+    uint32_t type = 0, bytes = 0;
+    int32_t flag = 0;
+    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_VERIFY_STEP || bytes != sizeof(flag) ||
+        !tp_read_full(tp->control_fd, &flag, sizeof(flag))) {
+        fprintf(stderr, "ds4-tp: bad verify-step frame (type %u bytes %u)\n",
+                type, bytes);
+        return 0;
+    }
+    *continue_flag = flag;
+    return 1;
+}
+
 int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen) {
     struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs;
     if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
