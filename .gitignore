@@ -68,6 +68,7 @@
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli
 /tests/test_engram
+/tests/test_ngram_cache
 /tests/rdma_t1/t1_server
 /tests/rdma_t1/t1_client
 /tests/rdma_t1/ds4_region_server

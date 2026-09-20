@@ -46,6 +46,7 @@
 #include "ds4_image.h"
 #include "ds4_engram.h"
 #include "ds4_tp.h"
+#include "ds4_ngram.h"
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 #define DS4_HAS_DEEPSEEK41_GPU 1
 #endif
@@ -58063,6 +58064,9 @@ struct ds4_session {
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
+    ds4_ngram_table context_ngram;
+    bool context_ngram_ready;
+    int ngram_indexed_len;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
     const ds4_vision_span *sync_images;
@@ -58128,6 +58132,156 @@ struct ds4_session {
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
+
+/* =========================================================================
+ * 3-Tier N-Gram Speculative Drafting Engine
+ * ========================================================================= */
+static ds4_ngram_table g_dynamic_ngram;
+static bool g_dynamic_ngram_ready = false;
+static bool g_dynamic_ngram_enabled = false;
+static pthread_mutex_t g_dynamic_ngram_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static ds4_ngram_table g_static_ngram;
+static bool g_static_ngram_ready = false;
+static pthread_mutex_t g_static_ngram_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ds4_dynamic_ngram_save(void) {
+    pthread_mutex_lock(&g_dynamic_ngram_lock);
+    if (g_dynamic_ngram_ready && g_dynamic_ngram_enabled && g_dynamic_ngram.total_entries > 0) {
+        const char *path = ds4_ngram_default_cache_path();
+        if (ds4_ngram_table_save(&g_dynamic_ngram, path)) {
+            if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+                fprintf(stderr, "ds4: saved %u dynamic n-gram entries to %s\n",
+                        g_dynamic_ngram.total_entries, path);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_dynamic_ngram_lock);
+}
+
+static void ds4_dynamic_ngram_init_once(void) {
+    pthread_mutex_lock(&g_dynamic_ngram_lock);
+    if (!g_dynamic_ngram_ready) {
+        const char *dyn_env = getenv("DS4_NGRAM_DYNAMIC");
+        bool want = false;
+        if (dyn_env) {
+            want = (atoi(dyn_env) != 0);
+        } else if (getenv("DS4_DSPARK_NGRAM_DRAFT") != NULL ||
+                   getenv("DS4_DSPARK_NGRAM_FALLBACK") != NULL) {
+            want = true;
+        }
+        if (want) {
+            if (ds4_ngram_table_init(&g_dynamic_ngram, 65536, 1)) {
+                const char *path = ds4_ngram_default_cache_path();
+                if (ds4_ngram_table_load(&g_dynamic_ngram, path)) {
+                    if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+                        fprintf(stderr, "ds4: loaded %u dynamic n-gram entries from %s\n",
+                                g_dynamic_ngram.total_entries, path);
+                    }
+                }
+                g_dynamic_ngram_ready = true;
+                g_dynamic_ngram_enabled = true;
+                atexit(ds4_dynamic_ngram_save);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_dynamic_ngram_lock);
+}
+
+static void ds4_static_ngram_free(void) {
+    pthread_mutex_lock(&g_static_ngram_lock);
+    if (g_static_ngram_ready) {
+        ds4_ngram_table_free(&g_static_ngram);
+        g_static_ngram_ready = false;
+    }
+    pthread_mutex_unlock(&g_static_ngram_lock);
+}
+
+static void ds4_static_ngram_init_once(void) {
+    pthread_mutex_lock(&g_static_ngram_lock);
+    if (!g_static_ngram_ready) {
+        const char *path = getenv("DS4_NGRAM_STATIC_PATH");
+        if (path && path[0]) {
+            if (ds4_ngram_table_init(&g_static_ngram, 65536, 2)) {
+                if (ds4_ngram_table_load(&g_static_ngram, path)) {
+                    g_static_ngram_ready = true;
+                    atexit(ds4_static_ngram_free);
+                    if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+                        fprintf(stderr, "ds4: loaded %u static n-gram entries from %s\n",
+                                g_static_ngram.total_entries, path);
+                    }
+                } else {
+                    ds4_ngram_table_free(&g_static_ngram);
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_static_ngram_lock);
+}
+
+static void ds4_session_ngram_note_tokens(ds4_session *s, int n_new) {
+    if (!s || n_new <= 0 || s->checkpoint.len <= 0) return;
+    if (s->context_ngram_ready) {
+        ds4_ngram_table_update(&s->context_ngram, s->checkpoint.v, s->checkpoint.len, n_new);
+    }
+    if (g_dynamic_ngram_ready && g_dynamic_ngram_enabled) {
+        pthread_mutex_lock(&g_dynamic_ngram_lock);
+        ds4_ngram_table_update(&g_dynamic_ngram, s->checkpoint.v, s->checkpoint.len, n_new);
+        pthread_mutex_unlock(&g_dynamic_ngram_lock);
+    }
+    s->ngram_indexed_len = s->checkpoint.len;
+}
+
+static void ds4_session_ngram_clear(ds4_session *s) {
+    if (!s) return;
+    if (s->context_ngram_ready) {
+        ds4_ngram_table_clear(&s->context_ngram);
+    }
+    s->ngram_indexed_len = 0;
+}
+
+static void ds4_session_ngram_sync_tokens(ds4_session *s) {
+    if (!s || !s->checkpoint_valid || s->checkpoint.len <= 0) return;
+    if (s->ngram_indexed_len < 0) s->ngram_indexed_len = 0;
+    if (s->ngram_indexed_len > s->checkpoint.len) s->ngram_indexed_len = s->checkpoint.len;
+    int n_new = s->checkpoint.len - s->ngram_indexed_len;
+    if (n_new <= 0) return;
+    ds4_session_ngram_note_tokens(s, n_new);
+}
+
+int ds4_ngram_draft_propose(ds4_session *s,
+                            const int *history,
+                            int n_history,
+                            int current_token,
+                            int *out_draft,
+                            int max_draft) {
+    if (!out_draft || max_draft <= 0 || current_token < 0) return 0;
+    if (max_draft > DS4_DSPARK_MAX_BLOCK_SIZE) max_draft = DS4_DSPARK_MAX_BLOCK_SIZE;
+
+    if (s) {
+        ds4_session_ngram_sync_tokens(s);
+        if (!history && s->checkpoint.v) {
+            history = s->checkpoint.v;
+            n_history = s->checkpoint.len;
+        }
+    }
+
+    const ds4_ngram_table *ctx_tbl = (s && s->context_ngram_ready) ? &s->context_ngram : NULL;
+    const ds4_ngram_table *sta_tbl = g_static_ngram_ready ? &g_static_ngram : NULL;
+    const ds4_ngram_table *dyn_tbl = (g_dynamic_ngram_ready && g_dynamic_ngram_enabled) ? &g_dynamic_ngram : NULL;
+
+    if (!ctx_tbl && !sta_tbl && !dyn_tbl) return 0;
+
+    int drafted = 0;
+    if (dyn_tbl) pthread_mutex_lock(&g_dynamic_ngram_lock);
+    drafted = (int)ds4_ngram_draft_3tier(ctx_tbl, sta_tbl, dyn_tbl,
+                                         history, n_history,
+                                         current_token,
+                                         out_draft, (uint32_t)max_draft);
+    if (dyn_tbl) pthread_mutex_unlock(&g_dynamic_ngram_lock);
+
+    return drafted;
+}
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -67652,11 +67806,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
              * support map: the streaming-mode MoE guard keys on it so drafter
              * experts resolve residently instead of aliasing the main model's
              * layer 0..2 slots in the streaming expert cache. */
+#ifndef DS4_NO_GPU
             if (e->dspark && e->backend == DS4_BACKEND_CUDA && !e->multi_tier) {
                 const uint64_t bias = (e->model.size + 4095ull) & ~4095ull;
                 (void)ds4_gpu_register_support_map(e->mtp_model.map,
                                                    e->mtp_model.size, bias);
             }
+#endif
             fprintf(stderr,
                     "ds4: DSpark support model detected: %s "
                     "(stages=%u block=%u markov_rank=%u tensors=%u missing=%u "
@@ -69108,6 +69264,8 @@ void ds4_engine_close(ds4_engine *e) {
     }
     ds4_gpu_cleanup();
 #endif
+    ds4_dynamic_ngram_save();
+    ds4_static_ngram_free();
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
@@ -69277,6 +69435,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             ds4_session_free(s);
             return 1;
         }
+        s->ngram_indexed_len = 0;
+        if (ds4_ngram_table_init(&s->context_ngram, 16384, 0)) {
+            s->context_ngram_ready = true;
+        }
+        ds4_dynamic_ngram_init_once();
+        ds4_static_ngram_init_once();
         *out = s;
         return 0;
     }
@@ -69689,6 +69853,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         ds4_session_free(s);
         return 1;
     }
+    s->ngram_indexed_len = 0;
+    if (ds4_ngram_table_init(&s->context_ngram, 16384, 0)) {
+        s->context_ngram_ready = true;
+    }
+    ds4_dynamic_ngram_init_once();
+    ds4_static_ngram_init_once();
     *out = s;
     return 0;
 #endif
@@ -69696,6 +69866,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    ds4_session_ngram_sync_tokens(s);
     if (s->glm_reserved_graph_bytes && s->engine) {
         s->engine->glm_session_graph_bytes -= s->glm_reserved_graph_bytes;
         s->engine->glm_session_count--;
@@ -69757,6 +69928,13 @@ void ds4_session_free(ds4_session *s) {
     free(s->dspark_markov_bias);
     free(s->dspark_conf_features);
 #endif
+    if (s->context_ngram_ready) {
+        ds4_ngram_table_free(&s->context_ngram);
+        s->context_ngram_ready = false;
+    }
+    if (g_dynamic_ngram_ready) {
+        ds4_dynamic_ngram_save();
+    }
     free(s);
 }
 
@@ -71252,6 +71430,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "unable to retain image prompt identity");
         return 1;
     }
+    if (rc == 0) {
+        ds4_session_ngram_sync_tokens(s);
+    }
     return rc;
 }
 
@@ -71394,6 +71575,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
 
         session_cpu_reset_cache(s);
+        ds4_session_ngram_clear(s);
         prefill_layer_major_cpu(s->logits,
                                 &e->model,
                                 &e->weights,
@@ -71432,6 +71614,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             ds41_graph_reset(g);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
+            ds4_session_ngram_clear(s);
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
         ds41_encoder_residency encoder = {0};
@@ -71552,6 +71735,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
             s->mtp_draft_valid = false;
+            ds4_session_dspark_capture_invalidate(s);
+            ds4_session_ngram_clear(s);
             ds4_session_glm_reset_dense_cache(s);
             if (!ds4_session_glm_reset_kda_state(s)) {
                 snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
@@ -72332,6 +72517,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
     ds4_session_dspark_capture_invalidate(s);
+    ds4_session_ngram_clear(s);
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
@@ -73434,10 +73620,21 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
  * verify costs the same either way. */
 static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
                                         int *out, uint32_t max_draft) {
-    if (!s || !out || max_draft < 2u) return 0;
+    if (!s || !out || max_draft < 1u) return 0;
     const int *h = s->checkpoint.v;
     const int n = s->checkpoint.len;
     if (!h || n <= 0) return 0;
+
+    /* Sync any unindexed tokens in s->checkpoint to context and dynamic ngram caches */
+    ds4_session_ngram_sync_tokens((ds4_session *)s);
+
+    /* First, try the 3-tier N-Gram draft proposer (Context -> Static -> Dynamic) */
+    int k_ngram = ds4_ngram_draft_propose((ds4_session *)s, h, n, token, out, (int)max_draft);
+    if (k_ngram > 0) {
+        return (uint32_t)k_ngram;
+    }
+
+    if (max_draft < 2u) return 0;
 
     static int ng_max = -1, ng_min = 0, adaptive = -1;
     if (ng_max < 0) {
@@ -73568,6 +73765,20 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
     if (exec_tier != saved_tier) {
         g->active_tier = saved_tier;
         if (ds4_gpu_set_current_device(saved_tier) != 0) return false;
+    }
+    if ((!ok || !s->dspark_draft_valid) &&
+        (getenv("DS4_DSPARK_NGRAM_DRAFT") != NULL || getenv("DS4_DSPARK_NGRAM_FALLBACK") != NULL)) {
+        uint32_t cap = DS4_DSPARK_MAX_BLOCK_SIZE - 1u;
+        if (cap > (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1)) cap = (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1);
+        const uint32_t k = ds4_session_ngram_draft(s, token, s->dspark_draft_tokens, cap);
+        if (k >= 1u) {
+            s->dspark_draft_len = k;
+            s->dspark_draft_valid = true;
+            s->dspark_stochastic_draft = false;
+            if (getenv("DS4_DSPARK_SPEC_LOG") != NULL)
+                fprintf(stderr, "ds4: ngram fallback draft len=%u at pos=%u\n", k, pos);
+            return true;
+        }
     }
     return ok;
 }
@@ -73881,6 +74092,9 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                 return 1;
             }
         }
+    }
+    if (rc == 0) {
+        ds4_session_ngram_note_tokens(s, 1);
     }
     return rc;
 }
@@ -76225,6 +76439,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
         }
         s->checkpoint_valid = true;
         ds4_session_dspark_capture_note_checkpoint(s);
+        ds4_session_ngram_note_tokens(s, commit_drafts);
         if (stats_enabled) {
             s->dspark_stats.full_accepts++;
             s->dspark_stats.direct_full_commits++;
@@ -76298,6 +76513,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
             }
             s->checkpoint_valid = true;
             ds4_session_dspark_capture_note_checkpoint(s);
+            ds4_session_ngram_note_tokens(s, commit_drafts);
             if (stats_enabled) {
                 s->dspark_stats.partial_accepts++;
                 s->dspark_stats.direct_partial_commits++;
@@ -76360,6 +76576,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
                    (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
             s->checkpoint_valid = true;
             ds4_session_dspark_capture_note_checkpoint(s);
+            ds4_session_ngram_note_tokens(s, commit_drafts);
             if (stats_enabled) {
                 s->dspark_stats.partial_accepts++;
                 s->dspark_stats.replay_fallbacks++;
@@ -76499,6 +76716,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
         memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->checkpoint_valid = true;
         ds4_session_dspark_capture_note_checkpoint(s);
+        ds4_session_ngram_note_tokens(s, replayed_drafts);
         if (stats_enabled) {
             if (replayed_drafts == draft_n) s->dspark_stats.full_accepts++;
             else s->dspark_stats.partial_accepts++;
@@ -76755,6 +76973,7 @@ static int ds4_session_eval_dspark_speculative_stochastic(
             }
             s->checkpoint_valid = true;
             ds4_session_dspark_capture_note_checkpoint(s);
+            ds4_session_ngram_note_tokens(s, draft_n);
             if (stats_enabled) {
                 s->dspark_stats.full_accepts++;
                 s->dspark_stats.direct_full_commits++;
@@ -76817,6 +77036,7 @@ static int ds4_session_eval_dspark_speculative_stochastic(
             }
             s->checkpoint_valid = true;
             ds4_session_dspark_capture_note_checkpoint(s);
+            if (accepted_drafts > 0) ds4_session_ngram_note_tokens(s, accepted_drafts);
         }
     }
 
@@ -76870,6 +77090,7 @@ static int ds4_session_eval_dspark_speculative_stochastic(
         }
         s->checkpoint_valid = true;
         ds4_session_dspark_capture_note_checkpoint(s);
+        if (accepted_drafts > 0) ds4_session_ngram_note_tokens(s, accepted_drafts);
     }
 
     if (ds4_session_eval_probe_tp(s, replacement, false,
@@ -76915,6 +77136,7 @@ static int ds4_session_eval_dspark_speculative_stochastic(
  * reach ds41_graph_verify_rows or the pair deadlocks. That is why every early
  * exit here is fatal rather than a graceful decline: there is no state in which
  * declining quietly leaves the leader able to make progress. */
+#ifdef DS4_HAS_DEEPSEEK41_GPU
 static int ds4_session_tp_spec_cycle_ds41(ds4_session *s, const int *drafts,
                                           int draft_n, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
@@ -77004,6 +77226,7 @@ static int ds4_session_tp_spec_cycle_ds41(ds4_session *s, const int *drafts,
     }
     return 0;
 }
+#endif
 
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               char *err, size_t errlen) {
@@ -77031,9 +77254,11 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
         snprintf(err, errlen, "tp: verify block beyond context");
         return 1;
     }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
         return ds4_session_tp_spec_cycle_ds41(s, drafts, draft_n, err, errlen);
     }
+#endif
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
     const int start = s->checkpoint.len;
@@ -79840,6 +80065,7 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             ds4_session_dspark_capture_note_checkpoint(s);
+            ds4_session_ngram_note_tokens(s, 1);
         }
         return 0;
     }
@@ -80959,6 +81185,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_images = NULL;
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
+    ds4_session_ngram_clear(s);
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
@@ -80983,6 +81210,13 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     }
 #endif
     s->checkpoint.len = pos;
+    if (s->context_ngram_ready) {
+        ds4_ngram_table_clear(&s->context_ngram);
+        if (pos > 0 && s->checkpoint.v) {
+            ds4_ngram_table_update(&s->context_ngram, s->checkpoint.v, pos, pos);
+        }
+    }
+    s->ngram_indexed_len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row
      * counts. Without a saved frontier the caller must rebuild this prefix. */
     if (!state_ok) s->checkpoint_valid = false;
