@@ -41956,11 +41956,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
         if (!sok) { (void)ds4_gpu_synchronize(); return false; }
         return true;
     }
+    const bool vt = getenv("DS4_DSPARK_VERIFY_TIMING") != NULL;
+    const double vt_t0 = vt ? now_sec() : 0.0;
     if (!ds41_graph_prefill_sweep(g, m, w, tokens, count, NULL, NULL, 0,
                                   NULL, NULL, false, false,
                                   plain_sweep ? NULL : vc)) {
         return false;
     }
+    const double vt_t_sweep = vt ? now_sec() : 0.0;
     if (plain_sweep) return true;
     /* Per-row logits: the V4.1 head is already row-parameterized, so the only
      * difference from the single-token path is the row count. */
@@ -41972,6 +41975,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
     if (ok) ok = ds41_norm_batch(b->norm, b->x, m, w->output_norm, count);
     if (ok) ok = ds41_output_projection(g, vc->logits, m, w, b->norm, count);
     if (!ds4_gpu_end_commands()) ok = false;
+    const double vt_t_proj = vt ? now_sec() : 0.0;
     const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
     const bool tp_split = (g->tp_world == 2) && (g->tp_logits_half != NULL) && (vc->tp != NULL);
     if (tp_split) {
@@ -42003,6 +42007,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
     } else {
         if (ok) ok = ds4_gpu_tensor_read(vc->logits, 0, vc->row_logits,
                                          (uint64_t)count * DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    const double vt_t_end = vt ? now_sec() : 0.0;
+    if (vt) {
+        fprintf(stderr, "ds4: [timing] verify_rows count=%u rank=%u: total=%.2f ms (sweep=%.2f, proj=%.2f, logits_rdma=%.2f)\n",
+                count, g->tp_rank, (vt_t_end - vt_t0) * 1000.0,
+                (vt_t_sweep - vt_t0) * 1000.0,
+                (vt_t_proj - vt_t_sweep) * 1000.0,
+                (vt_t_end - vt_t_proj) * 1000.0);
     }
     if (!ok) (void)ds4_gpu_synchronize();
     return ok;
@@ -58129,6 +58141,9 @@ static bool ds4_session_dspark_seed_batch_enabled(
 }
 
 static bool ds4_session_dspark_seed_batch_short_fallback(const ds4_session *s) {
+    const char *env = getenv("DS4_DSPARK_SEED_BATCH_SHORT_FALLBACK");
+    if (env && env[0]) return strcmp(env, "0") != 0;
+    if (s && s->engine && s->engine->tp.active) return false;
     if (s->engine->backend == DS4_BACKEND_METAL) return true;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     return s->engine->backend == DS4_BACKEND_CUDA &&
@@ -75660,6 +75675,8 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
         }
         fprintf(stderr, "\n");
     }
+    const bool vt_commit = getenv("DS4_DSPARK_VERIFY_TIMING") != NULL;
+    const double vt_c0 = vt_commit ? now_sec() : 0.0;
     if (!ds41_verify_commit(g, &s->ds41_vc, (uint32_t)commit)) {
         if (tp_verify) {
             (void)ds4_tp_send_verify_commit(
@@ -75670,6 +75687,7 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
         if (errlen) snprintf(err, errlen, "V4.1 DSpark verify commit failed");
         return -1;
     }
+    const double vt_c1 = vt_commit ? now_sec() : 0.0;
     /* Local state is settled; tell the worker how much of the block to keep.
      * commit is never zero -- drafts[0] was matched against the target's own
      * logits before the block was announced -- so the worker only ever sees
@@ -75683,6 +75701,13 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
         if (errlen) snprintf(err, errlen, "tp: V4.1 verify commit send failed");
         s->checkpoint_valid = false;
         return -1;
+    }
+    const double vt_c2 = vt_commit ? now_sec() : 0.0;
+    if (vt_commit) {
+        fprintf(stderr, "ds4: [timing] commit count=%u commit=%d: commit=%.2f ms, send_commit=%.2f ms\n",
+                (uint32_t)draft_n, commit,
+                (vt_c1 - vt_c0) * 1000.0,
+                (vt_c2 - vt_c1) * 1000.0);
     }
     for (int i = 0; i < commit; i++) token_vec_push(&s->checkpoint, drafts[i]);
     s->checkpoint_valid = true;
@@ -79877,49 +79902,40 @@ static int ds4_session_eval_speculative_argmax_impl(
             s->dspark_draft_valid &&
             s->dspark_draft_len > 0 &&
             s->dspark_draft_len < DS4_DSPARK_MAX_BLOCK_SIZE) {
-            /* A short, low-confidence suffix rarely repays a batched seed.
-             * Decode the seed once, then check the already-prepared first
-             * draft against its logits without running another proposal. */
-            if (ds4_session_dspark_seed_batch_short_fallback(s) &&
-                s->dspark_draft_len < 3) {
-                if (ds4_session_eval_probe_tp(s, first_token, false, err, errlen) != 0)
-                    return -1;
-                accepted[0] = first_token;
-                return ds4_session_eval_dspark_speculative_argmax(
-                    s, 1, max_tokens, eos_token, ignore_eos, think_mode,
-                    accepted, accepted_cap, err, errlen);
+            const uint32_t min_verify = ds4_dspark_env_u32(
+                "DS4_DSPARK_MIN_VERIFY_DRAFTS",
+                (s && s->engine && s->engine->tp.active) ? 3u : 1u);
+            if (s->dspark_draft_len >= min_verify) {
+                memmove(s->dspark_draft_tokens + 1,
+                        s->dspark_draft_tokens,
+                        (size_t)s->dspark_draft_len *
+                            sizeof(s->dspark_draft_tokens[0]));
+                s->dspark_draft_tokens[0] = first_token;
+                s->dspark_draft_len++;
+                attempted_verify = true;
+                const int fused_n =
+                    ds4_session_eval_dspark_speculative_argmax(
+                        s, 0, max_tokens, eos_token, ignore_eos, think_mode,
+                        accepted, accepted_cap, err, errlen);
+                if (fused_n != 0) return fused_n;
             }
-            memmove(s->dspark_draft_tokens + 1,
-                    s->dspark_draft_tokens,
-                    (size_t)s->dspark_draft_len *
-                        sizeof(s->dspark_draft_tokens[0]));
-            s->dspark_draft_tokens[0] = first_token;
-            s->dspark_draft_len++;
-            attempted_verify = true;
-            const int fused_n =
-                ds4_session_eval_dspark_speculative_argmax(
-                    s, 0, max_tokens, eos_token, ignore_eos, think_mode,
-                    accepted, accepted_cap, err, errlen);
-            if (fused_n != 0) return fused_n;
         }
-        if (ds4_session_dspark_seed_batch_short_fallback(s) || align_rocm_dspark) {
-            /* A declined proposal already consumed this cycle's confidence and
-             * scheduler decision. Do not draft the same seed again after decode. */
-            if (ds4_session_eval_probe_tp(s, first_token, false, err, errlen) != 0)
-                return -1;
-            accepted[0] = first_token;
-            if (!attempted_verify) {
-                ds4_session_dspark_scheduler_note(s, 0, true,
-                                                  s->dspark_last_propose_ms);
-                if (ds4_dspark_stats_enabled()) {
-                    s->dspark_stats.cycles++;
-                    s->dspark_stats.no_draft++;
-                    ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
-                }
+        /* A declined proposal already consumed this cycle's confidence and
+         * scheduler decision. Do not draft the same seed again after decode. */
+        if (ds4_session_eval_probe_tp(s, first_token, false, err, errlen) != 0)
+            return -1;
+        accepted[0] = first_token;
+        if (!attempted_verify) {
+            ds4_session_dspark_scheduler_note(s, 0, true,
+                                              s->dspark_last_propose_ms);
+            if (ds4_dspark_stats_enabled()) {
+                s->dspark_stats.cycles++;
+                s->dspark_stats.no_draft++;
+                ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
             }
-            if (ds4_dspark_stats_enabled()) s->dspark_stats.first_tokens++;
-            return 1;
         }
+        if (ds4_dspark_stats_enabled()) s->dspark_stats.first_tokens++;
+        return 1;
     }
     if (ds4_session_eval_probe_tp(s,
                                   first_token,
