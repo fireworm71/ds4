@@ -384,3 +384,59 @@ Either
 The second is more attractive: it removes 40 gates per sweep outright, which at
 the measured 0.814 ms of host-visible gate time is ~32 ms, on top of making the
 window usable.
+
+---
+
+# COLLAPSING THE TWO GATES IS NOT AVAILABLE EITHER
+
+The previous section offered two routes. The attractive one -- collapse V4.1's
+two per-layer reductions into one -- is now ruled out.
+
+The two reductions are different tensors at different points in the layer, and
+they are sequentially dependent:
+
+```c
+/* attention output partial */
+ok = ds41_sum_partial_batch(g, active.block, il, rows);          /* ds4.c:42176 */
+ok = ds4_gpu_dsv41_quantize(active.block, ...) &&
+     ds41_after_attention_batch(&active, model, l, rows) &&      /* consumes it */
+     ds41_moe_batch(g, model, l, il, rows, shared_owner);        /* -> ds4.c:40790 */
+
+/* inside ds41_moe_batch, the FFN partial */
+ds41_sum_partial_batch(g, b->routed, il, count);                 /* ds4.c:40790 */
+```
+
+The attention partial must be summed before the HC/FFN norm that feeds the MoE,
+and the MoE partial must be summed before the residual. There is a true data
+dependency between them, so they can be neither merged into one exchange nor
+overlapped. **V4.1 genuinely needs two gates per layer.**
+
+That leaves only the slab-layout route: two batch slots per layer, gates indexed
+by a running counter rather than the layer id.
+
+## And a caveat on the ceiling
+
+Per-gate timing says handshake is 0.426 ms. With 80 gates per sweep that implies
+~34 ms recoverable, but Stage 1 measured **-16 ms**. The gap is almost certainly
+peer wait: the handshake blocks until the other rank reaches the same gate, so
+removing it moves part of that wait into the RDMA rather than eliminating it.
+
+**The honest ceiling for gate work is therefore roughly what Stage 1 already
+achieved**, not the ~34 ms the per-gate number suggests. Anyone taking the
+slab-layout route should expect to be competing with `DS4_TP_GATE_HANDSHAKE_EVERY`
+for a similar saving, gaining correctness (a real barrier) rather than speed.
+
+## Where that leaves the effort
+
+Ranked by remaining expected value:
+
+1. **Overlap propose with the target decode** (T24 section 4). Unaffected by any
+   of the above, attacks the 40 ms that actually gates the +EV decision, and
+   needs no transport work.
+2. **Piecewise CUDA-graph the sweep** around the eager gates -- vLLM's GB10
+   workaround. Attacks the ~120 ms of per-layer compute-plus-launch that the
+   gate measurements show is the bulk of the sweep.
+3. Slab-layout change for the window: correctness win, speed roughly par with
+   Stage 1.
+4. ~~Collapse the two gates~~ -- ruled out here.
+5. ~~Drafter TP~~ -- ruled out in T24 by SGLang's guidance.
