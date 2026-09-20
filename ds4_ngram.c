@@ -283,7 +283,7 @@ uint32_t ds4_ngram_draft_3tier(const ds4_ngram_table *context_table,
                 const int32_t *prefix = &chain[curr_len - g];
                 const uint16_t min_cnt = (g >= 2) ? 1 : 2;
                 if (ds4_ngram_table_lookup(context_table, prefix, g, &next_tok, &conf, min_cnt)) {
-                    if (g >= 2 || conf >= 0.50f) {
+                    if (conf >= 0.60f || (g >= 3 && conf >= 0.50f)) {
                         found = true;
                         break;
                     }
@@ -326,6 +326,13 @@ uint32_t ds4_ngram_draft_3tier(const ds4_ngram_table *context_table,
 
         draft_out[drafted++] = next_tok;
         chain[curr_len++] = next_tok;
+
+        /* Confidence-aware chain truncation: if continuation confidence is moderate
+         * (0.50 - 0.70), limit further speculative lookahead to 2 additional tokens
+         * to avoid high verification penalties on divergent branches. */
+        if (conf < 0.70f && drafted + 2 < max_draft) {
+            max_draft = drafted + 2;
+        }
     }
 
     return drafted;

@@ -73644,11 +73644,11 @@ static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
     static int ng_max = -1, ng_min = 0, adaptive = -1;
     if (ng_max < 0) {
         const char *e = getenv("DS4_DSPARK_NGRAM_MAX");
-        ng_max = e ? atoi(e) : 16;
+        ng_max = e ? atoi(e) : 32;
         if (ng_max < 2) ng_max = 2;
         if (ng_max > 64) ng_max = 64;
         const char *mn = getenv("DS4_DSPARK_NGRAM_MIN");
-        ng_min = mn ? atoi(mn) : 3;
+        ng_min = mn ? atoi(mn) : 6;
         if (ng_min < 2) ng_min = 2;
         if (ng_min > ng_max) ng_min = ng_max;
         const char *ad = getenv("DS4_DSPARK_NGRAM_ADAPTIVE");
@@ -73697,6 +73697,21 @@ static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
             if (allowed > max_draft) allowed = max_draft;
         }
 
+        /* Check branch uniqueness: if this prefix has divergent continuations elsewhere in history,
+         * clamp allowed draft to 8 to avoid paying verification penalty on an ambiguous branch. */
+        int branch_conflicts = 0;
+        for (int j = i - 1; j >= 0; j--) {
+            if (h[j] == token && j + 1 < n) {
+                int d = 1;
+                while (j - d >= 0 && n - d >= 0 && h[j - d] == h[n - d] && d < depth) d++;
+                if (d >= depth && h[j + 1] != h[i + 1]) {
+                    branch_conflicts++;
+                    break;
+                }
+            }
+        }
+        if (branch_conflicts > 0 && allowed > 8u) allowed = 8u;
+
         const uint32_t k = avail < allowed ? avail : allowed;
         const int score = depth * 2 + (int)k;
         /* Prefer higher combined score (prefix depth and yield continuation) */
@@ -73737,7 +73752,7 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
         if (cap > (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1)) cap = (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1);
         {
             const char *e = getenv("DS4_DSPARK_NGRAM_DRAFT_MAX");
-            const int want = e ? atoi(e) : 6;
+            const int want = e ? atoi(e) : ((DS4_TP_BATCH_MAX_ROWS >= 64) ? 48 : 16);
             if (want >= 2 && (uint32_t)want < cap) cap = (uint32_t)want;
         }
         const uint32_t k =
@@ -73752,21 +73767,21 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
         }
 
         /* Fallthrough policy when N-Gram misses:
-         * 1) DS4_DSPARK_NGRAM_HYBRID unset: pure N-Gram mode. Declining is free (<250ns)
-         *    and ensures 0% regression on novel/creative prose.
-         * 2) "auto" or "adaptive": only fall through to DSpark neural draft if speculation
+         * 1) "auto" or "adaptive" (default): only fall through to DSpark neural draft if speculation
          *    is currently in a healthy state (s->dspark_streak_misses == 0 and scheduler
-         *    has not paused DSpark proposals). If on a miss streak, decline immediately.
+         *    has not paused DSpark proposals). If on a miss streak, decline immediately (0 ms cost).
+         * 2) "none" or "0": pure N-Gram mode. Declining is free (<250ns) and ensures 0% regression on prose.
          * 3) "1" or "always": unconditional fallthrough for ablation comparison.
          */
         const char *hybrid = getenv("DS4_DSPARK_NGRAM_HYBRID");
-        if (!hybrid) return false;
+        if (!hybrid) hybrid = "auto";
+        if (strcmp(hybrid, "0") == 0 || strcmp(hybrid, "none") == 0) return false;
 
         bool allow_fallback = false;
         if (strcmp(hybrid, "1") == 0 || strcmp(hybrid, "always") == 0) {
             allow_fallback = true;
         } else {
-            /* "auto", "adaptive", or any other non-empty setting */
+            /* "auto", "adaptive", or default */
             allow_fallback = (s->dspark_streak_misses == 0 &&
                               !ds4_session_dspark_scheduler_is_skipping(s));
             if (!allow_fallback && getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
