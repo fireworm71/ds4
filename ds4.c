@@ -73388,9 +73388,83 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
 }
 
 /* Support weights and DSpark scratch live on the configured executor tier. */
+/* Prompt-lookup drafting, as in vLLM's `ngram` speculative method and
+ * llama.cpp's examples/lookup: find the most recent place the current suffix
+ * occurred in the token history and propose whatever followed it.
+ *
+ * The point is the cost. DSpark's stage chain is ~40 ms per propose on this
+ * pair, which is why drafting is only worth attempting when a block is ~63%
+ * likely to land (T23) while the drafter delivers 17%. This is a backward scan
+ * over an int array, so a failed draft costs nothing and that gate disappears
+ * entirely -- only the verify is paid, and only when a match was found. It
+ * composes with DSpark rather than replacing it: no match falls through to the
+ * model.
+ *
+ * drafts[0] must be the token the caller already sampled, because the verify
+ * checks it against the target's own argmax. So the pattern searched for is
+ * the history tail followed by that token, and the continuation fills
+ * drafts[1..]. Longest suffix first: a longer match predicts better and the
+ * verify costs the same either way. */
+static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
+                                        int *out, uint32_t max_draft) {
+    if (!s || !out || max_draft < 2u) return 0;
+    const int *h = s->checkpoint.v;
+    const int n = s->checkpoint.len;
+    if (!h || n <= 0) return 0;
+
+    static int ng_max = -1, ng_min = 0;
+    if (ng_max < 0) {
+        const char *e = getenv("DS4_DSPARK_NGRAM_MAX");
+        ng_max = e ? atoi(e) : 8;
+        if (ng_max < 2) ng_max = 2;
+        if (ng_max > 32) ng_max = 32;
+        const char *mn = getenv("DS4_DSPARK_NGRAM_MIN");
+        ng_min = mn ? atoi(mn) : 3;
+        if (ng_min < 2) ng_min = 2;
+        if (ng_min > ng_max) ng_min = ng_max;
+    }
+
+    for (int ng = ng_max; ng >= ng_min; ng--) {
+        const int tail = ng - 1;          /* history tokens preceding `token` */
+        if (n < tail + 1) continue;
+        for (int i = n - tail - 1; i >= 0; i--) {
+            if (h[i + tail] != token) continue;
+            if (tail && memcmp(h + i, h + n - tail,
+                               (size_t)tail * sizeof(int)) != 0) continue;
+            uint32_t k = 1;
+            out[0] = token;
+            for (int j = i + tail + 1; j < n && k < max_draft; j++) out[k++] = h[j];
+            if (k >= 2u) return k;
+            /* Matched at the very end, so nothing followed it; older matches
+             * for this length may still have a continuation. */
+        }
+    }
+    return 0;
+}
+
 static bool ds4_session_prepare_dspark_draft(ds4_session *s,
                                              int token,
                                              uint32_t pos) {
+    /* Try the free drafter first: a hit skips the model entirely. */
+    if (getenv("DS4_DSPARK_NGRAM_DRAFT") != NULL) {
+        uint32_t cap = DS4_DSPARK_MAX_BLOCK_SIZE;
+        if (cap > DS4_TP_BATCH_MAX_ROWS) cap = DS4_TP_BATCH_MAX_ROWS;
+        {
+            const char *e = getenv("DS4_DSPARK_NGRAM_DRAFT_MAX");
+            const int want = e ? atoi(e) : 6;
+            if (want >= 2 && (uint32_t)want < cap) cap = (uint32_t)want;
+        }
+        const uint32_t k =
+            ds4_session_ngram_draft(s, token, s->dspark_draft_tokens, cap);
+        if (k >= 2u) {
+            s->dspark_draft_len = k;
+            s->dspark_draft_valid = true;
+            s->dspark_stochastic_draft = false;
+            if (getenv("DS4_DSPARK_SPEC_LOG") != NULL)
+                fprintf(stderr, "ds4: ngram draft len=%u at pos=%u\n", k, pos);
+            return true;
+        }
+    }
     ds4_gpu_graph *g = &s->graph;
     const int exec_tier =
         g->dspark_exec_tier >= 0 && g->dspark_exec_tier < DS4_MAX_GPUS

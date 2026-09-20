@@ -106,3 +106,71 @@ can be gated so it never costs anything when it does not fire.
 Expected outcome is workload-dependent by construction: a clear win on code and
 repetitive generation, neutral on prose. That is a better risk profile than
 anything left on the engine side, all of which was measured to parity at best.
+
+---
+
+# BUILT AND MEASURED: it loses, and the reason is a cap nobody had found
+
+`DS4_DSPARK_NGRAM_DRAFT=1` implements prompt-lookup drafting in
+`ds4_session_prepare_dspark_draft`, ahead of the DSpark chain, with
+`DS4_DSPARK_NGRAM_MIN/MAX` controlling match length and
+`DS4_DSPARK_NGRAM_DRAFT_MAX` the draft cap. A miss falls through to the model.
+It works mechanically and costs nothing to run.
+
+## Results
+
+| configuration | tg | blocks | accepted | verify total |
+|---|---|---|---|---|
+| baseline (no spec) | **22.01** | -- | -- | -- |
+| ngram, min=3, counting prompt | 8.21 | 65 | 9 | 14.7 s |
+| ngram, min=8, verbatim-repeat prompt | 13.73 | 26 | 19 | 5.6 s |
+
+Both lose badly. Two separate lessons.
+
+**My first prompt was wrong.** "Item 1: alpha. Item 2: alpha..." is a *counting*
+pattern: the suffix `alpha.\nItem` matches, and lookup then predicts the number
+that followed last time, which is always wrong. Lookup fails precisely at the
+varying token. A min match of 3 also fires on meaningless prose matches -- 65
+verifies for 9 accepted tokens.
+
+**Raising the gate helps but does not fix it.** min=8 on verbatim-repeating
+output cut verifies from 65 to 26 and roughly doubled acceptance per block, but
+still only **0.73 accepted tokens per verify** against the 1.14 break-even.
+
+## The real blocker: the 8-row verify cap
+
+Propose is now free, so the binding constraint moved to **accepted tokens per
+verify**. And the economics of a *long* accepted run are excellent:
+
+```
+verify(K) ~= 60 + 17K          (post Stage 1)
+K=7  -> 179 ms for 8 tokens  = 22.4 ms/token  = 45 t/s
+```
+
+Lookup decoding earns its keep on long verbatim spans -- ten or twenty tokens
+copied from the prompt -- which is exactly where those numbers land. **But the
+draft can never be that long here:** `DS4_TP_BATCH_MAX_ROWS = 8` caps verify
+rows, so at most ~7 draft tokens can ever be checked in one block, and
+`ds4_tp_batch_block_begin` rejects anything above it.
+
+So the configuration permits only the short drafts at which lookup is weakest,
+and forbids the long ones at which it is strongest. That cap is a small
+compile-time constant, but it sizes the RDMA slab on both ranks, so raising it
+is a real change rather than a knob.
+
+## What would make this line work
+
+1. **Raise `DS4_TP_BATCH_MAX_ROWS`** to 16 or 32 and re-measure. This is the
+   precondition; without it lookup cannot express the drafts that pay.
+2. **Test on the actual use case.** Neither prompt here was it. Lookup decoding
+   is for regenerating text that largely exists in the context -- "rewrite this
+   function with X changed", diff-style edits, long quotation. Synthetic
+   repetition with a counter is close to a worst case.
+3. Keep the strict gate: min=8 was clearly better than min=3, and the cost of a
+   wrong draft is a whole verify.
+
+## Status
+
+Implemented, off by default, measured negative at the current row cap. The code
+is small and self-contained; the finding that matters is that **the 8-row verify
+cap, not propose cost, is what stops a free drafter from paying.**
