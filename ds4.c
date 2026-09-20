@@ -41408,6 +41408,28 @@ static DS4_MAYBE_UNUSED bool ds41_verify_commit(ds41_gpu_graph *g,
     }
     g->history = vc->history[keep - 1u];
     g->pos = vc->pos0 + keep;
+    /* DS4_DS41_VERIFY_POSLOG=1: both ranks run this function with the keep the
+     * leader chose, so printing each rank's resulting frontier and a cheap
+     * fingerprint of the last kept KV row shows directly whether a partial
+     * commit leaves the pair in the same state. A full commit (keep == rows)
+     * restores nothing; only a partial one exercises the rollback, which is
+     * exactly where output divergence correlates. */
+    if (ok && getenv("DS4_DS41_VERIFY_POSLOG")) {
+        float probe[8] = {0};
+        const uint32_t slot = (vc->pos0 + keep - 1u) % 128u;
+        double mag = 0.0;
+        if (g->window[DS4_N_LAYER - 1u] &&
+            ds4_gpu_synchronize() != 0 &&
+            ds4_gpu_tensor_read(g->window[DS4_N_LAYER - 1u],
+                                (uint64_t)slot * DS41_VERIFY_KV_ROW,
+                                probe, sizeof(probe)) != 0) {
+            for (int i = 0; i < 8; i++) mag += (double)fabsf(probe[i]);
+        }
+        fprintf(stderr,
+                "ds4: dbg verify-commit rank=%u pos0=%u keep=%u rows=%u "
+                "pos=%u slot=%u w39=%.6f\n",
+                g->tp_rank, vc->pos0, keep, vc->rows, g->pos, slot, mag);
+    }
     return ok;
 }
 
