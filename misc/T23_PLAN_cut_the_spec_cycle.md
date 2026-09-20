@@ -131,3 +131,103 @@ optional.
 * **min-verify tuning.** 2 and 3 measure the same (20.0 t/s); 4 is worse.
 * **Scheduler feedback (plan Components 2/3).** `scheduler_skips=86` of 110 --
   the scheduler already suppresses drafting on cycles that would waste propose.
+
+---
+
+# STAGE 1 RESULT and the revised critical path
+
+## Stage 1 delivered, and is measured
+
+`DS4_TP_GATE_HANDSHAKE_EVERY=N` (commit `8bf79a1`) performs the big-gate TCP
+rendezvous only where `layer % N == 0`. At N=40:
+
+```
+rows=4   143.7 -> 128.8 ms
+rows=5   159.9 -> 143.1 ms
+rows=6   177.4 -> 160.8 ms
+```
+
+**-16 ms at every row count**, as predicted, with zero desync reports and zero
+RNR stalls. tg at confidence 0.3: 14.78 -> 17.78 t/s.
+
+At default confidence tg is unchanged (20.01 -> 20.10): only four blocks reach
+verify in 128 tokens, so 16 ms/sweep is ~1% of runtime. **The saving scales
+with how often verify runs.**
+
+## Which moves the constraint off verify entirely
+
+With Stage 1, `verify(K=3) ~= 111 ms` for 4 tokens -- **27.8 ms/token against a
+43.5 ms baseline**. Speculation is now strongly profitable *per block*. What
+stops it is the decision to propose at all:
+
+```
+propose costs             40 ms
+a successful block saves  ~63 ms
+so propose is +EV only if P(success) > 63%
+measured P(success)       ~17%   (4 usable blocks in ~24 attempts)
+```
+
+`scheduler_skips=86 of 110` is therefore **correct behaviour**, not a bug to
+fix. Plan Components 2/3 would have made this worse.
+
+## Why propose costs 40 ms
+
+`DS4_DSPARK_STAGE_PROFILE=1`, 9 stage executions:
+
+| part | share of chain |
+|---|---|
+| **ffn** (128-expert MoE) | 55% |
+| **q_path** (Q projection) | 35% |
+| attn_output_hc | 10% |
+| attention, norms, next_input | <1% |
+
+Both dominant parts are pure matmul width -- and the drafter runs them
+**un-parallelised**. `metal_graph_eval_dspark_stage_chain` sets `g->tp_world = 0`
+(ds4.c:34767) because:
+
+> The support model runs only on the coordinator. Its generic layer helpers
+> share the base graph object, so temporarily disarm TP or they would encode
+> expert gates that the worker can never reach.
+
+So rank 0 does 100% of the drafter's work while rank 1 idles. The target splits
+both the Q projection (`q_dim = N_HEAD / tp_world * N_HEAD_DIM`) and the experts
+across ranks; the drafter splits neither.
+
+## Revised plan
+
+**Stage 4a -- run the drafter on both ranks (largest lever).** The worker
+already loads the DSpark model (`--mtp-model` is passed to it). Driving its
+stage chain from a TP frame, exactly as `DS4_TP_FRAME_VERIFY` drives the
+worker's verify, would let `tp_world` stay 2 through the chain and split `ffn`
+and `q_path`. Expect chain 30 -> ~15-18 ms, propose 40 -> ~22 ms.
+
+**Stage 4b -- top-k the vocabulary projections (cheap).** `prop_logits` 3.3 ms
+and `prop_markov` 2.7 ms are full 256,960-entry projections; the drafter needs
+only the top few candidates. Expect -5 ms.
+
+**Not available: an early confidence short-circuit.** Plan Component 3 assumed
+stage-0 confidence could gate stages 1..4. It cannot: `confidence0` is computed
+from `batch_ffn_norm`, which is the *output* of the full chain, so the 30 ms is
+spent before the 0.06 ms check can run. That is also why `fuse_final_hidden`
+exists.
+
+## Honest arithmetic on where this lands
+
+With Stages 1 + 2 + 4a + 4b:
+
+```
+propose ~17 ms,  verify(K=3) ~96 ms
+save per success = 4 x 43.5 - 96 = 78 ms
++EV threshold    = 17 / 78 = 22%
+measured P(success)            17%
+```
+
+**The full programme lands just short of the threshold**, close enough that it
+turns on acceptance rate and on how much Stage 2 actually yields. This is worth
+saying plainly before more effort goes in: the remaining work is real
+engineering (a worker-side drafter driven over the TP protocol), and the
+expected outcome is *parity to modest gain*, not the 28-34 t/s the original
+plan targeted.
+
+The case for doing it anyway is that Stage 4a also halves drafter latency for
+single-box use, where there is no verify cost to amortise against.
