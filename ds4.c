@@ -58482,6 +58482,11 @@ static bool ds4_session_dspark_scheduler_should_skip(ds4_session *s) {
     return true;
 }
 
+static bool ds4_session_dspark_scheduler_is_skipping(const ds4_session *s) {
+    if (!s || !ds4_dspark_scheduler_enabled(s)) return false;
+    return s->dspark_sched_bypass || s->dspark_sched_skip > 0;
+}
+
 static void ds4_session_dspark_scheduler_note(
         ds4_session *s,
         uint32_t     accepted_drafts,
@@ -73713,8 +73718,10 @@ static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
 static bool ds4_session_prepare_dspark_draft(ds4_session *s,
                                              int token,
                                              uint32_t pos) {
+    bool ngram_attempted = false;
     /* Try the free drafter first: a hit skips the model entirely. */
     if (getenv("DS4_DSPARK_NGRAM_DRAFT") != NULL) {
+        ngram_attempted = true;
         /* When multiple consecutive mispredictions or divergences occur
          * (e.g. creative writing, thinking trace), pause speculative proposals
          * for 1 cycle so ordinary single-token decode advances at ~44 ms/token
@@ -73743,14 +73750,32 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
                 fprintf(stderr, "ds4: ngram draft len=%u at pos=%u\n", k, pos);
             return true;
         }
-        /* A miss declines the cycle rather than falling through to DSpark.
-         * Falling through costs the model's ~40 ms propose on top of a lookup
-         * that already said no, which measured -17% on prose (19.28 against a
-         * 23.14 baseline) while the copy-heavy case gained 8.8%. Declining
-         * makes the miss free, so the feature is a win where lookup predicts
-         * and neutral where it does not. DS4_DSPARK_NGRAM_HYBRID=1 restores the
-         * fallthrough for comparison. */
-        if (getenv("DS4_DSPARK_NGRAM_HYBRID") == NULL) return false;
+
+        /* Fallthrough policy when N-Gram misses:
+         * 1) DS4_DSPARK_NGRAM_HYBRID unset: pure N-Gram mode. Declining is free (<250ns)
+         *    and ensures 0% regression on novel/creative prose.
+         * 2) "auto" or "adaptive": only fall through to DSpark neural draft if speculation
+         *    is currently in a healthy state (s->dspark_streak_misses == 0 and scheduler
+         *    has not paused DSpark proposals). If on a miss streak, decline immediately.
+         * 3) "1" or "always": unconditional fallthrough for ablation comparison.
+         */
+        const char *hybrid = getenv("DS4_DSPARK_NGRAM_HYBRID");
+        if (!hybrid) return false;
+
+        bool allow_fallback = false;
+        if (strcmp(hybrid, "1") == 0 || strcmp(hybrid, "always") == 0) {
+            allow_fallback = true;
+        } else {
+            /* "auto", "adaptive", or any other non-empty setting */
+            allow_fallback = (s->dspark_streak_misses == 0 &&
+                              !ds4_session_dspark_scheduler_is_skipping(s));
+            if (!allow_fallback && getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+                fprintf(stderr, "ds4: hybrid dspark fallback declined (streak_misses=%u skipping=%d)\n",
+                        s->dspark_streak_misses,
+                        ds4_session_dspark_scheduler_is_skipping(s));
+            }
+        }
+        if (!allow_fallback) return false;
     }
     ds4_gpu_graph *g = &s->graph;
     const int exec_tier =
@@ -73766,7 +73791,7 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
         g->active_tier = saved_tier;
         if (ds4_gpu_set_current_device(saved_tier) != 0) return false;
     }
-    if ((!ok || !s->dspark_draft_valid) &&
+    if ((!ok || !s->dspark_draft_valid) && !ngram_attempted &&
         (getenv("DS4_DSPARK_NGRAM_DRAFT") != NULL || getenv("DS4_DSPARK_NGRAM_FALLBACK") != NULL)) {
         uint32_t cap = DS4_DSPARK_MAX_BLOCK_SIZE - 1u;
         if (cap > (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1)) cap = (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1);
