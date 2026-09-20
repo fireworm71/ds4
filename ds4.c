@@ -41967,8 +41967,39 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
     if (ok) ok = ds41_norm_batch(b->norm, b->x, m, w->output_norm, count);
     if (ok) ok = ds41_output_projection(g, vc->logits, m, w, b->norm, count);
     if (!ds4_gpu_end_commands()) ok = false;
-    if (ok) ok = ds4_gpu_tensor_read(vc->logits, 0, vc->row_logits,
-                                     (uint64_t)count * DS4_N_VOCAB * sizeof(float)) != 0;
+    const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+    const bool tp_split = (g->tp_world == 2) && (g->tp_logits_half != NULL) && (vc->tp != NULL);
+    if (tp_split) {
+        float *scratch_half = malloc((size_t)count * vhalf * sizeof(float));
+        if (!scratch_half) { (void)ds4_gpu_synchronize(); return false; }
+        if (ok) ok = ds4_gpu_tensor_read(vc->logits, 0, scratch_half,
+                                         (uint64_t)count * vhalf * sizeof(float)) != 0;
+        if (g->tp_rank == 0) {
+            for (uint32_t r = 0; ok && r < count; r++) {
+                float *row_dest = vc->row_logits + (size_t)r * DS4_N_VOCAB;
+                memcpy(row_dest, scratch_half + (size_t)r * vhalf, (size_t)vhalf * sizeof(float));
+                if (!ds4_tp_recv_logits_half(vc->tp, row_dest + vhalf, vhalf)) {
+                    ok = false;
+                    break;
+                }
+            }
+        } else {
+            for (uint32_t r = 0; ok && r < count; r++) {
+                const float *row_src = scratch_half + (size_t)r * vhalf;
+                float *row_dest = vc->row_logits + (size_t)r * DS4_N_VOCAB;
+                memcpy(row_dest + vhalf, row_src, (size_t)vhalf * sizeof(float));
+                if (!ds4_tp_send_logits_half(vc->tp, row_src, vhalf)) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        free(scratch_half);
+    } else {
+        if (ok) ok = ds4_gpu_tensor_read(vc->logits, 0, vc->row_logits,
+                                         (uint64_t)count * DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (!ok) (void)ds4_gpu_synchronize();
     return ok;
 }
 
