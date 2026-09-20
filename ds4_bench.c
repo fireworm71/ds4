@@ -915,7 +915,9 @@ int main(int argc, char **argv) {
                 (void)cudaProfilerStart();
             }
 #endif
-            int toks[17];
+            /* Caps accepted_cap, which clamps draft_n. Sized for
+             * DS4_DSPARK_MAX_BLOCK_SIZE (48) plus the seed. */
+            int toks[49];
             int ntok = 1;
             if (speculative) {
                 const double spec_t0 = bench_now_sec();

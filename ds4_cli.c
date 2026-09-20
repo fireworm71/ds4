@@ -613,7 +613,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
-        int toks[17];
+        /* Caps accepted_cap, which clamps draft_n. Sized for
+         * DS4_DSPARK_MAX_BLOCK_SIZE (48) plus the seed. */
+        int toks[49];
         int ntok = 0;
         if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -1641,7 +1643,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
-        int toks[17];
+        /* Caps accepted_cap, which clamps draft_n. Sized for
+         * DS4_DSPARK_MAX_BLOCK_SIZE (48) plus the seed. */
+        int toks[49];
         int ntok = 0;
         if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {

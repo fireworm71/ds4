@@ -10154,7 +10154,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 break;
             }
 
-            int toks[17];
+            int toks[49];
             int ntok = 0;
             const int block_start = ds4_session_pos(w->session);
             if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
@@ -10553,7 +10553,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
                                        &rng);
         if (ds4_token_is_stop(w->engine, token)) break;
 
-        int toks[17];
+        int toks[49];
         int ntok = 0;
         const int block_start = ds4_session_pos(w->session);
         if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&

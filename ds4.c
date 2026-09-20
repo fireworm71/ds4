@@ -2704,7 +2704,7 @@ static void print_size(uint64_t bytes) {
  * verify(K) ~= 60 + 17K means a 31-token block is 587 ms for 32 tokens, 18 ms
  * each against 44 for decode. Sizes several small stack arrays and one
  * block_size x shard_vocab buffer (16 MiB at 32). */
-#define DS4_DSPARK_MAX_BLOCK_SIZE 32
+#define DS4_DSPARK_MAX_BLOCK_SIZE 48
 #if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
 /* Seed plus five drafts needs five intermediate compressor frontiers. */
 #define DS4_SPEC_PREFIX_SLOTS 5
@@ -42094,6 +42094,9 @@ static bool ds41_cuda_row_batch_supported(const ds41_gpu_graph *g, const ds4_wei
 
 static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weights *w,
                                         uint32_t remaining) {
+    if (!g->streaming && (g->tp_world == 1 ||
+        (g->tp_world == 2 && !getenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL"))))
+        return 0;
     if (remaining < 2u || remaining >= 256u ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL") || !ds41_cuda_row_batch_supported(g, w))
         return 0;
@@ -73419,31 +73422,62 @@ static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
     const int n = s->checkpoint.len;
     if (!h || n <= 0) return 0;
 
-    static int ng_max = -1, ng_min = 0;
+    static int ng_max = -1, ng_min = 0, adaptive = -1;
     if (ng_max < 0) {
         const char *e = getenv("DS4_DSPARK_NGRAM_MAX");
-        ng_max = e ? atoi(e) : 8;
+        ng_max = e ? atoi(e) : 16;
         if (ng_max < 2) ng_max = 2;
-        if (ng_max > 32) ng_max = 32;
+        if (ng_max > 64) ng_max = 64;
         const char *mn = getenv("DS4_DSPARK_NGRAM_MIN");
         ng_min = mn ? atoi(mn) : 3;
         if (ng_min < 2) ng_min = 2;
         if (ng_min > ng_max) ng_min = ng_max;
+        const char *ad = getenv("DS4_DSPARK_NGRAM_ADAPTIVE");
+        adaptive = ad ? atoi(ad) : 1;
     }
 
-    for (int ng = ng_max; ng >= ng_min; ng--) {
-        const int tail = ng - 1;          /* history tokens preceding `token` */
-        if (n < tail + 1) continue;
-        for (int i = n - tail - 1; i >= 0; i--) {
-            if (h[i + tail] != token) continue;
-            if (tail && memcmp(h + i, h + n - tail,
-                               (size_t)tail * sizeof(int)) != 0) continue;
-            uint32_t k = 0;
-            for (int j = i + tail + 1; j < n && k < max_draft; j++) out[k++] = h[j];
-            if (k >= 1u) return k;
-            /* Matched at the very end, so nothing followed it; older matches
-             * for this length may still have a continuation. */
+    uint32_t best_k = 0;
+    int best_depth = 0;
+    int best_src = -1;
+
+    for (int i = n - 2; i >= 0; i--) {
+        if (h[i] != token) continue;
+
+        /* Measure matching prefix depth backwards from i and n-1 */
+        int depth = 1;
+        while (i - depth >= 0 && n - depth >= 0 &&
+               h[i - depth] == h[n - depth]) {
+            depth++;
         }
+        if (depth < ng_min) continue;
+
+        const uint32_t avail = (uint32_t)(n - (i + 1));
+        if (avail == 0u) continue;
+
+        /* Adaptive draft sizing: shallow matches draft fewer tokens to limit
+         * verification cost on mispredictions, while deep matches draft up to
+         * max_draft. */
+        uint32_t allowed = max_draft;
+        if (adaptive) {
+            if (depth < 10) allowed = 12u;
+            else if (depth < 14) allowed = 20u;
+            else if (depth < 18) allowed = 32u;
+            else allowed = max_draft;
+            if (allowed > max_draft) allowed = max_draft;
+        }
+
+        const uint32_t k = avail < allowed ? avail : allowed;
+        /* Prefer deeper prefix matches; if equal depth, prefer longer continuation */
+        if (depth > best_depth || (depth == best_depth && k > best_k)) {
+            best_depth = depth;
+            best_k = k;
+            best_src = i + 1;
+            if (best_depth >= ng_max && best_k >= max_draft) break;
+        }
+    }
+    if (best_k && best_src >= 0) {
+        for (uint32_t j = 0; j < best_k; j++) out[j] = h[best_src + (int)j];
+        return best_k;
     }
     return 0;
 }
@@ -73453,8 +73487,8 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
                                              uint32_t pos) {
     /* Try the free drafter first: a hit skips the model entirely. */
     if (getenv("DS4_DSPARK_NGRAM_DRAFT") != NULL) {
-        uint32_t cap = DS4_DSPARK_MAX_BLOCK_SIZE;
-        if (cap > DS4_TP_BATCH_MAX_ROWS) cap = DS4_TP_BATCH_MAX_ROWS;
+        uint32_t cap = DS4_DSPARK_MAX_BLOCK_SIZE - 1u;
+        if (cap > (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1)) cap = (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1);
         {
             const char *e = getenv("DS4_DSPARK_NGRAM_DRAFT_MAX");
             const int want = e ? atoi(e) : 6;
