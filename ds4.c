@@ -73400,10 +73400,12 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
  * composes with DSpark rather than replacing it: no match falls through to the
  * model.
  *
- * drafts[0] must be the token the caller already sampled, because the verify
- * checks it against the target's own argmax. So the pattern searched for is
- * the history tail followed by that token, and the continuation fills
- * drafts[1..]. Longest suffix first: a longer match predicts better and the
+ * Returns the continuation ONLY. The caller prepends the token it already
+ * sampled (`memmove` + `dspark_draft_tokens[0] = first_token`) before the
+ * verify checks that anchor against the target's own argmax, so including it
+ * here duplicates it and guarantees a mismatch at row 1. The pattern searched
+ * for is still the history tail followed by that token; only what came after
+ * it is returned. Longest suffix first: a longer match predicts better and the
  * verify costs the same either way. */
 static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
                                         int *out, uint32_t max_draft) {
@@ -73431,10 +73433,9 @@ static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
             if (h[i + tail] != token) continue;
             if (tail && memcmp(h + i, h + n - tail,
                                (size_t)tail * sizeof(int)) != 0) continue;
-            uint32_t k = 1;
-            out[0] = token;
+            uint32_t k = 0;
             for (int j = i + tail + 1; j < n && k < max_draft; j++) out[k++] = h[j];
-            if (k >= 2u) return k;
+            if (k >= 1u) return k;
             /* Matched at the very end, so nothing followed it; older matches
              * for this length may still have a continuation. */
         }
@@ -73456,7 +73457,7 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
         }
         const uint32_t k =
             ds4_session_ngram_draft(s, token, s->dspark_draft_tokens, cap);
-        if (k >= 2u) {
+        if (k >= 1u) {
             s->dspark_draft_len = k;
             s->dspark_draft_valid = true;
             s->dspark_stochastic_draft = false;
@@ -73464,6 +73465,14 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
                 fprintf(stderr, "ds4: ngram draft len=%u at pos=%u\n", k, pos);
             return true;
         }
+        /* A miss declines the cycle rather than falling through to DSpark.
+         * Falling through costs the model's ~40 ms propose on top of a lookup
+         * that already said no, which measured -17% on prose (19.28 against a
+         * 23.14 baseline) while the copy-heavy case gained 8.8%. Declining
+         * makes the miss free, so the feature is a win where lookup predicts
+         * and neutral where it does not. DS4_DSPARK_NGRAM_HYBRID=1 restores the
+         * fallthrough for comparison. */
+        if (getenv("DS4_DSPARK_NGRAM_HYBRID") == NULL) return false;
     }
     ds4_gpu_graph *g = &s->graph;
     const int exec_tier =

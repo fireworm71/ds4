@@ -36683,8 +36683,15 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     return ok;
 }
 
+/* Must match DS4_TP_BATCH_MAX_ROWS in ds4_tp.h, which this file does not
+ * include. Kept as a named constant so the two cannot drift silently the way
+ * the previous hardcoded 8 did. */
+#define DS4_TP_BATCH_MAX_ROWS_GPU 16u
+
 extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    if (!g_cuda_tp.row || !g_cuda_tp.batch || g_cuda_tp.failed || !rows || rows > 8) return 0;
+    /* Was a hardcoded 8 while the constant it shadowed lived in ds4_tp.h. */
+    if (!g_cuda_tp.row || !g_cuda_tp.batch || g_cuda_tp.failed || !rows ||
+        rows > DS4_TP_BATCH_MAX_ROWS_GPU) return 0;
     const int ok = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "TP batch arrival") &&
         g_cuda_tp.batch(g_cuda_tp.ud, layer, rows, ++g_cuda_tp.batch_seq);
     if (!ok) g_cuda_tp.failed = true;

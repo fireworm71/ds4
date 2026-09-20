@@ -174,3 +174,79 @@ is a real change rather than a knob.
 Implemented, off by default, measured negative at the current row cap. The code
 is small and self-contained; the finding that matters is that **the 8-row verify
 cap, not propose cost, is what stops a free drafter from paying.**
+
+---
+
+# RESULT: the first configuration that beats baseline
+
+## The earlier measurements were my bug, not the idea
+
+All three n-gram runs above were invalid. The caller prepends the anchor
+itself:
+
+```c
+memmove(s->dspark_draft_tokens + 1, s->dspark_draft_tokens, ...);
+s->dspark_draft_tokens[0] = first_token;
+s->dspark_draft_len++;
+```
+
+My lookup also wrote `token` at `out[0]`, so every draft carried a **duplicated
+anchor** and mismatched at row 1 by construction. That is the whole explanation
+for `accepted_len_hist` being almost entirely zeros in those runs. The drafter
+must return the continuation only.
+
+With that fixed, `miss_first` goes from nonzero to **0**.
+
+## Measured, matched prompts, same binary and config
+
+| workload | baseline | + lookup drafting | delta |
+|---|---|---|---|
+| verbatim copy (260 tok) | 22.45 | **24.43** | **+8.8%** |
+| prose (128 tok) | 23.14 | 21.72 | -6% |
+
+On the copy task:
+
+```
+cycles=124 for 260 tokens = 2.10 tokens per target step
+miss_first=0
+draft_len_hist    14:11      (11 blocks at the 14-token cap)
+accepted_len_hist 14:6       (6 blocks accepted ALL 14)
+accepted_draft=131 over 15 blocks = 8.7 accepted per block
+```
+
+**Six blocks accepted fourteen tokens each.** That is the regime the whole
+analysis said was needed and that nothing else reached.
+
+## Raising the row cap was a real precondition
+
+`DS4_TP_BATCH_MAX_ROWS` 8 -> 16 (and a hardcoded `rows > 8` in ds4_cuda.cu that
+shadowed it, now a named constant). At 8 rows the 14-token drafts above cannot
+exist; the feature could only express the short drafts where lookup is weakest.
+The cap sizes the registered slab -- 40 layers x rows x 20 KiB x 2, so 26 MiB at
+16 rows -- and is otherwise free.
+
+## A miss must decline, not fall through
+
+Falling through to DSpark after a lookup miss costs the model's ~40 ms propose
+on top of a lookup that already said no: prose measured **19.28** that way. With
+a miss declining the cycle outright, prose recovers to **21.72**.
+
+The residual 6% is one mispredicted 14-row block costing 337 ms in a 5.9 s run.
+A stricter gate (longer minimum match, or a shorter draft when the match is
+marginal) should close most of it; `DS4_DSPARK_NGRAM_HYBRID=1` restores the old
+fallthrough for comparison.
+
+## Status and recommendation
+
+Off by default. Enable with:
+
+```
+DS4_DSPARK_NGRAM_DRAFT=1 DS4_DSPARK_NGRAM_MIN=8 DS4_DSPARK_NGRAM_MAX=16 \
+DS4_DSPARK_NGRAM_DRAFT_MAX=14 DS4_DSPARK_MIN_VERIFY_DRAFTS=4
+```
+
+This is worth having for copy-heavy work -- regenerating a file with edits,
+reproducing quoted text, structured output that echoes the prompt -- and should
+stay off for open-ended prose until the gate is tightened. It is also the only
+thing in T22-T25 that beat the baseline at all, which is a reasonable argument
+for tightening the gate rather than shelving it.
