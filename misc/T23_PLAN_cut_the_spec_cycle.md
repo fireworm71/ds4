@@ -231,3 +231,77 @@ plan targeted.
 
 The case for doing it anyway is that Stage 4a also halves drafter latency for
 single-box use, where there is no verify cost to amortise against.
+
+---
+
+# STAGE 1, REVISED: the intended mechanism already exists and is unreachable
+
+Stage 1 (`DS4_TP_GATE_HANDSHAKE_EVERY`) removes the per-layer TCP rendezvous by
+skipping it. That works (-16 ms, no RNR observed) but it is a workaround, and
+the codebase already contains the principled version.
+
+## `ds4_tp_batch_block_begin` / `_end`
+
+`ds4_tp.c:2197`, with a comment that describes precisely the optimisation Stage 1
+gropes at:
+
+> Verify-block window: called on both ranks right before a speculative verify
+> block whose every layer ends in one batch gate of `rows` rows. Drains the
+> decode receive window, posts the first layer's receives, crosses **one
+> control-byte barrier** (so both sides are posted before any send), and from
+> then on **each gate posts the next layer's receives and sends its rows without
+> any handshake.**
+
+It is strictly better than Stage 1: one barrier per block instead of none, so
+both ranks are provably posted before any send (no reliance on RNR retry), and
+each gate pre-posts the *next* layer's receives, so the exchange is pipelined
+rather than merely handshake-free.
+
+## Why it never runs on our pair
+
+Two independent reasons, both structural:
+
+1. **The call site is Metal-only.** `ds4.c:37868` wraps it in
+   `#if defined(__APPLE__)`, so on CUDA it is not even compiled.
+2. **It is attached to the wrong verify path.** The call sits in
+   `metal_graph_verify_suffix_tops_impl` -- the pre-V4.1 verify. V4.1 uses
+   `ds41_graph_verify_rows`, which never touches it.
+
+## And V4.1 uses a different gate function
+
+There are two batch gate paths in the transport:
+
+| function | buffers | rendezvous |
+|---|---|---|
+| `ds4_tp_batch_gate_exchange` | fixed slab offsets per layer | **windowed** (`block_active`) |
+| `ds4_tp_big_gate_exchange` | arbitrary pointers | **per-gate TCP handshake** |
+
+V4.1's `ds41_sum_partial_batch` calls `ds4_gpu_tp_big_gate_encode`, i.e. the
+**big** path, because its buffers (`x` and `g->batch.q`) are not in the
+registered slab. So even with the Apple guard removed, the window would not
+apply -- `block_active` is only honoured by the batch path.
+
+## The real Stage 1
+
+Extend the window to the big-gate path: when `r->block_active`, have
+`ds4_tp_big_gate_exchange` skip the handshake and consume pre-posted receives,
+exactly as `ds4_tp_batch_gate_exchange` does. Then call
+`ds4_tp_batch_block_begin/_end` around `ds41_graph_verify_rows` on all
+platforms, not just Apple.
+
+This is RDMA-layer work -- receive posting, completion accounting, and the
+`recv_window_active` / `block_active` interaction in
+`tp_rdma_big_gate_exchange`, which currently *refuses* to run while a receive
+window is active. It should land the same ~16 ms as Stage 1 with a proper
+barrier, and it removes a `getenv`-gated shortcut from the hot path.
+
+Until then `DS4_TP_GATE_HANDSHAKE_EVERY` stands as an interim measure, off by
+default.
+
+## One thing Stage 1 does not affect, correctly
+
+Plain decode is untouched. `ds4_tp_gate_exchange` (the row gate, used by
+single-token decode) goes straight to `tp_rdma_gate_exchange` under RDMA and
+**never does a TCP handshake**. Only the big gate did, so only the verify path
+ever paid it -- which matches the measurement that decode tg was unchanged by
+Stage 1.
