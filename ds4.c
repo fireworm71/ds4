@@ -40957,7 +40957,15 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
 #endif
     /* Resident appends do not pay for an SSD layer sweep. In particular,
      * the server's 128-token mixed quantum must not become scalar prefill. */
-    if (!g->streaming && g->tp_world == 1) minimum = 8u;
+    /* The same holds for a resident TP pair, and it mattered more there: a
+     * bulk sweep costs one RDMA expert exchange per layer for the whole
+     * batch, while cutting the prompt into DS4_TP_BATCH_MAX_ROWS micro-batches
+     * costs ceil(n/8) exchanges per layer. A 46-token prompt was paying 40
+     * layers x 6 round trips to avoid an SSD sweep that resident mode never
+     * performs. */
+    if (!g->streaming && (g->tp_world == 1 ||
+        (g->tp_world == 2 &&
+         !getenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL")))) minimum = 8u;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* With at least half the experts cached, warm short appends beat a full
      * disk sweep. Leave a token-major tail to warm the following decode too. */
