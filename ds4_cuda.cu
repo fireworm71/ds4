@@ -25987,7 +25987,7 @@ static int routed_moe_launch(
             use_sorted_pairs &&
             (owned_filtered || getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL);
         const uint32_t q4_owned_batch =
-            owned_filtered && q4k_path && n_tokens >= 4u && n_tokens <= 16u;
+            owned_filtered && q4k_path && n_tokens >= 4u && n_tokens <= 64u;
         /* Small batches (DSpark stage chain / verify, n<=8) leave most of an
          * 8-slot expert tile empty (1-2 rows per expert): tile4 halves the
          * wasted dot-slots and measures ~2x faster there. Q4 TP batches use

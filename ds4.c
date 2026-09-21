@@ -73906,7 +73906,8 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
         if (cap > (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1)) cap = (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1);
         {
             const char *e = getenv("DS4_DSPARK_NGRAM_DRAFT_MAX");
-            const int want = e ? atoi(e) : 8;
+            const int default_want = (s && s->engine && s->engine->ssd_streaming) ? 12 : 8;
+            const int want = e ? atoi(e) : default_want;
             if (want >= 2 && (uint32_t)want < cap) cap = (uint32_t)want;
         }
         const uint32_t k =
@@ -73966,7 +73967,8 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
         if (cap > (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1)) cap = (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1);
         {
             const char *e = getenv("DS4_DSPARK_NGRAM_DRAFT_MAX");
-            const int want = e ? atoi(e) : 8;
+            const int default_want = (s && s->engine && s->engine->ssd_streaming) ? 12 : 8;
+            const int want = e ? atoi(e) : default_want;
             if (want >= 2 && (uint32_t)want < cap) cap = (uint32_t)want;
         }
         const uint32_t k = ds4_session_ngram_draft(s, token, s->dspark_draft_tokens, cap);
