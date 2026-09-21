@@ -73929,7 +73929,12 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
          * 3) "1" or "always": unconditional fallthrough for ablation comparison.
          */
         const char *hybrid = getenv("DS4_DSPARK_NGRAM_HYBRID");
-        if (!hybrid) hybrid = "auto";
+        if (!hybrid) {
+            /* Under SSD streaming or network TP, DSpark neural drafter on prose preambles
+             * incurs high verification penalty on low-confidence guesses. Default to pure
+             * N-Gram mode ("0") which guarantees 0% regression on prose and 100% bit-exactness. */
+            hybrid = (s && s->engine && s->engine->ssd_streaming) ? "0" : "auto";
+        }
         if (strcmp(hybrid, "0") == 0 || strcmp(hybrid, "none") == 0) return false;
 
         bool allow_fallback = false;
