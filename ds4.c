@@ -75616,6 +75616,141 @@ static bool ds41_diff_restore(ds41_diff_slot *sl, uint32_t n) {
     return ds4_gpu_synchronize() != 0;
 }
 
+/* DS4_DS41_VERIFY_ROW_LOGITS=K: the comparison every other probe stops short of.
+ *
+ * ds41_verify_state_diff compares ONE decode step against a K-row sweep, so it
+ * only ever validates row 0 -- the row that matches decode by construction,
+ * because it attends to exactly the pre-sweep frontier. Rows 1..K-1 attend to
+ * state published inside the sweep, and nothing has ever checked them against a
+ * serial decode of the same tokens. T29 measured row 0 bit-identical under
+ * DS4_DS41_CORE_INVARIANT while generated text still diverged; the only place
+ * left for that divergence to live is here.
+ *
+ * Decode the same token K times capturing each step's logits, restore, run the
+ * K-row sweep, and diff row r against decode step r for every r. The first r
+ * that differs is where batch invariance actually breaks. */
+/* Top-1 index and the gap to top-2, in a single pass. The gap is what decides
+ * whether the batched verify's bounded logit perturbation can change the
+ * committed token: if top1 - top2 exceeds the perturbation, both the batched
+ * and a serial decode pick the same argmax, so the block is safe to accept. */
+static int ds4_argmax_with_margin(const float *v, uint32_t n, float *gap) {
+    int best = 0;
+    float v1 = -INFINITY, v2 = -INFINITY;
+    for (uint32_t i = 0; i < n; i++) {
+        const float x = v[i];
+        if (x > v1) { v2 = v1; v1 = x; best = (int)i; }
+        else if (x > v2) { v2 = x; }
+    }
+    if (gap) *gap = (v2 == -INFINITY) ? INFINITY : (v1 - v2);
+    return best;
+}
+
+static void ds41_verify_row_logit_diff(ds4_session *s, int token) {
+    /* Sample many positions, not one. The compressed-cache write fires only
+     * when (pos + 1) % ratio == 0, so a single probe at one pos0 can miss the
+     * parity that actually breaks invariance -- which is why
+     * DS4_DS41_VERIFY_STATE_DIFF_SKIP exists. DS4_DS41_VERIFY_ROW_LOGITS_N=N
+     * probes the first N speculative cycles (default 1). Only divergent rows
+     * are printed, plus one summary line per cycle, so N can be large. */
+    static int calls = 0;
+    static int budget = -1;
+    if (budget < 0) {
+        const char *e = getenv("DS4_DS41_VERIFY_ROW_LOGITS_N");
+        budget = e ? atoi(e) : 1;
+        if (budget < 1) budget = 1;
+    }
+    if (calls >= budget) return;
+    const int call_index = calls++;
+
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+
+    uint32_t rows = (uint32_t)atoi(getenv("DS4_DS41_VERIFY_ROW_LOGITS"));
+    if (rows < 2u) rows = 5u;
+    if (rows > (uint32_t)DS4_DSPARK_MAX_BLOCK_SIZE) rows = DS4_DSPARK_MAX_BLOCK_SIZE;
+
+    ds41_diff_slot *sl = calloc(DS41_DIFF_SLOTS, sizeof(*sl));
+    float *dec = malloc((size_t)rows * DS4_N_VOCAB * sizeof(float));
+    ds41_verify_ctx vc;
+    memset(&vc, 0, sizeof(vc));
+    if (!sl || !dec) { free(sl); free(dec); return; }
+
+    const uint32_t n = ds41_diff_collect(g, sl);
+    const ds4_engram_history h0 = g->history;
+    const uint32_t pos0 = g->pos;
+    const bool unified = getenv("DS4_DS41_UNIFY_DECODE") != NULL;
+    bool ok = ds4_gpu_synchronize() != 0 && ds41_diff_grab(sl, n, 0);
+
+    for (uint32_t r = 0; ok && r < rows; r++) {
+        float *dst = dec + (size_t)r * DS4_N_VOCAB;
+        ok = (unified
+                  ? ds41_graph_step_via_sweep(g, &e->model, &e->weights, token, dst)
+                  : ds41_graph_step(g, &e->model, &e->weights, token, dst)) &&
+             ds4_gpu_synchronize() != 0;
+    }
+
+    if (ok) { g->history = h0; g->pos = pos0; ok = ds41_diff_restore(sl, n); }
+
+    int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
+    for (uint32_t r = 0; r < rows; r++) drafts[r] = token;
+    if (ok) ok = ds41_verify_alloc(&vc, rows);
+    if (ok) ok = ds41_graph_verify_rows(g, &e->model, &e->weights,
+                                        drafts, rows, &vc) &&
+                 ds4_gpu_synchronize() != 0;
+
+    if (ok && vc.row_logits) {
+        uint32_t bad_rows = 0u, argmax_flips = 0u;
+        double worst = 0.0;
+        for (uint32_t r = 0; r < rows; r++) {
+            const float *dv = dec + (size_t)r * DS4_N_VOCAB;
+            const float *vv = vc.row_logits + (size_t)r * DS4_N_VOCAB;
+            uint32_t da = 0u, va = 0u, ndiff = 0u;
+            double maxabs = 0.0;
+            for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+                if (dv[i] > dv[da]) da = i;
+                if (vv[i] > vv[va]) va = i;
+                const double d = fabs((double)dv[i] - (double)vv[i]);
+                if (d > 0.0) ndiff++;
+                if (d > maxabs) maxabs = d;
+            }
+            if (ndiff) {
+                bad_rows++;
+                if (maxabs > worst) worst = maxabs;
+                if (da != va) argmax_flips++;
+                /* The top-2 gap is what decides whether maxabs can flip the
+                 * argmax. Reporting (gap, maxabs, flipped) per row is the data
+                 * needed to pick a DS4_DSPARK_SAFE_MARGIN threshold: flips must
+                 * occur only where gap < maxabs, and the threshold has to clear
+                 * the gaps actually observed at accepted rows. */
+                float dgap = INFINITY, vgap = INFINITY;
+                (void)ds4_argmax_with_margin(dv, DS4_N_VOCAB, &dgap);
+                (void)ds4_argmax_with_margin(vv, DS4_N_VOCAB, &vgap);
+                fprintf(stderr,
+                        "ds4: dbg row-logits cycle=%d pos0=%u row=%u/%u "
+                        "decode_argmax=%u verify_argmax=%u match=%d "
+                        "ndiff=%u of %u maxabs=%.6g decode_gap=%.4g verify_gap=%.4g\n",
+                        call_index, pos0, r, rows, da, va, (int)(da == va),
+                        ndiff, (unsigned)DS4_N_VOCAB, maxabs,
+                        (double)dgap, (double)vgap);
+            }
+        }
+        fprintf(stderr,
+                "ds4: dbg row-logits SUMMARY cycle=%d pos0=%u rows=%u "
+                "bad_rows=%u argmax_flips=%u worst=%.6g\n",
+                call_index, pos0, rows, bad_rows, argmax_flips, worst);
+    } else {
+        fprintf(stderr, "ds4: dbg row-logits probe unavailable (ok=%d)\n", (int)ok);
+    }
+
+    g->history = h0;
+    g->pos = pos0;
+    (void)ds41_diff_restore(sl, n);
+    ds41_verify_free(&vc);
+    for (uint32_t i = 0; i < n; i++) { free(sl[i].a); free(sl[i].b); free(sl[i].base); }
+    free(sl);
+    free(dec);
+}
+
 static void ds41_verify_state_diff(ds4_session *s, int token) {
     static int done = 0;
     static int seen = 0;
@@ -75680,6 +75815,34 @@ static void ds41_verify_state_diff(ds4_session *s, int token) {
         }
     }
     const uint32_t pos_verify = g->pos;
+
+    /* DS4_DS41_VERIFY_LOGIT_DIFF=1: every tracked state array can read clean
+     * while the generated text still differs, because greedy decoding takes an
+     * argmax -- a discrete decision over a continuous quantity. A rounding-level
+     * difference in one row's logits, far too small to disturb any array in
+     * ds41_state_spans, flips one token and the streams part. So compare what
+     * the two append paths produce for the SAME position directly. `logits` is
+     * decode's; vc.row_logits row 0 is the verify's for that same position. */
+    if (ok && vc.row_logits && getenv("DS4_DS41_VERIFY_LOGIT_DIFF")) {
+        const float *dv = logits;
+        const float *vv = vc.row_logits;
+        uint32_t da = 0u, va = 0u, ndiff = 0u;
+        double maxabs = 0.0, sumabs = 0.0;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            if (dv[i] > dv[da]) da = i;
+            if (vv[i] > vv[va]) va = i;
+            const double d = fabs((double)dv[i] - (double)vv[i]);
+            if (d > 0.0) ndiff++;
+            if (d > maxabs) maxabs = d;
+            sumabs += d;
+        }
+        fprintf(stderr,
+                "ds4: dbg logit-diff decode_argmax=%u(%.6g) verify_argmax=%u(%.6g) "
+                "match=%d ndiff=%u of %u maxabs=%.6g meanabs=%.3g\n",
+                da, (double)dv[da], va, (double)vv[va], (int)(da == va),
+                ndiff, (unsigned)DS4_N_VOCAB, maxabs,
+                sumabs / (double)DS4_N_VOCAB);
+    }
 
     if (ok) { g->history = h0; g->pos = pos0; ok = ds41_diff_restore(sl, n); }
 
@@ -75799,6 +75962,9 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
     if (getenv("DS4_DS41_VERIFY_STATE_DIFF") != NULL) {
         ds41_verify_state_diff(s, drafts[0]);
     }
+    if (getenv("DS4_DS41_VERIFY_ROW_LOGITS") != NULL) {
+        ds41_verify_row_logit_diff(s, drafts[0]);
+    }
     if (s->ds41_vc_ready && s->ds41_vc.rows != (uint32_t)draft_n) {
         ds41_verify_free(&s->ds41_vc);
         s->ds41_vc_ready = false;
@@ -75851,11 +76017,37 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
      * accept rule -- a diagnostic separation, not a mode. */
     const bool commit1_only = getenv("DS4_DS41_VERIFY_COMMIT1") != NULL;
     const uint32_t active_rows = s->ds41_vc.evaluated ? s->ds41_vc.evaluated : (uint32_t)draft_n;
+    /* DS4_DSPARK_SAFE_MARGIN=X: accept a drafted row only when the target's
+     * top-1 beats its top-2 by more than X.
+     *
+     * T29: the batched verify's logits differ from a serial decode's by a
+     * bounded amount (measured up to 3.24), and that difference only changes
+     * the committed token when the top-2 gap is smaller than the perturbation
+     * -- which happened on ~1.3% of verified rows. Requiring a margin turns
+     * "occasionally commits a wrong token" into "occasionally declines to
+     * speculate", which is the safe direction: a rejected row costs one
+     * ordinary decode step, a wrongly accepted one silently corrupts output.
+     * 0 (default) keeps the shipped behaviour. */
+    static float safe_margin = -1.0f;
+    if (safe_margin < 0.0f) {
+        const char *sm = getenv("DS4_DSPARK_SAFE_MARGIN");
+        safe_margin = sm ? (float)atof(sm) : 0.0f;
+        if (!(safe_margin > 0.0f)) safe_margin = 0.0f;
+    }
+    uint32_t margin_rejects = 0;
     for (int i = 1; !commit1_only && i < (int)active_rows; i++) {
         const float *row = s->ds41_vc.row_logits + (size_t)(i - 1) * DS4_N_VOCAB;
-        if (sample_argmax(row, DS4_N_VOCAB) != drafts[i]) break;
+        float gap = INFINITY;
+        const int top = safe_margin > 0.0f
+                            ? ds4_argmax_with_margin(row, DS4_N_VOCAB, &gap)
+                            : sample_argmax(row, DS4_N_VOCAB);
+        if (top != drafts[i]) break;
+        if (safe_margin > 0.0f && gap < safe_margin) { margin_rejects++; break; }
         commit++;
     }
+    if (margin_rejects && getenv("DS4_DSPARK_SPEC_LOG") != NULL)
+        fprintf(stderr, "ds4: margin-reject at commit=%d (threshold %.3f)\n",
+                commit, (double)safe_margin);
     for (int i = 0; i < commit; i++) {
         if (!ignore_eos && drafts[i] == eos_token) { commit = i + 1; break; }
         if (think_mode &&

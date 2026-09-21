@@ -18852,7 +18852,12 @@ static int attention_decode_batch_launch(
                                                      use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                      raw_start, n_comp, window, ratio, n_head, head_dim,
                                                      score_lanes);
-    do { if (getenv("DS4_CUDA_ATTN_DISPATCH_LOG")) fprintf(stderr, "ds4: attn-dispatch arm=\"attention decode batch launch\" n_tokens=%u n_comp=%u\n", n_tokens, n_comp); } while (0); return cuda_ok(cudaGetLastError(), "attention decode batch launch");
+    /* threads is n_tokens-dependent (512 for a one-row launch, 256 for a batch,
+     * unless score_lanes != 0 forces 256 either way), and the kernel's output
+     * accumulation distributes by blockDim.x -- so a differing block size
+     * changes the reduction order and hence the low bits. Log it rather than
+     * infer it: this is the one remaining candidate for the 1.3e-06. */
+    do { if (getenv("DS4_CUDA_ATTN_DISPATCH_LOG")) fprintf(stderr, "ds4: attn-dispatch arm=\"attention decode batch launch\" n_tokens=%u n_comp=%u threads=%u score_lanes=%u\n", n_tokens, n_comp, threads, score_lanes); } while (0); return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
 extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
@@ -18898,6 +18903,77 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (comp_kv_f16) return 0;
+    /* DS4_CUDA_ATTN_INVARIANCE_CHECK=1: the defect measured directly, in situ.
+     *
+     * T29 traced V4.1's speculative divergence to twelve `n_tokens == 1` fast
+     * paths, five of them inside kernels where a dispatch-level override cannot
+     * reach. This runs row 0 alone and then the full batch on *identical*
+     * inputs and diffs the two. Because the kernel masks by `qpos = pos0 + t`,
+     * a correct implementation must return the same row 0 either way, so any
+     * difference is the single-token path diverging from the general one.
+     *
+     * The single-row launch writes only row 0 (grid.x == 1) and the batch
+     * launch then overwrites every row, so the caller still sees the normal
+     * batched result and the check is side-effect free. Costs one extra launch
+     * per layer, and turns a 5-minute model run into a microsecond answer. */
+    static int chk = -1;
+    if (chk < 0) chk = getenv("DS4_CUDA_ATTN_INVARIANCE_CHECK") != NULL;
+    if (chk && n_tokens > 1u && heads && heads->ptr && n_head && head_dim) {
+        const size_t row_floats = (size_t)n_head * head_dim;
+        const size_t row_bytes = row_floats * sizeof(float);
+        float *one = (float *)malloc(row_bytes);
+        float *many = (float *)malloc(row_bytes);
+        if (one && many) {
+            /* The kernel derives `first_raw_pos = pos0 + n_tokens - n_raw`, so
+             * n_raw must shrink with n_tokens or the single-row launch reads a
+             * window shifted by (n_tokens - 1) and the comparison is not
+             * apples-to-apples. Likewise n_comp is (pos0 + n_tokens)/ratio, so
+             * row 0 alone sees (pos0 + 1)/ratio compressed rows. Adjust both so
+             * the ONLY difference between the two launches is the row count. */
+            /* DS4_CUDA_ATTN_INVARIANCE_SELF=1: the control this check needed
+             * from the start. Run the SAME shape twice instead of 1-vs-N. A
+             * deterministic kernel must then report maxabs exactly 0. If it
+             * does not, the kernel is non-deterministic run to run and every
+             * 1-vs-N number here is noise rather than batch-size dependence. */
+            static int self_mode = -1;
+            if (self_mode < 0)
+                self_mode = getenv("DS4_CUDA_ATTN_INVARIANCE_SELF") != NULL;
+            const uint32_t probe_tokens = self_mode ? n_tokens : 1u;
+            const uint32_t n_raw_one =
+                self_mode ? n_raw
+                          : (n_raw > (n_tokens - 1u) ? n_raw - (n_tokens - 1u) : 1u);
+            const uint32_t n_comp_one =
+                self_mode ? n_comp : (ratio ? (pos0 + 1u) / ratio : n_comp);
+            int ok1 = attention_decode_batch_launch(heads, model_map, model_size,
+                          sinks_offset, q, raw_kv, comp_kv, comp_kv_f16, comp_mask,
+                          use_comp_mask, probe_tokens, pos0, n_raw_one, raw_cap, raw_start,
+                          n_comp_one, window, ratio, n_head, head_dim);
+            cudaStreamSynchronize(cuda_decode_stream());
+            cudaMemcpy(one, heads->ptr, row_bytes, cudaMemcpyDeviceToHost);
+            int ok2 = attention_decode_batch_launch(heads, model_map, model_size,
+                          sinks_offset, q, raw_kv, comp_kv, comp_kv_f16, comp_mask,
+                          use_comp_mask, n_tokens, pos0, n_raw, raw_cap, raw_start,
+                          n_comp, window, ratio, n_head, head_dim);
+            cudaStreamSynchronize(cuda_decode_stream());
+            cudaMemcpy(many, heads->ptr, row_bytes, cudaMemcpyDeviceToHost);
+            size_t ndiff = 0;
+            double maxabs = 0.0;
+            for (size_t i = 0; i < row_floats; i++) {
+                const double d = fabs((double)one[i] - (double)many[i]);
+                if (d > 0.0) ndiff++;
+                if (d > maxabs) maxabs = d;
+            }
+            fprintf(stderr,
+                    "ds4: attn-invariance n_tokens=%u ratio=%u n_comp=%u pos0=%u "
+                    "row0_ndiff=%zu of %zu maxabs=%.6g\n",
+                    n_tokens, ratio, n_comp, pos0, ndiff, row_floats, maxabs);
+            free(one);
+            free(many);
+            return ok1 && ok2;
+        }
+        free(one);
+        free(many);
+    }
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
