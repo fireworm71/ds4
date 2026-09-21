@@ -242,6 +242,7 @@ uint32_t ds4_ngram_draft_3tier(const ds4_ngram_table *context_table,
                                int32_t *draft_out,
                                uint32_t max_draft) {
     if (!draft_out || max_draft == 0) return 0;
+    if (ds4_is_syntax_boundary_token(current_token)) return 0;
     if ((!context_table || !context_table->buckets) &&
         (!static_table || !static_table->buckets) &&
         (!dynamic_table || !dynamic_table->buckets))
@@ -275,11 +276,11 @@ uint32_t ds4_ngram_draft_3tier(const ds4_ngram_table *context_table,
         bool found = false;
 
         /* Fallback order: Tier 2 (context) -> Tier 1 (static) -> Tier 3 (dynamic)
-         * In each tier: trying 3-gram key, fallback to 2-gram, fallback to 1-gram */
+         * In each tier: trying 4-gram down to 2-gram key (1-gram disallowed to prevent low-entropy unigram guesses) */
 
         /* Tier 2: Context cache (in-memory, immediate session) */
         if (context_table && context_table->buckets) {
-            for (int g = (curr_len >= DS4_NGRAM_MAX ? DS4_NGRAM_MAX : curr_len); g >= DS4_NGRAM_MIN; g--) {
+            for (int g = (curr_len >= DS4_NGRAM_MAX ? DS4_NGRAM_MAX : curr_len); g >= 2; g--) {
                 const int32_t *prefix = &chain[curr_len - g];
                 const uint16_t min_cnt = (g >= 2) ? 1 : 2;
                 if (ds4_ngram_table_lookup(context_table, prefix, g, &next_tok, &conf, min_cnt)) {
@@ -293,11 +294,11 @@ uint32_t ds4_ngram_draft_3tier(const ds4_ngram_table *context_table,
 
         /* Tier 1: Static cache (precomputed corpus) */
         if (!found && static_table && static_table->buckets) {
-            for (int g = (curr_len >= DS4_NGRAM_MAX ? DS4_NGRAM_MAX : curr_len); g >= DS4_NGRAM_MIN; g--) {
+            for (int g = (curr_len >= DS4_NGRAM_MAX ? DS4_NGRAM_MAX : curr_len); g >= 2; g--) {
                 const int32_t *prefix = &chain[curr_len - g];
                 const uint16_t min_cnt = (g >= 3) ? 1 : 2;
                 if (ds4_ngram_table_lookup(static_table, prefix, g, &next_tok, &conf, min_cnt)) {
-                    if (conf >= 0.40f) {
+                    if (conf >= 0.70f) {
                         found = true;
                         break;
                     }
@@ -307,11 +308,11 @@ uint32_t ds4_ngram_draft_3tier(const ds4_ngram_table *context_table,
 
         /* Tier 3: Dynamic cache (persisted across runs) */
         if (!found && dynamic_table && dynamic_table->buckets) {
-            for (int g = (curr_len >= DS4_NGRAM_MAX ? DS4_NGRAM_MAX : curr_len); g >= DS4_NGRAM_MIN; g--) {
+            for (int g = (curr_len >= DS4_NGRAM_MAX ? DS4_NGRAM_MAX : curr_len); g >= 2; g--) {
                 const int32_t *prefix = &chain[curr_len - g];
                 const uint16_t min_cnt = (g >= 3) ? 1 : 2;
                 if (ds4_ngram_table_lookup(dynamic_table, prefix, g, &next_tok, &conf, min_cnt)) {
-                    if (conf >= 0.50f) {
+                    if (conf >= 0.70f) {
                         found = true;
                         break;
                     }
@@ -321,17 +322,18 @@ uint32_t ds4_ngram_draft_3tier(const ds4_ngram_table *context_table,
 
         if (!found || next_tok <= 0 || next_tok > 200000) break;
 
-        /* Stop draft if token looks like EOS/EOT */
+        /* Stop draft if token looks like EOS/EOT or syntax boundary */
         if (next_tok == 0) break;
+        if (ds4_is_syntax_boundary_token(next_tok)) break;
 
         draft_out[drafted++] = next_tok;
         chain[curr_len++] = next_tok;
 
         /* Confidence-aware chain truncation: if continuation confidence is moderate
-         * (0.50 - 0.70), limit further speculative lookahead to 2 additional tokens
-         * to avoid high verification penalties on divergent branches. */
-        if (conf < 0.70f && drafted + 2 < max_draft) {
-            max_draft = drafted + 2;
+         * (< 0.80f), truncate lookahead immediately to avoid high verification penalties
+         * on ambiguous or divergent branches. */
+        if (conf < 0.80f) {
+            break;
         }
     }
 

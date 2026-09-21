@@ -14,6 +14,22 @@
 extern "C" {
 #endif
 
+static inline bool ds4_is_syntax_boundary_token(int32_t tok) {
+    return (tok == 11    /* ')' */ ||
+            tok == 29    /* ';' */ ||
+            tok == 95    /* '}' */ ||
+            tok == 510   /* ';\n' */ ||
+            tok == 833   /* ');\n' */ ||
+            tok == 1048  /* ';\n\n' */ ||
+            tok == 1778  /* '}\n' */ ||
+            tok == 2365  /* '}\n\n' */ ||
+            tok == 3039  /* ');\n\n' */ ||
+            tok == 3171  /* ');' */ ||
+            tok == 12774 /* '};\n' */ ||
+            tok == 12797 /* '};\n\n' */ ||
+            tok == 35141 /* '};' */);
+}
+
 #define DS4_NGRAM_MIN 1
 #define DS4_NGRAM_MAX 4
 #define DS4_NGRAM_WAYS 4

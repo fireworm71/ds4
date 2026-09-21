@@ -2970,6 +2970,24 @@ int ds4_tp_recv_verify_step(ds4_tp *tp, int32_t *continue_flag) {
     return 1;
 }
 
+int ds4_tp_send_verify_tops(ds4_tp *tp, const ds4_tp_row_top *tops, uint32_t count) {
+    ds4_tp_frame_header h = { DS4_TP_MAGIC, DS4_TP_FRAME_VERIFY_TOPS,
+                              count * (uint32_t)sizeof(ds4_tp_row_top) };
+    return tp_write_full(tp->control_fd, &h, sizeof(h)) &&
+           tp_write_full(tp->control_fd, tops, count * sizeof(ds4_tp_row_top));
+}
+
+int ds4_tp_recv_verify_tops(ds4_tp *tp, ds4_tp_row_top *tops, uint32_t count) {
+    uint32_t type = 0, bytes = 0;
+    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_VERIFY_TOPS || bytes != count * sizeof(ds4_tp_row_top)) {
+        fprintf(stderr, "ds4-tp: bad verify-tops frame (type %u bytes %u, expected %u)\n",
+                type, bytes, (uint32_t)(count * sizeof(ds4_tp_row_top)));
+        return 0;
+    }
+    return tp_read_full(tp->control_fd, tops, count * sizeof(ds4_tp_row_top));
+}
+
 int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen) {
     struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs;
     if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {

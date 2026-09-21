@@ -41274,6 +41274,8 @@ typedef struct ds41_verify_ctx {
     ds4_gpu_tensor *logits; /* rows * DS4_N_VOCAB, device */
     ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
     float *row_logits;      /* rows * DS4_N_VOCAB, host */
+    float *logits_half;     /* rows * (DS4_N_VOCAB / 2), host */
+    int row_preds[DS4_TP_BATCH_MAX_ROWS];
 } ds41_verify_ctx;
 
 static DS4_MAYBE_UNUSED void ds41_verify_free(ds41_verify_ctx *vc) {
@@ -41284,6 +41286,7 @@ static DS4_MAYBE_UNUSED void ds41_verify_free(ds41_verify_ctx *vc) {
     ds4_gpu_tensor_free(vc->idx);
     ds4_gpu_tensor_free(vc->logits);
     free(vc->row_logits);
+    free(vc->logits_half);
     memset(vc, 0, sizeof(*vc));
 }
 
@@ -41298,9 +41301,11 @@ static DS4_MAYBE_UNUSED bool ds41_verify_alloc(ds41_verify_ctx *vc, uint32_t row
     vc->comp = ds4_gpu_tensor_alloc((uint64_t)4u * (rows + 1u) * 512u * sizeof(float));
     vc->idx  = ds4_gpu_tensor_alloc((uint64_t)4u * (rows + 1u) * 128u * sizeof(float));
     vc->logits = ds4_gpu_tensor_alloc((uint64_t)rows * DS4_N_VOCAB * sizeof(float));
+    const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+    vc->logits_half = malloc((size_t)rows * vhalf * sizeof(float));
     vc->row_logits = malloc((size_t)rows * DS4_N_VOCAB * sizeof(float));
     if (!vc->win || !vc->prev || !vc->comp || !vc->idx ||
-        !vc->logits || !vc->row_logits) {
+        !vc->logits || !vc->logits_half || !vc->row_logits) {
         ds41_verify_free(vc);
         return false;
     }
@@ -41845,13 +41850,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_via_sweep(ds41_gpu_graph *g,
         head_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_VOCAB * sizeof(float));
         if (!head_logits) return false;
     }
-    ds41_prefill_row *b = &g->batch;
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre,
+    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre,
                                                 DS4_N_EMBD, DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, 1u, DS4_V41_BF16);
-    if (ok) ok = ds41_norm_batch(b->norm, b->x, m, w->output_norm, 1u);
-    if (ok) ok = ds41_output_projection(g, head_logits, m, w, b->norm, 1u);
+    if (ok) ok = ds41_bf16(g->x, DS4_N_EMBD);
+    if (ok) ok = ds41_norm(g->norm, g->x, m, w->output_norm);
+    if (ok) ok = ds41_output_projection(g, head_logits, m, w, g->norm, 1u);
     if (!ds4_gpu_end_commands()) ok = false;
     if (ok) ok = ds4_gpu_tensor_read(head_logits, 0, logits,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
@@ -41914,7 +41918,6 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
     vc->evaluated = count;
     vc->serial_capture = serial;
     if (serial && !plain_sweep) {
-        ds41_prefill_row *b = &g->batch;
         bool sok = true;
         uint32_t evaluated = 0;
         const bool commit1_only = getenv("DS4_DS41_VERIFY_COMMIT1") != NULL;
@@ -41932,11 +41935,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                 vc->logits, (uint64_t)r * DS4_N_VOCAB * sizeof(float) + rank_offset,
                 proj_bytes);
             sok = lrow && ds4_gpu_begin_commands() != 0;
-            if (sok) sok = ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre,
+            if (sok) sok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre,
                                                           DS4_N_EMBD, DS4_N_HC) != 0;
-            if (sok) sok = ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, 1u, DS4_V41_BF16);
-            if (sok) sok = ds41_norm_batch(b->norm, b->x, m, w->output_norm, 1u);
-            if (sok) sok = ds41_output_projection(g, lrow, m, w, b->norm, 1u);
+            if (sok) sok = ds41_bf16(g->x, DS4_N_EMBD);
+            if (sok) sok = ds41_norm(g->norm, g->x, m, w->output_norm);
+            if (sok) sok = ds41_output_projection(g, lrow, m, w, g->norm, 1u);
             if (!ds4_gpu_end_commands()) sok = false;
             ds4_gpu_tensor_free(lrow);
             if (!sok) break;
@@ -41951,11 +41954,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                         sok = false;
                         break;
                     }
+                    if (vc->logits_half) {
+                        memcpy(vc->logits_half + (size_t)r * vhalf, row_dest, (size_t)vhalf * sizeof(float));
+                    }
+                    const int next_pred = sample_argmax(row_dest, DS4_N_VOCAB);
+                    vc->row_preds[r] = next_pred;
+                    if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+                        fprintf(stderr, "ds4: [serial_verify] r=%u pos=%u pred=%d(%.2f) expected=%d\n",
+                                r, vc->pos0 + r, next_pred, row_dest[next_pred],
+                                (r + 1 < count ? tokens[r + 1] : -1));
+                    }
                 } else {
                     sok = ds4_gpu_tensor_read(vc->logits,
                                               (uint64_t)r * DS4_N_VOCAB * sizeof(float) + (uint64_t)vhalf * sizeof(float),
                                               row_dest + vhalf, (uint64_t)vhalf * sizeof(float)) != 0;
                     if (!sok) break;
+                    if (vc->logits_half) {
+                        memcpy(vc->logits_half + (size_t)r * vhalf, row_dest + vhalf, (size_t)vhalf * sizeof(float));
+                    }
                     if (!ds4_tp_send_logits_half(vc->tp, row_dest + vhalf, vhalf)) {
                         sok = false;
                         break;
@@ -41965,6 +41981,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                 sok = ds4_gpu_tensor_read(vc->logits, (uint64_t)r * DS4_N_VOCAB * sizeof(float),
                                           row_dest, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
                 if (!sok) break;
+                const int next_pred = sample_argmax(row_dest, DS4_N_VOCAB);
+                vc->row_preds[r] = next_pred;
             }
             evaluated = r + 1;
 
@@ -41973,8 +41991,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                     if (g->tp_rank == 0) {
                         bool cont = !commit1_only;
                         if (cont && r + 1 < count) {
-                            const int next_pred = sample_argmax(row_dest, DS4_N_VOCAB);
-                            if (next_pred != tokens[r + 1]) cont = false;
+                            if (vc->row_preds[r] != tokens[r + 1]) cont = false;
                         } else {
                             cont = false;
                         }
@@ -41992,8 +42009,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                 } else {
                     if (commit1_only) break;
                     if (r + 1 < count) {
-                        const int next_pred = sample_argmax(row_dest, DS4_N_VOCAB);
-                        if (next_pred != tokens[r + 1]) break;
+                        if (vc->row_preds[r] != tokens[r + 1]) break;
                     }
                 }
             }
@@ -42014,46 +42030,69 @@ static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows(ds41_gpu_graph *g,
     if (plain_sweep) return true;
     /* Per-row logits: the V4.1 head is already row-parameterized, so the only
      * difference from the single-token path is the row count. */
-    ds41_prefill_row *b = &g->batch;
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre,
-                                                DS4_N_EMBD, DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16);
-    if (ok) ok = ds41_norm_batch(b->norm, b->x, m, w->output_norm, count);
-    if (ok) ok = ds41_output_projection(g, vc->logits, m, w, b->norm, count);
+    ds4_gpu_tensor *vx = ds4_gpu_tensor_view(g->batch.x, 0, (uint64_t)count * DS4_N_EMBD * sizeof(float));
+    ds4_gpu_tensor *vres = ds4_gpu_tensor_view(g->batch.residual, 0, (uint64_t)count * DS4_N_HC * DS4_N_EMBD * sizeof(float));
+    ds4_gpu_tensor *vsplit = ds4_gpu_tensor_view(g->batch.ffn_split, 0, (uint64_t)count * 24u * sizeof(float));
+    ds4_gpu_tensor *vnorm = ds4_gpu_tensor_view(g->batch.norm, 0, (uint64_t)count * DS4_N_EMBD * sizeof(float));
+    bool ok = vx && vres && vsplit && vnorm && ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_hc_weighted_sum_split_tensor(vx, vres, vsplit, DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_gpu_dsv41_quantize(vx, DS4_N_EMBD, count, DS4_V41_BF16);
+    if (ok) ok = ds41_norm_batch(vnorm, vx, m, w->output_norm, count);
+    if (ok) ok = ds41_output_projection(g, vc->logits, m, w, vnorm, count);
     if (!ds4_gpu_end_commands()) ok = false;
+    ds4_gpu_tensor_free(vnorm);
+    ds4_gpu_tensor_free(vsplit);
+    ds4_gpu_tensor_free(vres);
+    ds4_gpu_tensor_free(vx);
     const double vt_t_proj = vt ? now_sec() : 0.0;
     const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
     const bool tp_split = (g->tp_world == 2) && (g->tp_logits_half != NULL) && (vc->tp != NULL);
     if (tp_split) {
-        float *scratch_half = malloc((size_t)count * vhalf * sizeof(float));
-        if (!scratch_half) { (void)ds4_gpu_synchronize(); return false; }
-        if (ok) ok = ds4_gpu_tensor_read(vc->logits, 0, scratch_half,
+        if (!vc->logits_half) { (void)ds4_gpu_synchronize(); return false; }
+        if (ok) ok = ds4_gpu_tensor_read(vc->logits, 0, vc->logits_half,
                                          (uint64_t)count * vhalf * sizeof(float)) != 0;
         if (g->tp_rank == 0) {
-            for (uint32_t r = 0; ok && r < count; r++) {
-                float *row_dest = vc->row_logits + (size_t)r * DS4_N_VOCAB;
-                memcpy(row_dest, scratch_half + (size_t)r * vhalf, (size_t)vhalf * sizeof(float));
-                if (!ds4_tp_recv_logits_half(vc->tp, row_dest + vhalf, vhalf)) {
-                    ok = false;
-                    break;
+            ds4_tp_row_top worker_tops[DS4_TP_BATCH_MAX_ROWS];
+            if (!ds4_tp_recv_verify_tops(vc->tp, worker_tops, count)) {
+                ok = false;
+            } else {
+                for (uint32_t r = 0; r < count; r++) {
+                    const float *row_src = vc->logits_half + (size_t)r * vhalf;
+                    int local_top = sample_argmax(row_src, vhalf);
+                    float local_val = row_src[local_top];
+                    if (worker_tops[r].val > local_val) {
+                        vc->row_preds[r] = (int)worker_tops[r].token;
+                    } else {
+                        vc->row_preds[r] = local_top;
+                    }
+                    if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+                        fprintf(stderr, "ds4: row_pred[%u]: local=%d(%.2f) worker=%d(%.2f) pred=%d\n",
+                                r, local_top, local_val, worker_tops[r].token, worker_tops[r].val,
+                                vc->row_preds[r]);
+                    }
                 }
             }
         } else {
-            for (uint32_t r = 0; ok && r < count; r++) {
-                const float *row_src = scratch_half + (size_t)r * vhalf;
-                float *row_dest = vc->row_logits + (size_t)r * DS4_N_VOCAB;
-                memcpy(row_dest + vhalf, row_src, (size_t)vhalf * sizeof(float));
-                if (!ds4_tp_send_logits_half(vc->tp, row_src, vhalf)) {
-                    ok = false;
-                    break;
-                }
+            ds4_tp_row_top worker_tops[DS4_TP_BATCH_MAX_ROWS];
+            for (uint32_t r = 0; r < count; r++) {
+                const float *row_src = vc->logits_half + (size_t)r * vhalf;
+                int local_top = sample_argmax(row_src, vhalf);
+                worker_tops[r].token = local_top + (int32_t)vhalf;
+                worker_tops[r].val = row_src[local_top];
+            }
+            if (!ds4_tp_send_verify_tops(vc->tp, worker_tops, count)) {
+                ok = false;
             }
         }
-        free(scratch_half);
     } else {
         if (ok) ok = ds4_gpu_tensor_read(vc->logits, 0, vc->row_logits,
                                          (uint64_t)count * DS4_N_VOCAB * sizeof(float)) != 0;
+        if (ok) {
+            for (uint32_t r = 0; r < count; r++) {
+                const float *row = vc->row_logits + (size_t)r * DS4_N_VOCAB;
+                vc->row_preds[r] = sample_argmax(row, DS4_N_VOCAB);
+            }
+        }
     }
     const double vt_t_end = vt ? now_sec() : 0.0;
     if (vt) {
@@ -73702,6 +73741,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
 static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
                                         int *out, uint32_t max_draft) {
     if (!s || !out || max_draft < 1u) return 0;
+    if (ds4_is_syntax_boundary_token(token)) return 0;
     const int *h = s->checkpoint.v;
     const int n = s->checkpoint.len;
     if (!h || n <= 0) return 0;
@@ -73774,19 +73814,31 @@ static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
         }
 
         /* Check branch uniqueness: if this prefix has divergent continuations elsewhere in history,
-         * clamp allowed draft to 8 to avoid paying verification penalty on an ambiguous branch. */
+         * clamp allowed draft to the agreement length to avoid paying verification penalty on an ambiguous branch. */
         int branch_conflicts = 0;
+        int max_agree = (int)allowed;
         for (int j = i - 1; j >= 0; j--) {
             if (h[j] == token && j + 1 < n) {
                 int d = 1;
                 while (j - d >= 0 && n - d >= 0 && h[j - d] == h[n - d] && d < depth) d++;
-                if (d >= depth && h[j + 1] != h[i + 1]) {
-                    branch_conflicts++;
-                    break;
+                if (d >= depth) {
+                    int agree = 0;
+                    while (j + 1 + agree < n && i + 1 + agree < n &&
+                           h[j + 1 + agree] == h[i + 1 + agree] &&
+                           agree < (int)allowed) {
+                        agree++;
+                    }
+                    if (agree < max_agree) {
+                        max_agree = agree;
+                        branch_conflicts++;
+                    }
                 }
             }
         }
-        if (branch_conflicts > 0 && allowed > 8u) allowed = 8u;
+        if (branch_conflicts > 0) {
+            if (allowed > (uint32_t)max_agree) allowed = (uint32_t)max_agree;
+            if (allowed > 8u) allowed = 8u;
+        }
 
         const uint32_t k = avail < allowed ? avail : allowed;
         const int score = depth * 2 + (int)k;
@@ -73800,8 +73852,16 @@ static uint32_t ds4_session_ngram_draft(const ds4_session *s, int token,
         }
     }
     if (best_k && best_src >= 0) {
-        for (uint32_t j = 0; j < best_k; j++) out[j] = h[best_src + (int)j];
-        return best_k;
+        const bool clamp_syntax = true;
+        uint32_t actual_k = 0;
+        for (uint32_t j = 0; j < best_k; j++) {
+            const int tok = h[best_src + (int)j];
+            if (clamp_syntax && ds4_is_syntax_boundary_token(tok)) {
+                break;
+            }
+            out[actual_k++] = tok;
+        }
+        return actual_k;
     }
     return 0;
 }
@@ -73828,7 +73888,7 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
         if (cap > (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1)) cap = (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1);
         {
             const char *e = getenv("DS4_DSPARK_NGRAM_DRAFT_MAX");
-            const int want = e ? atoi(e) : ((DS4_TP_BATCH_MAX_ROWS >= 64) ? 48 : 16);
+            const int want = e ? atoi(e) : 8;
             if (want >= 2 && (uint32_t)want < cap) cap = (uint32_t)want;
         }
         const uint32_t k =
@@ -73886,6 +73946,11 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
         (getenv("DS4_DSPARK_NGRAM_DRAFT") != NULL || getenv("DS4_DSPARK_NGRAM_FALLBACK") != NULL)) {
         uint32_t cap = DS4_DSPARK_MAX_BLOCK_SIZE - 1u;
         if (cap > (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1)) cap = (uint32_t)(DS4_TP_BATCH_MAX_ROWS - 1);
+        {
+            const char *e = getenv("DS4_DSPARK_NGRAM_DRAFT_MAX");
+            const int want = e ? atoi(e) : 8;
+            if (want >= 2 && (uint32_t)want < cap) cap = (uint32_t)want;
+        }
         const uint32_t k = ds4_session_ngram_draft(s, token, s->dspark_draft_tokens, cap);
         if (k >= 1u) {
             s->dspark_draft_len = k;
@@ -76182,8 +76247,7 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
     const bool commit1_only = getenv("DS4_DS41_VERIFY_COMMIT1") != NULL;
     const uint32_t active_rows = s->ds41_vc.evaluated ? s->ds41_vc.evaluated : (uint32_t)draft_n;
     for (int i = 1; !commit1_only && i < (int)active_rows; i++) {
-        const float *row = s->ds41_vc.row_logits + (size_t)(i - 1) * DS4_N_VOCAB;
-        if (sample_argmax(row, DS4_N_VOCAB) != drafts[i]) break;
+        if (s->ds41_vc.row_preds[i - 1] != drafts[i]) break;
         commit++;
     }
     for (int i = 0; i < commit; i++) {
@@ -76199,8 +76263,7 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
                 s->ds41_vc.pos0, draft_n, active_rows, commit);
         for (int i = 0; i < draft_n; i++) fprintf(stderr, "d[%d]=%d ", i, drafts[i]);
         for (int i = 1; i < (int)active_rows; i++) {
-            const float *row = s->ds41_vc.row_logits + (size_t)(i - 1) * DS4_N_VOCAB;
-            fprintf(stderr, "pred[%d]=%d ", i - 1, sample_argmax(row, DS4_N_VOCAB));
+            fprintf(stderr, "pred[%d]=%d ", i - 1, s->ds41_vc.row_preds[i - 1]);
         }
         fprintf(stderr, "\n");
     }
@@ -76232,11 +76295,26 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
         return -1;
     }
     const double vt_c2 = vt_commit ? now_sec() : 0.0;
+    if (tp_verify && e->tp.vocab_split) {
+        const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+        memcpy(s->logits, s->ds41_vc.logits_half + (size_t)(commit - 1) * vhalf,
+               (size_t)vhalf * sizeof(float));
+        if (!ds4_tp_recv_logits_half(e->tp.ctx, s->logits + vhalf, vhalf)) {
+            if (errlen) snprintf(err, errlen, "tp: worker commit logits half missing");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+    } else {
+        memcpy(s->logits, s->ds41_vc.row_logits + (size_t)(commit - 1) * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    const double vt_c3 = vt_commit ? now_sec() : 0.0;
     if (vt_commit) {
-        fprintf(stderr, "ds4: [timing] commit count=%u commit=%d: commit=%.2f ms, send_commit=%.2f ms\n",
+        fprintf(stderr, "ds4: [timing] commit count=%u commit=%d: commit=%.2f ms, send_commit=%.2f ms, logits_recv=%.2f ms\n",
                 (uint32_t)draft_n, commit,
                 (vt_c1 - vt_c0) * 1000.0,
-                (vt_c2 - vt_c1) * 1000.0);
+                (vt_c2 - vt_c1) * 1000.0,
+                (vt_c3 - vt_c2) * 1000.0);
     }
     for (int i = 0; i < commit; i++) token_vec_push(&s->checkpoint, drafts[i]);
     s->checkpoint_valid = true;
@@ -76247,9 +76325,6 @@ static int ds4_session_ds41_dspark_verify(ds4_session *s, int n_accept,
             : 0.0;
     ds4_session_dspark_scheduler_note(
         s, (uint32_t)(commit - 1), false, sched_extra_ms);
-    /* The last accepted row's logits are the state the next step reads. */
-    memcpy(s->logits, s->ds41_vc.row_logits + (size_t)(commit - 1) * DS4_N_VOCAB,
-           (size_t)DS4_N_VOCAB * sizeof(float));
     s->mtp_draft_valid = false;
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
@@ -77334,11 +77409,16 @@ static int ds4_session_tp_spec_cycle_ds41(ds4_session *s, const int *drafts,
         token_vec_push(&s->checkpoint, drafts[i]);
     }
     s->checkpoint_valid = true;
-    if (s->logits && e->tp.vocab_split && keep > 0) {
+    if (e->tp.vocab_split && keep > 0) {
         const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
-        memcpy(s->logits + vhalf,
-               s->ds41_vc.row_logits + (size_t)(keep - 1) * DS4_N_VOCAB + vhalf,
-               (size_t)vhalf * sizeof(float));
+        const float *worker_row = s->ds41_vc.logits_half + (size_t)(keep - 1) * vhalf;
+        if (s->logits) {
+            memcpy(s->logits + vhalf, worker_row, (size_t)vhalf * sizeof(float));
+        }
+        if (!ds4_tp_send_logits_half(e->tp.ctx, worker_row, vhalf)) {
+            snprintf(err, errlen, "tp: worker commit logits half send failed");
+            return 1;
+        }
     }
     return 0;
 }
@@ -80481,6 +80561,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         if (!attempted_verify) {
             ds4_session_dspark_scheduler_note(s, 0, true,
                                               s->dspark_last_propose_ms);
+            if (s->dspark_streak_misses > 0) s->dspark_streak_misses--;
             if (ds4_dspark_stats_enabled()) {
                 s->dspark_stats.cycles++;
                 s->dspark_stats.no_draft++;
