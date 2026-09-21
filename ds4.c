@@ -41526,6 +41526,21 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         false, true, false, false, &prepare, 1);
 #endif
             if (ok) ok = metal_graph_stream_map_layer(m, w, il);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            /* Below 2K, unused expert reads outweigh the overlap. */
+            if (ok && total_count >= 2048u) {
+                const ds4_gpu_stream_expert_table current = graph_stream_expert_table_make(m,
+                    &w->layer[il], il,
+                    routed_expert_row_bytes(w->layer[il].ffn_gate_exps) * DS4_N_FF_EXP,
+                    routed_expert_row_bytes(w->layer[il].ffn_down_exps) * DS4_N_EMBD);
+                ds4_gpu_stream_expert_table next = {0};
+                const bool more = il + 1u < (encoder_only ? 20u : DS4_N_LAYER);
+                if (more) next = graph_stream_expert_table_make(m, &w->layer[il + 1u], il + 1u,
+                    routed_expert_row_bytes(w->layer[il + 1u].ffn_gate_exps) * DS4_N_FF_EXP,
+                    routed_expert_row_bytes(w->layer[il + 1u].ffn_down_exps) * DS4_N_EMBD);
+                (void)ds4_gpu_stream_expert_cache_prefetch(&current, more ? &next : NULL);
+            }
+#endif
 #ifdef __APPLE__
             /* CUDA reads into its device cache: warming mmap would read twice. */
             if (ok && il + 1u < (encoder_only ? 20u : DS4_N_LAYER) &&
@@ -41789,6 +41804,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         }
     }
     if (!ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (g->streaming) ds4_gpu_stream_expert_cache_prefetch_finish(true);
+#endif
     if (!metal_graph_stream_prepare_join_all(&prepare, 1)) ok = false;
     if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (ok && !encoder_only) {
