@@ -1,4 +1,5 @@
-/* TCP gates must not depend on the requested socket-buffer size. */
+/* TCP gates must not depend on the requested send-buffer size; the receive
+ * floor is part of socket setup (see pair() and tp_socket_tune). */
 #include "../ds4_tp.c"
 #include <assert.h>
 
@@ -75,9 +76,15 @@ static void pair(int fd[2], bool tcp) {
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
     }
     for (unsigned i = 0; i < 2; i++) {
+        /* The send buffer stays tiny to stress chunked sends. The receive
+         * buffer gets the production floor (see tp_socket_tune): on Linux a
+         * tiny advertised window strangles the sender to one chunk per
+         * ~200ms timer, and the window does not recover once the connection
+         * has carried data, so the floor must be applied before traffic. */
         int small = 1024;
         assert(setsockopt(fd[i], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0);
-        assert(setsockopt(fd[i], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+        int floor = DS4_TP_TCP_RCVBUF_FLOOR;
+        assert(setsockopt(fd[i], SOL_SOCKET, SO_RCVBUF, &floor, sizeof(floor)) == 0);
 #ifdef SO_NOSIGPIPE
         int one = 1;
         assert(setsockopt(fd[i], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) == 0);

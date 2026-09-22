@@ -48,6 +48,12 @@
  * stalls while keeping its sockets open. */
 #define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 750
 
+/* Minimum SO_RCVBUF for a TCP data socket, applied at socket setup before
+ * the connection carries data (see tp_socket_tune). Sized to hold one gate
+ * payload (header + vector) in each direction without shrinking the
+ * advertised window. */
+#define DS4_TP_TCP_RCVBUF_FLOOR (64 * 1024)
+
 typedef struct {
     uint32_t magic;
     uint32_t type;
@@ -274,7 +280,11 @@ static void tp_socket_tune(int fd) {
 #endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     /* Gate exchanges are latency-critical 16KB messages; large socket
-     * buffers only matter for the TCP fallback's pipelining. */
+     * buffers only matter for the TCP fallback's pipelining. Must run
+     * before the socket carries data: on Linux a small SO_RCVBUF shrinks
+     * the advertised window for the connection's lifetime (the sender ends
+     * up paced by ~200ms timers), and raising it afterwards does not
+     * recover. This is the production form of DS4_TP_TCP_RCVBUF_FLOOR. */
     int sz = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
