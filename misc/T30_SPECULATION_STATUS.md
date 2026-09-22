@@ -75,6 +75,10 @@ DS4_CUDA_ATTN_INVARIANCE_SELF=1                                # determinism con
 
 ## 6. The one open question
 
+**ANSWERED in T31: it slopes the same way on the TP2 pair (-14% to -25% at
+every depth). Correct speculation does not pay; target-only decode stays
+default until the attention core is batch-size invariant.**
+
 **Does the depth curve slope the same way on the resident TP2 pair?**
 
 Everything above was measured single-box with `--ssd-streaming`, because the
