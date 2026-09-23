@@ -243,6 +243,169 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
 
+## DeepSeek V4.1 Flash optimization campaign (this fork)
+
+This repository is a development fork of DwarfStar. On top of upstream
+`a04f46f` it carries 127 commits from a DeepSeek V4.1 Flash text-inference
+optimization campaign, run mostly on a pair of DGX Spark GB10 machines in
+tensor parallelism over RoCE RDMA. The work is organized as numbered tasks
+(T1–T31) whose write-ups live in `misc/` (that directory is gitignored, but the
+notes are force-added so they are tracked). Almost everything below is opt-in or
+off by default; negative results are recorded as carefully as wins.
+
+Headline results at a glance:
+
+| Area | Result |
+| --- | --- |
+| Speculative decode, fast mode | Copy-heavy decode 22.45 → 29.75 t/s; one 61-draft block accepted whole |
+| Speculative decode, correct mode | Loses at every depth, −14% to −25%; target-only stays default |
+| n-gram lookup drafting | Copy-heavy 22.45 → 27.50 t/s (+22.5%); prose neutral at a strict gate |
+| Q3 mixed-quant splice | NLL −5.79% vs Q2 (69/100 cases), −7% decode |
+| MoE SSD streaming | Fetch-at-depth: shallow prefill +46.8%, deep +20.4%, byte-identical |
+| RDMA expert tier | 1.75–1.79x over one NIC, byte-exact; remote-RAM promotion measured null |
+| Auto-promotion to resident | Q2 TP2 decode 14.07 → 21.45 t/s (+52.4%) |
+| Streaming penalty | Not disk: per-layer probe sync is 41.28 ms/token (58% of decode) |
+
+### Speculative decoding (DSpark) on V4.1
+
+- Ported the DSpark drafter to V4.1: a sidecar builder
+  (`gguf-tools/deepseek41_dspark.py`), the verify transaction core, the batched
+  `ds41_graph_verify_rows` path, and full session integration. Dropping a
+  spurious per-head q norm took acceptance from 0.29 to 1.18 tokens/cycle.
+- Added a load-time finiteness guard after finding that two of the three DSpark
+  support GGUFs on disk held non-finite weights in 37 tensors, which made the
+  drafter silently propose nothing.
+- Wired the verify into the existing TP protocol: `DS4_TP_FRAME_VERIFY` /
+  `VERIFY_COMMIT`, argmax-only logits exchange (`DS4_TP_FRAME_VERIFY_TOPS`),
+  multi-rank coordinated early exit, and a clean decline (rather than a dead
+  generation) when speculative decode is unsupported under network TP.
+- Raised the verify/block caps 8 → 16 → 32 → 48 → 64 and added an AIMD streak
+  manager plus direct RDMA slab staging that bypasses host bounce buffers. In
+  the fast batched mode this reached 22.45 → 29.75 t/s on copy-heavy work, with
+  a full 61-draft block accepted in one verify.
+- Found the correctness wall: **the batched verify is not batch-size
+  invariant.** A row computed in an N-row sweep differs from the same row
+  computed alone; ~1.3% of verified rows flip an argmax and commit a different
+  token than serial decode. The failure is silent and dangerous in code and
+  identifiers (`ROUTER_MAX_QUEUES` became `ROUTER_MAX_QUEues`), and generated
+  text is a lossy detector of it, so validation uses per-row logit probes
+  (`misc/T29`, `misc/T30`).
+- `CORE_INVARIANT` (per-row attention) fixes it for ~1.8% decode cost, but it
+  removes the batching that made the verify cheap. The depth curve then slopes
+  down single-box (5.54 → 5.01 t/s at depth 6) and on the TP2 pair (−14% to
+  −25% at every depth, `misc/T31`). **Target-only decode remains the default
+  until the batched attention core is batch-size invariant.**
+- A later fix for a layer-39 HC weighted-sum bug in verify rows reported 100%
+  bit-exact greedy output and +50% in the batched mode; the T29–T31 probe work
+  established that mode is not generally invariant, so those numbers are not
+  treated as safe. All speculative paths stay opt-in.
+
+### Speculative n-gram engine
+
+- `ds4_ngram.c` / `ds4_ngram.h`: a 4-way set-associative hash table with O(1)
+  lookup, LFU eviction, empirical continuation frequencies, and binary
+  serialization.
+- Three tiers, consulted in priority order: **context** (the current
+  generation), **static** (precomputed from a corpus with
+  `--build-ngram-corpus`, auto-loaded), and **dynamic** (persisted across runs
+  to `~/.cache/ds4/ngram_cache.bin`).
+- Longest-match chaining from 4-grams down to 1-grams, syntax-boundary token
+  clamping, confidence-aware chain truncation, and an adaptive gated hybrid that
+  tries the free n-gram draft first and falls back to DSpark only when that is
+  worth its cost. A lookup miss declines the cycle instead of paying the
+  model's propose.
+- Measured: verbatim-copy decode 22.45 → 27.50 t/s (+22.5%), later 29.75
+  (+32.5%); prose is neutral at a strict minimum match. Hybrid fallthrough
+  defaults to off under SSD streaming. Enable with
+  `DS4_DSPARK_NGRAM_DRAFT=1` (off by default).
+
+### Q3 mixed-quant splice
+
+- A "Q3splice" GGUF is the Q2 base with the trailing layers' routed experts
+  taken from Q4; 6L, 7L and 8L variants were built, and 8L is the largest that
+  fits the pair.
+- Quality (100-case official-continuation NLL): 8L scores 0.343799 against
+  Q2's 0.364937 (−5.79%, winning 69/100 cases) while full Q4 scores 0.246408
+  (−32.5%, streaming only).
+- Speed: 8L TP2 resident runs 20.06 t/s against Q2's 21.57 (−7%) at ctx 32K
+  with the 4K prefill chunk; against the Q4 streaming configuration it actually
+  has to use, that is roughly +95% decode and +129% prefill.
+- The memory ceiling was mapped exactly: the pair works at 100.07 GiB planned
+  per rank and fails at 101.86. Maximum Q4 layers by context are 10 at 32K, 9
+  at 128K, and 7 at 256K.
+- Layer selection is not a lever: per-layer Q2↔Q4 divergence is flat, and
+  choosing the "best" k layers gains +0.93%, about 13x below the scoring noise
+  floor. Take the last k.
+- "Q3 is not broken": the streaming expert cache was a single slab strided for
+  one expert size, torn down and rebuilt twice per token on a mixed file.
+  Resident TP2 needs no fix; the admit check was also bounded to what the host
+  can actually hold, and mixed-quant routed experts are admitted on resident
+  network TP.
+
+### MoE streaming optimization (SSD streaming and expert transport)
+
+- **Fetch at depth**: parallel expert preads instead of one synchronous read at
+  a time. Shallow prefill 46.65 → 70.51 t/s (+46.8%), deep 266 → 320 t/s
+  (+20.4%), generation +2.7%/+8.1%, all byte-identical.
+  `DS4_CUDA_EXPERT_FETCH_THREADS` selects the depth (default 1).
+- Upstream's prefill read-ahead (`c2c3ce3`) was measured and rejected: it
+  competes for the same saturated NVMe as the depth-8 fetch, costing −9.6% (Q4)
+  and −14.1% (Q2).
+- **RDMA expert tier** (`ds4_rdma_tier.c`): one-sided RDMA READ striped across
+  two NICs on two devices, 1.75x (Q2) and 1.79x (Q4) over one leg and
+  byte-exact, with a region server, connection pooling, and read-back
+  verification. Off unless `DS4_EXPERT_TIER_RDMA` is set. Remote-RAM promotion
+  of uncovered spans measured null: every span that reaches disk is a first
+  touch, because the expert cache already absorbs the reuse.
+- **The streaming penalty is not disk.** A per-layer host probe sync costs
+  1.032 ms × 40 layers = 41.28 ms/token, 58% of the streaming decode budget;
+  decode disk I/O is only 8.4 ms/token.
+- **Auto-promotion (Lever 5)**: when a shard fits the non-movable budget, the
+  engine clears `--ssd-streaming` and runs resident. Q2 TP2 decode went
+  14.07 → 21.45 t/s (+52.4%) and the Q3 7L splice at 256K went 10.31 → 19.84
+  t/s (+92.4%) against the Q4 streaming baseline. `DS4_FORCE_SSD_STREAMING=1`
+  bypasses it.
+- Two attacks on the remaining cost measured null: a device-side probe bypass
+  cost 8.2% of Q4 decode, and per-layer expert partitioning lifted the decode
+  hit rate from 63.5% to 95.9% and cut decode I/O 16% but bought no throughput
+  (the fetching is already overlapped). Both stay narrow and opt-in.
+- TP ranks can stream their own half of the experts (`DS4_CUDA_TP_STREAMING`).
+  A routing analysis found 55.7% of decode misses are predictable one layer
+  ahead, but decode is disk-bandwidth-bound, so the prefetcher was a null.
+
+### Transport and TP plumbing
+
+- Big-gate RDMA work: the per-layer TCP rendezvous became optional
+  (−16 ms/sweep), direct RDMA slab staging removed host bounce buffers,
+  vocab-split logits and multi-rank early exit were added, and a resident TP
+  pair now bulk-sweeps short prompts (192-token prefill 23.56 → 37.16 t/s).
+- Fixed `test_tp_tcp`, which had never passed on Linux, by enforcing the TCP
+  receive-buffer floor before the connection carries traffic.
+- Smaller changes: CLOCK second-chance expert eviction, depth-span expert
+  fetch, I8 support in the mixed-splice tool, and a per-token NLL dump for
+  `--perplexity-file`.
+
+### Diagnostics and tooling
+
+- Environment-gated probes for the speculative-verify investigation: per-row
+  logit diff against serial decode, in-situ attention 1-row-vs-N-row invariance,
+  attention dispatch logging, a safe-margin accept gate, and DSpark stage and
+  finiteness profiling. All inert by default.
+- `gguf-tools/analysis/`: routing replay, a Belady-bound policy sweep, demand
+  periodicity, cross-chunk prefill replay, and expert placement analysis.
+- `tests/rdma_t1/` (the RDMA transport prototype and region server) and
+  `tests/test_ngram_cache.c`.
+
+### Bottom line
+
+The pair's practical configurations are Q2 TP2 resident (~21.5 t/s) or Q3
+7L/8L TP2 resident (~20 t/s at measurably better quality), with Q4 TP2
+streaming (~10 t/s) only when memory forces it; n-gram lookup drafting is worth
+enabling for copy-heavy work. Speculative decode stays opt-in and off by
+default, because it does not pay in the numerically correct mode. The single
+blocker on that whole track is making the batched attention core batch-size
+invariant.
+
 ## Logo
 
 The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
