@@ -66,6 +66,23 @@ ConnectX-6 facing a 200G-rated cage that will not autoneg: pass
 `scripts/rdma_inventory.sh` needs no root at all and prints the facts section 7
 still lists as unknown.
 
+### 2.1 Found while checking: the promax link lost its jumbo MTU
+
+Both halves of the live TP link are at netdev MTU 1500 today, so
+`ibv_devinfo` reports `active_mtu: 1024` against `max_mtu: 4096`. T1 was
+measured with 4096 (`t1_common.h`: "4096 here, not ds4_tp.c's 1024"), so the
+setting did not survive the 2026-09-21 reboot -- nothing persists it. Every
+RDMA message on that link is now cut into 4x as many packets as when the
+transport was benchmarked. Restoring it is one command per netdev on each
+Spark, and promax needs the same:
+
+    sudo ip link set dev enp1s0f1np1  mtu 9000
+    sudo ip link set dev enP2p1s0f1np1 mtu 9000
+
+Worth doing before any TP2 Q4 number is taken as a baseline, and worth
+re-checking after every reboot until it is persisted (`--persist` writes the
+netplan file for the new link; the promax link has no such file yet).
+
 ## 3. What vivo can do for TP2 Q4, ranked
 
 Current baseline to beat (T31, `DeepSeek-V4.1-Flash-Q4.gguf`, 518,596,067,328 B
@@ -76,8 +93,8 @@ Current baseline to beat (T31, `DeepSeek-V4.1-Flash-Q4.gguf`, 518,596,067,328 B
 
 TP2 is a 50/50 expert split with exactly one worker, and there is no ratio
 knob in the tree. A rank also has to hold its non-expert weights, KV and
-expert cache resident; the pair's measured Q4 ceiling is ~100 GiB planned per
-rank. The 3090 has 24 GB. Separately, `docs/DISTRIBUTED.md` scopes CUDA
+expert cache resident, and the pair's measured per-rank planning ceiling is
+~100 GiB (100.07 GiB works, 101.86 fails). The 3090 has 24 GB. Separately, `docs/DISTRIBUTED.md` scopes CUDA
 network TP to one GPU per rank with matching model/quant layouts, and the two
 boxes would be sm_86 against sm_121. This is closed, not a tuning problem.
 
