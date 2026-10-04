@@ -91,12 +91,38 @@ ConnectX-6 GID. vivo then shows `rx_packets` and a neighbour entry for
 promax's MAC `fc:4c:ea:f9:49:3d`. The link is healthy and carries frames; it
 simply has the wrong box on the far end for the plan as written.
 
-The Spark's cage p0 holds a module whose far end is connected to nothing live,
-which is the whole of its "No partner detected" with every counter at zero.
-The kernel logs read as one cable plugged Spark p0 <-> promax p0 at 18:47 on
-Oct 03 (promax's end came up at 18:51, the Spark's never did), promax's end
-going down at 18:58, and promax's p0 coming back up at 100G at 19:40 — i.e.
-the far end was moved to vivo.
+**The cable is a bifurcated one** (Jason, 2026-10-04), which explains the rest
+of it exactly. A 200G-to-2x100G breakout DAC wires lanes 0-1 of the wide end to
+one branch and lanes 2-3 to the other, and it is passive copper: **there is no
+path between the two branches.** The wiring that fits every measurement is
+
+    promax cage p0  ==(200G end)==>  branch A --> vivo ConnectX-6   (up, 100G)
+                                     branch B --> Spark cage p0     (dark)
+
+The lane counts confirm it without touching anything: promax's p1 reports
+`200 Gb/sec (4X HDR)` — four lanes — while promax's p0 and vivo both report
+`100 Gb/sec (2X HDR)`, two lanes. promax trained a two-lane link on the branch
+going to vivo and does not drive the other two lanes at all, so the Spark's
+cage p0 sees a module and no signal whatsoever: every counter zero, "No partner
+detected". Nothing is faulty and nothing needs re-seating.
+
+The consequence matters more than the diagnosis: **the Spark cannot reach vivo
+through this cable, at any speed.** Branch B could only come alive if promax's
+cage p0 were put into 2x100G split mode in firmware (`mlxconfig`, MFT not
+installed on either Spark, support on the Spark's embedded CX7 unknown), and
+even then it would buy a second 100G path between two boxes that already share
+200G. Not worth the surgery.
+
+If the tier must sit on rank 0 instead, the choices are to move the 200G end
+into the Spark's cage p0 and hang vivo off branch A there — promax then loses
+the vivo link — or to run a straight 100G QSFP56 DAC from the Spark's p0 to
+vivo and keep the breakout for something else. Neither is needed for the
+measurement; §2.4 is.
+
+For the record, the kernel logs read as that cable going in at 18:47 on Oct 03
+(both the Spark's and promax's ends, 14 s apart), promax's end training at
+18:51 and dropping at 18:58, then coming up at 100G at 19:40 once vivo's card
+was on branch A.
 
 **My first reading of this was wrong.** I called it a lane/rate mismatch — a
 200G 4-lane cage against a 100G 2-lane card, with vivo locking onto 2 lanes of
@@ -136,10 +162,12 @@ symmetric halves of the experts.
     # promax: adopt it on the cage that actually reaches vivo
     sudo ./rdma_link_setup.sh --iface enp1s0f0np0 --addr 10.99.4.1/30 --peer 10.99.4.2
 
-The alternative is physical: pull the dead module from the Spark's cage p0,
-move vivo's cable there, and everything already configured works unchanged with
-the tier on rank 0. Worth doing only if rank 0 specifically matters, or if
-promax's p0 is wanted for a second Spark-to-Spark cable later.
+The alternative is physical and, because the cable is a breakout (§2.2), it
+costs promax the vivo link: move the 200G end from promax's cage p0 into the
+Spark's, leave vivo on branch A, and everything already configured here works
+unchanged with the tier on rank 0. A straight 100G DAC from the Spark's p0 to
+vivo does the same without taking anything away. Worth it only if rank 0
+specifically matters.
 
 ### 2.5 Two more things the bring-up turned up
 
