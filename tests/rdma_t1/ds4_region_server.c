@@ -35,6 +35,12 @@ static uint64_t slot_bytes;
 static uint32_t n_slots;
 static int model_fd = -1;          /* kept open: D2 preads slots from it */
 static t1_ep dev_a, dev_b;
+/* Single-leg mode: the peer has one RoCE device, so there is nothing to stripe
+ * across and leg B does not exist. A box with two devices should never run this
+ * -- one leg is half the bandwidth -- but a one-port card (vivo's ConnectX-6)
+ * otherwise cannot serve at all, and one leg at ~12 GB/s still beats the
+ * client's local NVMe. The ds4 tier client already supports a one-leg spec. */
+static int g_single;
 static pthread_mutex_t accept_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile uint64_t live_clients;
 static volatile uint64_t promote_loads;
@@ -95,12 +101,14 @@ static void *pair_thread(void *vp) {
     struct ibv_qp *qp_a = NULL, *qp_b = NULL;
 
     if (serve_leg(&dev_a, dev_a.mr, fd_a, 0x123456u, &cq_a, &qp_a) &&
-        serve_leg(&dev_b, dev_b.mr, fd_b, 0x654321u, &cq_b, &qp_b)) {
+        (g_single || serve_leg(&dev_b, dev_b.mr, fd_b, 0x654321u, &cq_b, &qp_b))) {
         uint8_t go = 1;
-        if (!t1_send_all(fd_a, &go, 1) && !t1_send_all(fd_b, &go, 1)) {
+        if (!t1_send_all(fd_a, &go, 1) &&
+            (g_single || !t1_send_all(fd_b, &go, 1))) {
             __sync_fetch_and_add(&live_clients, 1);
-            fprintf(stderr, "region-server: pair up (A qp %u, B qp %u); %llu live\n",
-                    qp_a->qp_num, qp_b->qp_num, (unsigned long long)live_clients);
+            fprintf(stderr, "region-server: %s up (A qp %u, B qp %u); %llu live\n",
+                    g_single ? "client" : "pair", qp_a->qp_num,
+                    qp_b ? qp_b->qp_num : 0u, (unsigned long long)live_clients);
             /* Command loop. D2 promotion arrives here as T1_CMD_LOAD; D1
              * writes its slot with RDMA and never says anything. Returns when
              * the client closes, which is also how a read-only client behaves. */
@@ -139,7 +147,8 @@ static void *pair_thread(void *vp) {
     if (qp_b) ibv_destroy_qp(qp_b);
     if (cq_a) ibv_destroy_cq(cq_a);
     if (cq_b) ibv_destroy_cq(cq_b);
-    close(fd_a); close(fd_b);
+    close(fd_a);
+    if (fd_b >= 0) close(fd_b);
     return NULL;
 }
 
@@ -166,7 +175,9 @@ static void usage(void) {
       "  --size N         region size when --pattern is used\n"
       "  --dev-a/-b NAME  verbs devices (default rocep1s0f1 / roceP2p1s0f1)\n"
       "  --port-a/-b N    TCP ports (default 19515 / 19516)\n"
-      "  --gid-index N    default 3\n");
+      "  --gid-index N    default 3\n"
+      "  --single         serve leg A only, for a box with ONE RoCE device.\n"
+      "                   Half the bandwidth; the client spec then has one entry.\n");
     exit(1);
 }
 
@@ -190,12 +201,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--gid-index") && i + 1 < argc) gid_index = atoi(argv[++i]);
         else if (!strcmp(a, "--cache-slots") && i + 1 < argc) n_slots = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(a, "--slot-bytes") && i + 1 < argc) slot_bytes = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--single")) g_single = 1;
         else usage();
     }
     if (!file && !pattern) usage();
-    if (!strcmp(dev_a_name, dev_b_name))
+    if (!g_single && !strcmp(dev_a_name, dev_b_name))
         t1_die("--dev-a and --dev-b are the same device -- two QPs on one device\n"
-               "     do not aggregate. See the T0 trap in the plan.");
+               "     do not aggregate. See the T0 trap in the plan.\n"
+               "     On a box with only one RoCE device, pass --single.");
 
     /* Check the pinning budget BEFORE spending minutes loading. ibv_reg_mr pins
      * the whole region, so RLIMIT_MEMLOCK below the region size fails the
@@ -288,14 +301,16 @@ int main(int argc, char **argv) {
                         "   paged out, which makes every number here a lie\n", strerror(errno));
 
     t1_open(&dev_a, dev_a_name, gid_index);
-    t1_open(&dev_b, dev_b_name, gid_index);
-    if (dev_a.node_guid == dev_b.node_guid)
-        t1_die("%s and %s are one device (guid 0x%llx) -- cannot stripe",
-               dev_a_name, dev_b_name, (unsigned long long)dev_a.node_guid);
+    if (!g_single) {
+        t1_open(&dev_b, dev_b_name, gid_index);
+        if (dev_a.node_guid == dev_b.node_guid)
+            t1_die("%s and %s are one device (guid 0x%llx) -- cannot stripe",
+                   dev_a_name, dev_b_name, (unsigned long long)dev_a.node_guid);
+    }
     int odp_a = 0, odp_b = 0;
     dev_a.mr = reg_region(dev_a.pd, region, region_bytes, &odp_a);
-    dev_b.mr = reg_region(dev_b.pd, region, region_bytes, &odp_b);
-    if (!dev_a.mr || !dev_b.mr)
+    if (!g_single) dev_b.mr = reg_region(dev_b.pd, region, region_bytes, &odp_b);
+    if (!dev_a.mr || (!g_single && !dev_b.mr))
         t1_die("reg_mr failed: %s\n"
                "     Even on-demand paging did not register the region. Serve less\n"
                "     with --bytes, or raise memlock as root.", strerror(errno));
@@ -308,35 +323,43 @@ int main(int argc, char **argv) {
            (double)region_bytes / 1073741824.0, region, file ? file : "(pattern)");
     printf("region-server: leg A %-14s guid 0x%016llx rkey 0x%08x :%d\n",
            dev_a_name, (unsigned long long)dev_a.node_guid, dev_a.mr->rkey, port_a);
-    printf("region-server: leg B %-14s guid 0x%016llx rkey 0x%08x :%d\n",
-           dev_b_name, (unsigned long long)dev_b.node_guid, dev_b.mr->rkey, port_b);
+    if (g_single)
+        printf("region-server: leg B disabled (--single): one device, no striping\n");
+    else
+        printf("region-server: leg B %-14s guid 0x%016llx rkey 0x%08x :%d\n",
+               dev_b_name, (unsigned long long)dev_b.node_guid, dev_b.mr->rkey, port_b);
     printf("region-server: prefix %.2f GiB + %u promotion slots x %.2f MiB (%.2f GiB)\n",
            (double)prefix_bytes / 1073741824.0, n_slots,
            (double)slot_bytes / 1048576.0,
            (double)(region_bytes - cache_off) / 1073741824.0);
-    printf("region-server: distinct devices confirmed; serving many pairs.\n");
+    printf("region-server: %s; serving many clients.\n",
+           g_single ? "single leg" : "distinct devices confirmed");
     fflush(stdout);
 
-    int la = listen_on(port_a), lb = listen_on(port_b);
+    int la = listen_on(port_a), lb = g_single ? -1 : listen_on(port_b);
     for (;;) {
         /* One pair at a time through accept, so leg A and leg B of the same
          * client cannot interleave with another client's. The pair is then
          * handed to its own thread, so N clients are served concurrently. */
         pthread_mutex_lock(&accept_lock);
         int ca = accept(la, NULL, NULL);
-        int cb = ca >= 0 ? accept(lb, NULL, NULL) : -1;
+        int cb = (!g_single && ca >= 0) ? accept(lb, NULL, NULL) : -1;
         pthread_mutex_unlock(&accept_lock);
-        if (ca < 0 || cb < 0) { if (ca >= 0) close(ca); if (cb >= 0) close(cb); continue; }
+        if (ca < 0 || (!g_single && cb < 0)) {
+            if (ca >= 0) close(ca);
+            if (cb >= 0) close(cb);
+            continue;
+        }
         int one = 1;
         setsockopt(ca, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        setsockopt(cb, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        if (cb >= 0) setsockopt(cb, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         pair_arg *pa = (pair_arg *)malloc(sizeof *pa);
-        if (!pa) { close(ca); close(cb); continue; }
+        if (!pa) { close(ca); if (cb >= 0) close(cb); continue; }
         pa->fd_a = ca; pa->fd_b = cb;
         pthread_t th;
         if (pthread_create(&th, NULL, pair_thread, pa) != 0) {
             fprintf(stderr, "region-server: thread create failed\n");
-            close(ca); close(cb); free(pa);
+            close(ca); if (cb >= 0) close(cb); free(pa);
         } else {
             pthread_detach(th);
         }

@@ -115,6 +115,13 @@ NICs, and serves many client pairs at once — ds4 fetches from up to 32 threads
 and a one-pair-at-a-time server would serialise all of them. `--bytes N` caps
 how much to hold.
 
+On a peer with only **one** RoCE device — a single-port card, or a box whose
+second port has no cable — add `--single`: leg A only, one TCP port, one leg
+advertised. The client spec then carries one entry and gets one leg's
+bandwidth, which is the best available there anyway: two QPs against one remote
+device split it 50/50 and stripe to nothing. A box with two usable devices
+should not use this.
+
 **On the ds4 box:**
 
     DS4_EXPERT_TIER_RDMA=10.99.0.2:19515,10.99.2.2:19516 ds4 ...
