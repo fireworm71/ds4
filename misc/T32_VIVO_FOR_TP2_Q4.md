@@ -80,7 +80,36 @@ If carrier stays 0 with the cable in both ends, the likely cause is a 100G
 ConnectX-6 facing a 200G-rated cage that will not autoneg: pass
 `--speed 100000` on **both** ends.
 
-### 2.2 First bring-up: the link trains on one end only
+### 2.2 First bring-up: vivo is cabled to promax, not to the Spark
+
+**The asymmetry below is not a PHY problem. The cable runs from vivo to
+*promax*.** promax's own cage p0 is up at 100000 Mb/s (`rocep1s0f0` and
+`roceP2p1s0f0` both `PORT_ACTIVE`, 100 Gb/s 2X HDR) since `Oct 03 19:40:22`,
+and an ICMPv6 link-local multicast ping out of promax's `enp1s0f0np0` is
+answered by `fe80::202:c9ff:fe01:7513` in 0.787 ms — which is exactly vivo's
+ConnectX-6 GID. vivo then shows `rx_packets` and a neighbour entry for
+promax's MAC `fc:4c:ea:f9:49:3d`. The link is healthy and carries frames; it
+simply has the wrong box on the far end for the plan as written.
+
+The Spark's cage p0 holds a module whose far end is connected to nothing live,
+which is the whole of its "No partner detected" with every counter at zero.
+The kernel logs read as one cable plugged Spark p0 <-> promax p0 at 18:47 on
+Oct 03 (promax's end came up at 18:51, the Spark's never did), promax's end
+going down at 18:58, and promax's p0 coming back up at 100G at 19:40 — i.e.
+the far end was moved to vivo.
+
+**My first reading of this was wrong.** I called it a lane/rate mismatch — a
+200G 4-lane cage against a 100G 2-lane card, with vivo locking onto 2 lanes of
+garbage — because vivo's PHY counters were climbing (24,341 frames,
+370 million corrected bits) while the Spark's stayed at zero. Those frames were
+promax talking to vivo, and vivo's `rx_corrected_bits_phy` is a lifetime FEC
+counter that includes the mis-trained window on Oct 03; `rx_symbol_err_phy` was
+0 the whole time, which should have stopped me. Do not force link speeds and do
+not buy a different cable on the strength of that paragraph. The one test that
+settles which boxes a cable joins is a link-local multicast ping out of the
+interface, which needs no root at either end.
+
+### 2.3 What the counters said (kept for the signature)
 
 Both scripts ran 2026-10-04 17:5x. Addresses, MTU 9000 and the RoCEv2 GID index
 (3, on both ends) are in place. The link is not:
@@ -93,25 +122,41 @@ Both scripts ran 2026-10-04 17:5x. Addresses, MTU 9000 and the RoCEv2 GID index
 | `rx_packets` (to the stack) | 0 | 0 |
 | `rx_corrected_bits_phy` | 0 | **370,387,351** |
 
-The narrow end sees 4.5 MB arrive at the PHY and corrects 370 million bits
-doing it, and not one frame reaches the stack; the wide end sees nothing at
-all. That is not a cabling fault -- it proves the cable runs between these two
-boxes -- it is a **lane/rate mismatch**: the Spark's cage transmits 4 lanes for
-200G, vivo's ConnectX-6 locks onto the 2 it can receive and declares LinkUp on
-garbage, and the Spark cannot train 4 lanes against a 2-lane partner, so it
-reports no partner.
+### 2.4 Fixing it: move the address, not the cable
 
-Next lever, both ends, lower rate pinned rather than negotiated:
+The cheapest repair touches no hardware. vivo keeps everything it has
+(`10.99.4.2/30`, MTU 9000, GID index 3); the `.1` end of the /30 moves from the
+Spark's dead cage to promax's live one, and the tier then serves **rank 1**
+instead of rank 0 — which costs nothing, because the two ranks stream
+symmetric halves of the experts.
 
-    sudo ./scripts/rdma_link_setup.sh --role spark --speed 100000
-    sudo ./rdma_link_setup.sh --role vivo --speed 100000
+    # spark-0fb3: the address is on a port with nothing on the other end
+    sudo ip addr del 10.99.4.1/30 dev enp1s0f0np0
 
-If that does not train either, identify the cable before changing anything
-else -- `sudo ethtool -m enp1s0f0np0` prints its part number and length. A
-200G-to-2x100G breakout would need the cage put in split mode, which is an
-`mlxconfig` question and may not be available on the Spark at all; a native
-100G QSFP28 DAC would sidestep the whole negotiation by giving both ends
-4x25G NRZ as their only option.
+    # promax: adopt it on the cage that actually reaches vivo
+    sudo ./rdma_link_setup.sh --iface enp1s0f0np0 --addr 10.99.4.1/30 --peer 10.99.4.2
+
+The alternative is physical: pull the dead module from the Spark's cage p0,
+move vivo's cable there, and everything already configured works unchanged with
+the tier on rank 0. Worth doing only if rank 0 specifically matters, or if
+promax's p0 is wanted for a second Spark-to-Spark cable later.
+
+### 2.5 Two more things the bring-up turned up
+
+* **The Spark has no TP addresses.** promax still holds `10.99.0.2/30` and
+  `10.99.2.2/30`, but `10.99.0.1` and `10.99.2.1` are absent on this box —
+  lost in the 2026-09-21 reboot along with the MTU. TP2 cannot run over RDMA
+  until they are back:
+
+      sudo ip addr replace 10.99.0.1/30 dev enp1s0f1np1
+      sudo ip addr replace 10.99.2.1/30 dev enP2p1s0f1np1
+
+* **The MTU fix is only half applied.** The Spark's p1 netdevs are at 9000 and
+  report `active_mtu 4096`, but *all four* of promax's netdevs are still at
+  1500, so every port there reports `active_mtu 1024` — and a QP takes the
+  lower of the two ends. promax needs `sudo ip link set dev <iface> mtu 9000`
+  on `enp1s0f1np1` and `enP2p1s0f1np1` (and on `enp1s0f0np0` for the vivo leg)
+  before §2.1 is actually fixed.
 
 `scripts/rdma_inventory.sh` needs no root at all and prints the facts section 7
 still lists as unknown.
@@ -194,21 +239,26 @@ Run order, once the link is up:
    the new link, not the 1 GbE.
 2. On vivo: `./ds4_region_server --file q4.prefix --single --dev-a <dev>
    --gid-index <from the setup script> --port-a 19515`
-3. On spark-0fb3, rank 0 only:
-   `DS4_EXPERT_TIER_RDMA=10.99.4.2:19515 DS4_EXPERT_TIER_RDMA_GID=<idx>
-   DS4_FETCH_STATS=1 ./ds4 ...` plus the usual Q4 TP2 streaming flags.
-   The tier verifies five sampled offsets against ds4's own model fd before it
-   activates, so a wrong or over-large prefix file refuses rather than lies.
-4. Read the stats. Decide from the nanoseconds, not the bytes.
+3. On the rank that is actually cabled to vivo — **promax, rank 1**, as §2.2
+   establishes: `DS4_EXPERT_TIER_RDMA=10.99.4.2:19515
+   DS4_EXPERT_TIER_RDMA_GID=<idx> DS4_FETCH_STATS=1 ./ds4 ...` plus the usual
+   Q4 TP2 streaming flags, on the worker command line. The tier verifies five
+   sampled offsets against ds4's own model fd before it activates, so a wrong
+   or over-large prefix file refuses rather than lies.
+4. Read the stats out of the worker's log. Decide from the nanoseconds, not the
+   bytes.
 
-Two things to know before spending a day on it: promotion of uncovered spans
+Two things to know before spending a day on it. Promotion of uncovered spans
 was already measured null ("every span that reaches disk is a first touch,
-because the expert cache already absorbs the reuse"), and rank 1 cannot reach
-vivo at all over RDMA — the Spark's only free cage is the one now pointing at
-vivo. If vivo's ConnectX-6 turns out to be dual-port, a second cable into
-promax's free cage p0 would give rank 1 its own leg, and the region server
-would then need a leg-independent mode (one region, two devices, each serving
-single-leg clients; it currently insists a client connect both legs).
+because the expert cache already absorbs the reuse"). And only **one** rank can
+have the tier: vivo's card is single-port, so one cable, one box. Giving the
+other rank a leg too would need a second port in vivo plus a cable into the
+remaining free cage, and then a leg-independent mode in the region server (one
+region, two devices, each serving single-leg clients; it currently insists one
+client connect both legs). An asymmetric pair is also a measurement hazard —
+accelerate one rank's fetch path and the other becomes the straggler that sets
+the token time, which caps any gain at roughly what the slower rank still
+spends on disk.
 
 ### 3.3 Capacity: vivo as storage behind the streaming path
 
@@ -253,12 +303,23 @@ carrying an IPv4 address on the peer's /24 and no interface here has one yet.
 ## 5. Order of work
 
 1. ~~Install the key, run the inventory on vivo~~ — done 2026-10-04, §1.
-2. `sudo scripts/rdma_link_setup.sh` on both ends; get carrier and a ping.
-3. `ib_read_bw` both directions for the real one-leg ceiling.
-4. `test_rdma_tier` against a `--single` region server over the live link:
-   correctness first, byte-exactness at odd offsets.
-5. Then, and only then, the §3.2 measurement with `DS4_FETCH_STATS=1`.
-6. In parallel, §3.4 — it needs nothing but SSH.
+2. ~~Scripts on both ends~~ — done; addresses, MTU 9000 and GID index 3 are in
+   place, and the link turned out to land on promax (§2.2).
+3. Repair the addressing: §2.4, two commands, nothing physical. Then the TP
+   addresses and promax's MTU, §2.5 — those gate every TP2 number, vivo or no
+   vivo, and are the cheapest thing on this list.
+4. `ib_read_bw` promax <-> vivo for the real one-leg ceiling, and
+   `test_rdma_tier` against a `--single` region server for byte-exactness.
+   Both are cheap and settle whether the transport is sound.
+5. §3.2 only if the prefill question is worth a day. It is a one-rank,
+   10%-coverage, 1.4x change behind a `max(rank0, rank1)` gate, so the decode
+   arm can be predicted at zero and skipped.
+6. §3.4 whenever vivo's nvidia driver is fixed — unblocks real work and needs
+   nothing from the fabric.
+
+Meanwhile the link is already worth having for what it moves: artifacts between
+promax and vivo at ~11 GB/s instead of the 1 GbE's ~110 MB/s. A 483 GiB model
+is 12 hours over the LAN and 12 minutes over this.
 
 ## 6. Access
 
