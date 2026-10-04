@@ -220,9 +220,17 @@ if [ -z "$ibdev" ]; then
     echo "  Try 'sudo modprobe mlx5_ib' and 'dmesg | grep -i mlx5' for the reason."
 else
     p="/sys/class/infiniband/$ibdev/ports/1"
-    printf '  %s port 1: state=%s phys=%s rate=%s\n' "$ibdev" \
+    amtu=""
+    command -v ibv_devinfo >/dev/null 2>&1 && \
+        amtu=$(ibv_devinfo -d "$ibdev" 2>/dev/null | awk '/active_mtu/{print $2; exit}')
+    printf '  %s port 1: state=%s phys=%s rate=%s active_mtu=%s\n' "$ibdev" \
         "$(cat "$p/state" 2>/dev/null)" "$(cat "$p/phys_state" 2>/dev/null)" \
-        "$(cat "$p/rate" 2>/dev/null)"
+        "$(cat "$p/rate" 2>/dev/null)" "${amtu:-?}"
+    # active_mtu must MATCH on both ends. The ds4 tier and the t1 tools program
+    # path_mtu from their own port and exchange no MTU in the handshake, so a
+    # 4096 end talking to a 1024 end fails at the RTR transition rather than
+    # negotiating down. Netdev MTU 9000 gives 4096, 1500 gives 1024.
+    [ "$amtu" = "1024" ] && echo "  NOTE: active_mtu 1024 -- set MTU 9000 here AND on the peer for 4096"
     printf '  fw=%s node_guid=%s\n' \
         "$(cat "/sys/class/infiniband/$ibdev/fw_ver" 2>/dev/null)" \
         "$(cat "/sys/class/infiniband/$ibdev/node_guid" 2>/dev/null)"

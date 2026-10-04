@@ -151,12 +151,32 @@ promax's p0 is wanted for a second Spark-to-Spark cable later.
       sudo ip addr replace 10.99.0.1/30 dev enp1s0f1np1
       sudo ip addr replace 10.99.2.1/30 dev enP2p1s0f1np1
 
-* **The MTU fix is only half applied.** The Spark's p1 netdevs are at 9000 and
-  report `active_mtu 4096`, but *all four* of promax's netdevs are still at
-  1500, so every port there reports `active_mtu 1024` — and a QP takes the
-  lower of the two ends. promax needs `sudo ip link set dev <iface> mtu 9000`
-  on `enp1s0f1np1` and `enP2p1s0f1np1` (and on `enp1s0f0np0` for the vivo leg)
-  before §2.1 is actually fixed.
+* **The MTU fix is only half applied, and parity is mandatory.** The Spark's p1
+  netdevs are at 9000 and report `active_mtu 4096`; *all four* of promax's are
+  still at 1500, so every port there reports 1024. This is not a performance
+  footnote: `ds4_rdma_tier.c:398` and `t1_common.h:223` both program
+  `path_mtu` from their **own** port, and the handshake carries no MTU field,
+  so a 4096 end talking to a 1024 end does not negotiate down — it fails at
+  the RTR transition. Measured today: `ib_read_bw` between promax (1024) and
+  vivo (4096) died with "Failed to modify QP to RTR / Unable to Connect the
+  HCA's through the link", and the same run with `-m 1024` on both ends worked.
+  promax needs MTU 9000 on `enp1s0f1np1`, `enP2p1s0f1np1` and `enp1s0f0np0`.
+
+### 2.6 The transport is sound: 91.60 Gb/s measured, one leg
+
+With the MTU pinned equal on both ends, `ib_read_bw` promax -> vivo (the
+direction the tier reads in), 1 MiB messages, 4 QPs, RoCE v1 GIDs because
+neither end of that cable has an IPv4 address yet:
+
+    #bytes    #iterations   BW average[Gb/sec]
+    1048576   32759         91.60
+
+**11.45 GB/s on a 100G link — 91.6% of line rate, at path MTU 1024.** It should
+gain a little at 4096. Against the Spark's ~8.4 GB/s local NVMe that is
+**1.36x**, which lands exactly where §3.2 predicted and confirms there is no
+PHY, PCIe or cable problem anywhere in this path. What the tier is worth is now
+purely a question about hit rate and the `max(rank0, rank1)` gate, not about
+the fabric.
 
 `scripts/rdma_inventory.sh` needs no root at all and prints the facts section 7
 still lists as unknown.
