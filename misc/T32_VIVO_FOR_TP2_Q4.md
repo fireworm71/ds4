@@ -25,10 +25,13 @@ MT28908, single port** (`enp5s0np0` / `mlx5_0`, fw 20.43.8004), port capability
 GB/s**, so the wire and not the slot is the limit (the slot is Gen4-capable;
 the BIOS trained it at Gen3, which costs nothing at 100G). Storage is one
 4 TB Crucial P310: 27 GiB free on `/`, 219 GiB free on `/mnt/data` (exfat).
-`memlock` is 7.83 GiB today, which the setup script fixes. The 3090 is
-**currently unusable** — `nvidia-driver-580-server-open` is installed but no
-nvidia module is loaded, so the DKMS build or a reboot is outstanding. None of
-the roles below need the GPU.
+`memlock` is 7.83 GiB today, which the setup script fixes.
+
+**There is no GPU in vivo right now.** `lspci` shows no VGA or 3D device at all
+and no PCI class `0x0300xx`, so `nvidia-smi` failing is not the driver problem it
+looked like: the 3090 is out of the box. The ConnectX-6 sits in the primary x16
+CPU slot (`0000:00:03.1`), which is presumably why. None of the fabric roles
+need a GPU, but §3.4 does.
 
 Both ends of the new cable are confirmed plugged, from the two kernel logs:
 module 0 "Cable plugged" on the Spark's cage p0 (Oct 03 18:47) and on vivo's
@@ -132,13 +135,41 @@ lands in the Spark's cage p0 — promax then loses the vivo link, since only one
 branch of a breakout can be live. Neither is needed for the measurement;
 §2.4 is.
 
+**It is not a firmware issue.** Port split is a *switch* feature (Spectrum and
+Quantum fan one 200G port out to two 100G hosts); adapter firmware has no such
+knob at any version, which is why `mstconfig -q` shows none rather than showing
+one that is off. The card is `MT_0000000223` (MCX653105A-HDAT: single-port
+QSFP56 HDR, PCIe4.0 x16, `MT4123`), and sysfs confirms the shape — one PCI
+function, one IB port. A firmware upgrade from 20.43.8004 changes nothing here.
+The cable is being used in the direction it was not built for: fanning a switch
+port down to two hosts is its job, and from an adapter only the branch carrying
+lanes 0-1 can ever train.
+
+Which gives a free move worth knowing: **swapping the two branch connectors
+moves the live link between the Sparks.** The branch on lanes 0-1 is the one
+that trains, so putting that branch in the Spark's cage p0 and the other in
+promax's hands the leg — and the tier with it — to rank 0 at no cost. One of
+the two is live either way; never both.
+
 **The upgrade worth knowing about**: vivo's port is HDR 200G and its slot
 carries 126.016 Gb/s (Gen3 x16, and the card is a PCIe4.0 x16 part). Replacing
 the breakout with a straight 200G QSFP56 DAC into one Spark cage would run the
 leg at the PCIe ceiling, **~15.7 GB/s instead of today's 12.26** — +28%, and
-1.87x the Spark's local NVMe. If the slot can also be trained at Gen4 the
-ceiling moves to the 200G wire, ~25 GB/s. That is the single cheapest way to
-make this path meaningfully faster, and it costs one cable.
+1.87x the Spark's local NVMe. That is the single cheapest way to make this path
+meaningfully faster, and it costs one cable.
+
+Note also that vivo's root port *advertises* Gen3 as its maximum
+(`0000:00:03.1 max_link_speed 8.0 GT/s`) although the card is a PCIe4.0 part in
+a Vermeer CPU slot. That smells like a BIOS "PCIe Gen3/Gen4/Auto" setting
+rather than a hardware limit; at Gen4 the slot would carry ~31.5 GB/s and a
+200G DAC could run near the wire at ~24 GB/s. It makes no difference at 100G,
+so it only matters alongside the cable swap.
+
+A genuine triangle needs a second port in vivo, and the board makes that
+unattractive: the ConnectX-6 already occupies the primary x16, and everything
+else hangs off a chipset uplink that itself trained at x4 Gen3 — about
+3.9 GB/s shared, which is *below* the Spark's local NVMe and therefore
+pointless as a tier leg.
 
 For the record, the kernel logs read as that cable going in at 18:47 on Oct 03
 (both the Spark's and promax's ends, 14 s apart), promax's end training at
@@ -371,12 +402,16 @@ added, not because it is actionable today.
 
 ### 3.4 Offload the side work
 
-The 3090 would be a perfectly good box for the things that currently steal the
+A 3090 would be a perfectly good box for the things that currently steal the
 pair: n-gram corpus builds (`--build-ngram-corpus`), quality scoring runs,
 imatrix work. Zero coupling, no protocol risk, and it keeps the pair free for
-the measurements that need both ranks. Blocked on vivo's nvidia driver not
-loading (§1), which is a separate and much smaller problem than anything else
-here.
+the measurements that need both ranks.
+
+**But there is no GPU in vivo** (§1) — nothing of PCI class `0x0300xx` is
+present, so this is not a driver problem waiting on DKMS. The card would have
+to go back in, and the ConnectX-6 is currently in the primary x16 slot. Until
+then the CPU-only side of this list still stands: corpus builds and scoring
+runs that do not need a GPU, on 12 Ryzen threads and 62 GB.
 
 ## 4. The one code change this needed
 
