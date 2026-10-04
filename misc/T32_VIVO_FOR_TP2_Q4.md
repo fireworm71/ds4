@@ -1,9 +1,9 @@
 # T32: wiring vivo into the fleet, and what it can actually do for TP2 Q4
 
-Written 2026-10-04 from spark-0fb3, with no root and no access to vivo yet, so
-everything about vivo's own hardware below is marked as unknown rather than
-guessed. The spark-side facts are read out of `/sys`, the kernel log and
-`ibv_devinfo` today; the throughput numbers are the earlier T1/T31 measurements.
+Written 2026-10-04 from spark-0fb3. Both boxes' facts below are read out of
+`/sys`, the kernel log and `ibv_devinfo` today (vivo over SSH, unprivileged);
+the throughput numbers are the earlier T1/T31 measurements. Neither box grants
+passwordless root, so the link itself is still unconfigured.
 
 ## 1. The fleet as of today
 
@@ -11,7 +11,24 @@ guessed. The spark-side facts are read out of `/sys`, the kernel log and
 |---|---|---|
 | spark-0fb3 (GB10, 121 GB) | TP2 coordinator, rank 0 | cage p1 to promax, 200G, up |
 | promaxgb10-493d (GB10) | TP2 worker, rank 1, `10.99.0.2` / `10.99.2.2` | same cable, two PCIe paths |
-| vivo (`192.168.0.248`, RTX 3090, Ubuntu 24.04) | nothing yet | 1 GbE LAN; ConnectX-6 just installed |
+| vivo (`192.168.0.248`, Ryzen 5 5600X, 62 GB, RTX 3090, Ubuntu 24.04) | nothing yet | 1 GbE LAN; ConnectX-6 cabled, port admin-down |
+
+vivo, measured today: **62 GB RAM** (60 free), 12 threads, one **ConnectX-6
+MT28908, single port** (`enp5s0np0` / `mlx5_0`, fw 20.43.8004), port capability
+**100 Gb/s (2X HDR)**, card on a **Gen3 x16 link — 126.016 Gb/s, i.e. 15.75
+GB/s**, so the wire and not the slot is the limit (the slot is Gen4-capable;
+the BIOS trained it at Gen3, which costs nothing at 100G). Storage is one
+4 TB Crucial P310: 27 GiB free on `/`, 219 GiB free on `/mnt/data` (exfat).
+`memlock` is 7.83 GiB today, which the setup script fixes. The 3090 is
+**currently unusable** — `nvidia-driver-580-server-open` is installed but no
+nvidia module is loaded, so the DKMS build or a reboot is outstanding. None of
+the roles below need the GPU.
+
+Both ends of the new cable are confirmed plugged, from the two kernel logs:
+module 0 "Cable plugged" on the Spark's cage p0 (Oct 03 18:47) and on vivo's
+ConnectX-6 (Oct 04 02:40, at boot). vivo's netdev has simply never been brought
+up — `oper=down`, verbs port `state=1: DOWN phys=3: Disabled` — which is the
+whole reason the Spark reports "No partner detected".
 
 The Spark's ConnectX-7 is one chip (`phys_switch_id b40f00000347bb4c`) with two
 QSFP cages, each exposed through two PCIe root complexes:
@@ -110,18 +127,25 @@ to spare for someone else's region.
 Measured transport, from T1 (spark ↔ promax, Q4-sized 18.98 MiB span): one leg
 13.38 GB/s, two legs striped 24.00 GB/s, local NVMe ~8.4 GB/s. vivo gets **one
 leg**, because one cable to a one-port card is one remote device, and two QPs on
-one remote device split it 50/50 and stripe to nothing (the T0 trap). So expect
-**~1.3-1.6x local NVMe for covered spans**, the lower end if the card is 100G.
+one remote device split it 50/50 and stripe to nothing (the T0 trap). Its port
+is 100G, so the wire caps the leg at 12.5 GB/s and ~11.5 GB/s is the realistic
+figure: **~1.4x the Spark's local NVMe** for covered spans.
 
 The honest arithmetic, and it is why this is not a headline number. The tier
 covers a prefix `[0, N)` of the file, so the hit rate is about `N / 483 GiB`.
-With decode disk I/O measured at 8.4 ms/token against a 145 ms/token TP2 Q4
-decode budget, the saving is `8.4 ms x coverage x (1 - 1/speedup)`:
+A hot-set region would not do better: promotion already measured null because
+"every span that reaches disk is a first touch", i.e. the expert cache absorbs
+the reuse and what reaches disk is spread across the file. With decode disk I/O
+measured at 8.4 ms/token against a 145 ms/token TP2 Q4 decode budget, the
+saving is `8.4 ms x coverage x (1 - 1/speedup)`:
 
 | vivo RAM for the region | coverage | decode saving (estimate) |
 |---|---|---|
-| 48 GiB | 10% | ~0.2 ms/token, ~0.1% |
-| 112 GiB | 23% | ~0.4 ms/token, ~0.3% |
+| 50 GiB (what 62 GB of RAM allows) | 10.4% | ~0.25 ms/token, **~0.2%** |
+| 112 GiB (hypothetical) | 23% | ~0.45 ms/token, ~0.3% |
+
+So on decode this is noise. It is worth running only for the prefill arm and
+only because the cost is low.
 
 Prefill is the arm worth measuring instead: it is read-heavy (24.13 t/s =
 41.4 ms/token of work) and we have never measured what share of it sits in
@@ -157,19 +181,25 @@ single-leg clients; it currently insists a client connect both legs).
 
 The Spark's root NVMe is at 94% — 226 GiB free with 1,559 GiB of model files
 already on it. That, not throughput, is the constraint that bites first: there
-is no room for another Q4-sized artifact. vivo over NVMe-oF/RDMA is the
-pattern already used with promax's `rambox` target, and a Gen4 NVMe served over
-a 100G link lands in the same ballpark as the Spark's local NVMe (~8.4 GB/s),
-so a model file can live on vivo and stream from there at roughly no loss.
-Needs root on both ends (`nvmet` on vivo, `nvme connect` here) and vivo's drive
-inventory, which §7 still lists as unknown.
+is no room for another Q4-sized artifact. vivo over NVMe-oF/RDMA is the pattern
+already used with promax's `rambox` target, and its Crucial P310 served over a
+100G link would land in the same ballpark as the Spark's local NVMe.
+
+**But vivo has no room either**: 219 GiB free on `/mnt/data` and 27 GiB on `/`,
+against 483 GiB for Q4 and 341-369 GiB for the Q2/Q3 artifacts. Nothing
+model-sized fits. This option is closed until someone frees ~500 GiB on vivo,
+and `/mnt/data` being exfat is a second reason not to put a streamed model
+there. It stays listed because the arithmetic changes the moment a disk is
+added, not because it is actionable today.
 
 ### 3.4 Offload the side work
 
-The 3090 is a perfectly good box for the things that currently steal the pair:
-n-gram corpus builds (`--build-ngram-corpus`), quality scoring runs, imatrix
-work. Zero coupling, no protocol risk, and it keeps the pair free for the
-measurements that need both ranks. Worth doing regardless of §3.2 and §3.3.
+The 3090 would be a perfectly good box for the things that currently steal the
+pair: n-gram corpus builds (`--build-ngram-corpus`), quality scoring runs,
+imatrix work. Zero coupling, no protocol risk, and it keeps the pair free for
+the measurements that need both ranks. Blocked on vivo's nvidia driver not
+loading (§1), which is a separate and much smaller problem than anything else
+here.
 
 ## 4. The one code change this needed
 
@@ -189,7 +219,7 @@ carrying an IPv4 address on the peer's /24 and no interface here has one yet.
 
 ## 5. Order of work
 
-1. Install the key from §6 on vivo; run `scripts/rdma_inventory.sh` there.
+1. ~~Install the key, run the inventory on vivo~~ — done 2026-10-04, §1.
 2. `sudo scripts/rdma_link_setup.sh` on both ends; get carrier and a ping.
 3. `ib_read_bw` both directions for the real one-leg ceiling.
 4. `test_rdma_tier` against a `--single` region server over the live link:
@@ -201,17 +231,21 @@ carrying an IPv4 address on the peer's /24 and no interface here has one yet.
 
 A dedicated key was generated on spark-0fb3 for this:
 `~/.ssh/id_ed25519_vivo`, with `Host vivo` (192.168.0.248, over the LAN) and
-`Host vivo-rdma` (10.99.4.2, once the link is up) in `~/.ssh/config`. The
-public half goes into vivo's `~/.ssh/authorized_keys`.
+`Host vivo-rdma` (10.99.4.2, once the link is up) in `~/.ssh/config`. Installed
+and verified 2026-10-04: `ssh vivo` reaches `jason@vivo`, and `~/vivo-cx6/` on
+the Spark is the self-contained bundle shipped there (scripts, region-server
+sources, a flat Makefile, this note).
 
-## 7. Still unknown about vivo
+## 7. Answered, and what is left
 
-`scripts/rdma_inventory.sh` prints all of it:
+Everything §7 originally asked is now measured and folded into §1: 62 GB of
+RAM, a single-port 100G ConnectX-6 on a Gen3 x16 link, the cable confirmed in
+both ends, 219 GiB free on vivo, `jason` is the account. What is left needs
+somebody's root password:
 
-* RAM — sets the tier coverage in §3.2, and whether that is worth doing at all.
-* The ConnectX-6 model, how many ports, and the PCIe link it negotiated
-  (`current_link_speed` x `current_link_width`): a x4 Gen3 slot would cap the
-  leg at ~3.9 GB/s, below local NVMe, which would end §3.2 on the spot.
-* Whether the cable from the Spark's cage p0 is actually in that card.
-* NVMe inventory and free space, for §3.3.
-* The account name to use for SSH (`jason` is assumed in `~/.ssh/config`).
+1. `sudo rdma_link_setup.sh --role vivo --install` on vivo and
+   `--role spark` here, then carrier and a ping.
+2. MTU 9000 on the two promax netdevs and on promax itself (§2.1) before any
+   baseline is taken.
+3. Only if §3.2 is to be tried: re-login after the memlock file lands, then the
+   prefix file and the run order in §3.2.
