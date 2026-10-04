@@ -11,7 +11,13 @@ passwordless root, so the link itself is still unconfigured.
 |---|---|---|
 | spark-0fb3 (GB10, 121 GB) | TP2 coordinator, rank 0 | cage p1 to promax, 200G, up |
 | promaxgb10-493d (GB10) | TP2 worker, rank 1, `10.99.0.2` / `10.99.2.2` | same cable, two PCIe paths |
-| vivo (`192.168.0.248`, Ryzen 5 5600X, 62 GB, RTX 3090, Ubuntu 24.04) | nothing yet | 1 GbE LAN; ConnectX-6 cabled, port admin-down |
+| vivo (`192.168.0.248`, Ryzen 5 5600X, 62 GB, RTX 3090, Ubuntu 24.04) | tier peer candidate for rank 1 | `10.99.4.2/30` to promax, 100G RoCEv2, **up and measured** |
+
+Final link map, after the 2026-10-04 bring-up:
+
+    spark-0fb3 cage p1  <--200G 4X-->  promax cage p1    10.99.0.1/.2 + 10.99.2.1/.2
+    vivo CX6 (wide end) <--100G 2X-->  promax cage p0    10.99.4.1/.2
+    vivo CX6 (branch B) <---dark---->  spark-0fb3 cage p0  (see §2.2)
 
 vivo, measured today: **62 GB RAM** (60 free), 12 threads, one **ConnectX-6
 MT28908, single port** (`enp5s0np0` / `mlx5_0`, fw 20.43.8004), port capability
@@ -91,33 +97,48 @@ ConnectX-6 GID. vivo then shows `rx_packets` and a neighbour entry for
 promax's MAC `fc:4c:ea:f9:49:3d`. The link is healthy and carries frames; it
 simply has the wrong box on the far end for the plan as written.
 
-**The cable is a bifurcated one** (Jason, 2026-10-04), which explains the rest
-of it exactly. A 200G-to-2x100G breakout DAC wires lanes 0-1 of the wide end to
-one branch and lanes 2-3 to the other, and it is passive copper: **there is no
-path between the two branches.** The wiring that fits every measurement is
+**The cable is a bifurcated one, and vivo holds its wide end** (Jason,
+2026-10-04): the two 100G branches go into the Spark and into promax. A
+200G-to-2x100G breakout DAC wires lanes 0-1 of the wide end to one branch and
+lanes 2-3 to the other, and it is passive copper, so the wiring is
 
-    promax cage p0  ==(200G end)==>  branch A --> vivo ConnectX-6   (up, 100G)
-                                     branch B --> Spark cage p0     (dark)
+    vivo ConnectX-6 ==(200G end)==>  branch A --> promax cage p0  (up, 100G)
+                                     branch B --> Spark cage p0   (dark)
 
-The lane counts confirm it without touching anything: promax's p1 reports
-`200 Gb/sec (4X HDR)` — four lanes — while promax's p0 and vivo both report
-`100 Gb/sec (2X HDR)`, two lanes. promax trained a two-lane link on the branch
-going to vivo and does not drive the other two lanes at all, so the Spark's
-cage p0 sees a module and no signal whatsoever: every counter zero, "No partner
-detected". Nothing is faulty and nothing needs re-seating.
+vivo's card is a **ConnectX-6 VPI, HDR IB (200Gb/s) and 200GbE, single-port
+QSFP56, PCIe4.0 x16** (its own `mstconfig` description), and `ethtool` lists
+`200000baseCR4` among its supported modes -- a real four-lane port. But one
+physical port trains **one** link: it came up at `active_width 2X /
+active_speed 50 Gbps` on the two lanes going to promax and leaves the other two
+dark. Lighting both branches at once would need a 2x100G port split, and
+`mstconfig -d 0000:05:00.0 q` offers no split knob on this card and firmware
+(only `MULTI_PORT_VHCA_EN`, `PORT_OWNER` and friends). **So the intended
+vivo-spark-promax triangle is not available: vivo talks to exactly one Spark at
+a time, and today that is promax.**
+
+The lane counts confirm it without touching anything: the Spark-promax cable
+reports `200 Gb/sec (4X HDR)` on p1 at both ends — four lanes — while promax's
+p0 and vivo both report `100 Gb/sec (2X HDR)`, two lanes. The Spark's cage p0
+therefore sees a module and no signal whatsoever: every counter zero, "No
+partner detected". Nothing is faulty and nothing needs re-seating.
 
 The consequence matters more than the diagnosis: **the Spark cannot reach vivo
-through this cable, at any speed.** Branch B could only come alive if promax's
-cage p0 were put into 2x100G split mode in firmware (`mlxconfig`, MFT not
-installed on either Spark, support on the Spark's embedded CX7 unknown), and
-even then it would buy a second 100G path between two boxes that already share
-200G. Not worth the surgery.
+through this cable, at any speed**, and no amount of configuration here changes
+that — the lanes it would need are physically terminated in a port that is
+already using the other two for promax.
 
-If the tier must sit on rank 0 instead, the choices are to move the 200G end
-into the Spark's cage p0 and hang vivo off branch A there — promax then loses
-the vivo link — or to run a straight 100G QSFP56 DAC from the Spark's p0 to
-vivo and keep the breakout for something else. Neither is needed for the
-measurement; §2.4 is.
+If the tier must sit on rank 0 instead, move vivo's wide end so that branch A
+lands in the Spark's cage p0 — promax then loses the vivo link, since only one
+branch of a breakout can be live. Neither is needed for the measurement;
+§2.4 is.
+
+**The upgrade worth knowing about**: vivo's port is HDR 200G and its slot
+carries 126.016 Gb/s (Gen3 x16, and the card is a PCIe4.0 x16 part). Replacing
+the breakout with a straight 200G QSFP56 DAC into one Spark cage would run the
+leg at the PCIe ceiling, **~15.7 GB/s instead of today's 12.26** — +28%, and
+1.87x the Spark's local NVMe. If the slot can also be trained at Gen4 the
+ceiling moves to the 200G wire, ~25 GB/s. That is the single cheapest way to
+make this path meaningfully faster, and it costs one cable.
 
 For the record, the kernel logs read as that cable going in at 18:47 on Oct 03
 (both the Spark's and promax's ends, 14 s apart), promax's end training at
@@ -190,21 +211,46 @@ specifically matters.
   HCA's through the link", and the same run with `-m 1024` on both ends worked.
   promax needs MTU 9000 on `enp1s0f1np1`, `enP2p1s0f1np1` and `enp1s0f0np0`.
 
-### 2.6 The transport is sound: 91.60 Gb/s measured, one leg
+### 2.6 The leg, measured twice: 91.60 then 98.05 Gb/s
 
-With the MTU pinned equal on both ends, `ib_read_bw` promax -> vivo (the
-direction the tier reads in), 1 MiB messages, 4 QPs, RoCE v1 GIDs because
-neither end of that cable has an IPv4 address yet:
+`ib_read_bw` promax -> vivo (the direction the tier reads in), 1 MiB messages,
+4 QPs:
 
-    #bytes    #iterations   BW average[Gb/sec]
-    1048576   32759         91.60
+| arm | GIDs | path MTU | BW average |
+|---|---|---|---|
+| before the MTU repair | RoCE v1 link-local, no IPv4 yet | 1024 | 91.60 Gb/s |
+| after §2.5 was applied | **RoCE v2, IPv4, index 3 both ends** | **4096** | **98.05 Gb/s** |
 
-**11.45 GB/s on a 100G link — 91.6% of line rate, at path MTU 1024.** It should
-gain a little at 4096. Against the Spark's ~8.4 GB/s local NVMe that is
-**1.36x**, which lands exactly where §3.2 predicted and confirms there is no
-PHY, PCIe or cable problem anywhere in this path. What the tier is worth is now
-purely a question about hit rate and the `max(rank0, rank1)` gate, not about
-the fabric.
+**12.26 GB/s on a 100G link — 98% of line rate.** The MTU parity fix is worth
++7% on its own. Against the Spark's ~8.4 GB/s local NVMe that is **1.46x**,
+which lands where §3.2 predicted and settles that there is no PHY, PCIe or
+cable problem anywhere in this path. What the tier is worth is now purely a
+question about hit rate and the `max(rank0, rank1)` gate, not about the fabric.
+
+### 2.7 The tier itself: proven end to end, byte-exact
+
+`ds4_region_server --single` on vivo (x86_64, built from this branch) serving a
+512 MiB file, `test_rdma_tier` on promax over the live leg, same file
+byte-identical on both ends (`sha256 3a701333...`):
+
+    ds4: rdma expert tier active: 0.50 GiB from 10.99.4.2, 1 leg x 8 pairs, verified
+    -- single-threaded, 16 offsets --
+       unaligned offset + odd length: OK
+       byte-exact
+    -- 8 threads x 12 spans --
+       113 reads, 1.05 GiB, 11.73 GB/s aggregate, 4042.0 us/span mean
+    ALL CHECKS PASSED
+
+So the `--single` patch works on the wire and not only at startup: the client
+accepts a one-leg peer, verifies it, and reads byte-exact at unaligned offsets
+and odd lengths from eight threads at **11.73 GB/s aggregate — 96% of the
+`ib_read_bw` ceiling**. Everything between a region of RAM on vivo and ds4's
+`cuda_model_stage_read()` is now demonstrated except ds4 itself.
+
+One footnote for anyone adding a second leg later: vivo's ConnectX-6 reports
+`node_guid 0x0000000000000000`. With two such devices the client's T0-trap
+check would see two equal GUIDs and drop to one leg -- correctly by its own
+logic, wrongly in fact. Single leg is unaffected; nothing compares.
 
 `scripts/rdma_inventory.sh` needs no root at all and prints the facts section 7
 still lists as unknown.
@@ -353,12 +399,12 @@ carrying an IPv4 address on the peer's /24 and no interface here has one yet.
 1. ~~Install the key, run the inventory on vivo~~ — done 2026-10-04, §1.
 2. ~~Scripts on both ends~~ — done; addresses, MTU 9000 and GID index 3 are in
    place, and the link turned out to land on promax (§2.2).
-3. Repair the addressing: §2.4, two commands, nothing physical. Then the TP
-   addresses and promax's MTU, §2.5 — those gate every TP2 number, vivo or no
-   vivo, and are the cheapest thing on this list.
-4. `ib_read_bw` promax <-> vivo for the real one-leg ceiling, and
-   `test_rdma_tier` against a `--single` region server for byte-exactness.
-   Both are cheap and settle whether the transport is sound.
+3. ~~Repair the addressing, the TP addresses and promax's MTU~~ — done
+   2026-10-04. promax holds `10.99.4.1/30` on the vivo leg, this box has
+   `10.99.0.1`/`10.99.2.1` back, and every port on both Sparks and vivo now
+   reports `active_mtu 4096`.
+4. ~~`ib_read_bw` and `test_rdma_tier` over the live leg~~ — done: 98.05 Gb/s
+   and ALL CHECKS PASSED, §2.6 and §2.7.
 5. §3.2 only if the prefill question is worth a day. It is a one-rank,
    10%-coverage, 1.4x change behind a `max(rank0, rank1)` gate, so the decode
    arm can be predicted at zero and skipped.
