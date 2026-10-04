@@ -201,6 +201,18 @@ printf '  %-14s carrier=%s speed=%s mtu=%s ipv4=%s\n' "$iface" \
 command -v ethtool >/dev/null 2>&1 && ethtool "$iface" 2>/dev/null | \
     grep -E "Speed|Duplex|Port|Link detected|Auto-neg" | sed 's/^/  /'
 
+# PHY-level counters, because they separate "nothing on the wire" from "signal
+# arrives but will not train". rx_packets_phy climbing while rx_packets stays 0,
+# with a large rx_corrected_bits_phy, is a lane/rate mismatch and not a cabling
+# fault: a 200G 4-lane port facing a 100G 2-lane one can leave the narrow end
+# claiming LinkUp while the wide end reports "No partner detected". Force BOTH
+# ends to the lower rate (--speed 100000) rather than re-seating cables.
+if command -v ethtool >/dev/null 2>&1; then
+    phy=$(ethtool -S "$iface" 2>/dev/null | grep -E \
+        "^ *(rx_packets|rx_packets_phy|rx_bytes_phy|rx_corrected_bits_phy|rx_symbol_err_phy|link_down_events_phy):")
+    [ -n "$phy" ] && { echo "  phy counters:"; echo "$phy" | sed 's/^ */    /'; }
+fi
+
 echo
 echo "== verbs =="
 if [ -z "$ibdev" ]; then

@@ -80,6 +80,39 @@ If carrier stays 0 with the cable in both ends, the likely cause is a 100G
 ConnectX-6 facing a 200G-rated cage that will not autoneg: pass
 `--speed 100000` on **both** ends.
 
+### 2.2 First bring-up: the link trains on one end only
+
+Both scripts ran 2026-10-04 17:5x. Addresses, MTU 9000 and the RoCEv2 GID index
+(3, on both ends) are in place. The link is not:
+
+| | spark-0fb3 `enp1s0f0np0` | vivo `enp5s0np0` |
+|---|---|---|
+| ethtool | `Link detected: no (Autoneg, No partner detected)` | **`Link detected: yes`, 100000 Mb/s** |
+| verbs port | `DOWN / phys Disabled` | **`ACTIVE / phys LinkUp`, 100 Gb/s (2X HDR)** |
+| `rx_packets_phy` | 0 | **24,341** |
+| `rx_packets` (to the stack) | 0 | 0 |
+| `rx_corrected_bits_phy` | 0 | **370,387,351** |
+
+The narrow end sees 4.5 MB arrive at the PHY and corrects 370 million bits
+doing it, and not one frame reaches the stack; the wide end sees nothing at
+all. That is not a cabling fault -- it proves the cable runs between these two
+boxes -- it is a **lane/rate mismatch**: the Spark's cage transmits 4 lanes for
+200G, vivo's ConnectX-6 locks onto the 2 it can receive and declares LinkUp on
+garbage, and the Spark cannot train 4 lanes against a 2-lane partner, so it
+reports no partner.
+
+Next lever, both ends, lower rate pinned rather than negotiated:
+
+    sudo ./scripts/rdma_link_setup.sh --role spark --speed 100000
+    sudo ./rdma_link_setup.sh --role vivo --speed 100000
+
+If that does not train either, identify the cable before changing anything
+else -- `sudo ethtool -m enp1s0f0np0` prints its part number and length. A
+200G-to-2x100G breakout would need the cage put in split mode, which is an
+`mlxconfig` question and may not be available on the Spark at all; a native
+100G QSFP28 DAC would sidestep the whole negotiation by giving both ends
+4x25G NRZ as their only option.
+
 `scripts/rdma_inventory.sh` needs no root at all and prints the facts section 7
 still lists as unknown.
 
