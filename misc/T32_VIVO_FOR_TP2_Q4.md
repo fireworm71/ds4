@@ -200,6 +200,49 @@ Both scripts ran 2026-10-04 17:5x. Addresses, MTU 9000 and the RoCEv2 GID index
 | `rx_packets` (to the stack) | 0 | 0 |
 | `rx_corrected_bits_phy` | 0 | **370,387,351** |
 
+### 2.3b Can both Sparks reach vivo with one ConnectX-6? Four answers
+
+Asked 2026-10-04. Ranked by what they actually buy.
+
+1. **At RDMA speed, simultaneously: no.** One adapter port trains one link
+   partner. The breakout cannot split (§2.2), so no cabling or firmware
+   arrangement gives two live peers from one card. The clean fix is a **100G
+   switch**: vivo's single port goes to the switch, each Spark gives up its
+   cage p0 to the switch, the direct 200G p1 cable stays as the TP link, and
+   every pair then talks RoCEv2 at wire speed with the forwarding done in
+   hardware. That is the only no-compromise answer and it costs a switch.
+2. **At IP speed, simultaneously: yes, today, for free.** Turn promax into a
+   router between `10.99.0.0/30` and `10.99.4.0/30` and the Spark reaches vivo
+   through it. Three commands, one per box:
+
+       # promax
+       sudo sysctl -w net.ipv4.ip_forward=1
+       # spark-0fb3
+       sudo ip route replace 10.99.4.0/30 via 10.99.0.2 dev enp1s0f1np1
+       # vivo
+       sudo ip route replace 10.99.0.0/30 via 10.99.4.1 dev enp5s0np0
+
+   Forwarding happens in promax's CPU so expect a few GB/s rather than twelve
+   -- still 10-30x the 1 GbE, which makes it the right path for shipping
+   prefix files, binaries and logs from the Spark to vivo. Nothing about the
+   TP link changes; this adds a route, not a bridge.
+3. **RoCE over that route: no, and not worth patching.** Two separate blocks.
+   `rt_open_dev` requires the peer address to share a /24 with a local RoCEv2
+   GID, so the tier refuses a routed peer outright. And even with that lifted,
+   the hop is software-forwarded by promax's CPU -- far below the ~8.4 GB/s
+   local NVMe the tier exists to beat. A hardware alternative does exist
+   (mlx5 switchdev eswitch bridging promax's two cages, forwarding in the
+   HCA), but that means putting the live TP port into a bridge on the Spark's
+   embedded CX7, undocumented and risking the one link the pair depends on.
+   Named for completeness; not recommended.
+4. **Choosing which Spark gets the leg: free and instant.** Swap the two
+   branch connectors (§2.2). One or the other, never both.
+
+A second NIC in vivo is the remaining option and the board spoils it: the
+ConnectX-6 holds the primary x16 and everything else hangs off a chipset uplink
+trained at x4 Gen3, about 3.9 GB/s shared -- below local NVMe, so a second leg
+there would be slower than not having one.
+
 ### 2.4 Fixing it: move the address, not the cable
 
 The cheapest repair touches no hardware. vivo keeps everything it has
